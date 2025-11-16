@@ -1,0 +1,17 @@
+# Env & secrets
+.env
+*.env
+
+# Virtual environments & deps cache
+.venv/
+__pycache__/
+.pytest_cache/
+
+# Runtime data
+/data/
+/logs/
+*.sqlite
+
+# Docker artifacts
+*.log
+*.pid
