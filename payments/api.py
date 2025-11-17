@@ -250,34 +250,13 @@ def create_app(registry: Registry, ledger: Ledger, settings: PaymentSettings) ->
             return record
         return record.model_copy(update=sensitive_fields)
 
-    def _provided_token(request: Request) -> Optional[str]:
-        return request.headers.get("X-Admin-Token")
-
     async def require_admin(request: Request) -> None:
         token = settings.api_admin_token
         if not token:
             return
-        provided = _provided_token(request)
+        provided = request.headers.get("X-Admin-Token")
         if provided != token:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Admin token required")
-
-    async def require_view_access(request: Request) -> None:
-        admin_token = settings.api_admin_token
-        viewer_tokens = settings.viewer_tokens
-        provided = _provided_token(request)
-        if admin_token:
-            if provided == admin_token:
-                return
-            if viewer_tokens:
-                if provided in viewer_tokens:
-                    return
-                raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Viewer token required")
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Admin token required")
-        if viewer_tokens:
-            if provided in viewer_tokens:
-                return
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Viewer token required")
-        # No tokens configured => open access
 
     def parse_iso8601(value: Optional[str]) -> Optional[datetime]:
         if value is None:
@@ -346,7 +325,7 @@ def create_app(registry: Registry, ledger: Ledger, settings: PaymentSettings) ->
 
     @app.get("/api/orchestrators", response_model=OrchestratorsResponse)
     async def list_orchestrators(
-        request: Request, _: Any = Depends(require_view_access)
+        request: Request, _: Any = Depends(require_admin)
     ) -> OrchestratorsResponse:
         records = registry.all_records()
         response: List[OrchestratorRecord] = []
@@ -394,7 +373,7 @@ def create_app(registry: Registry, ledger: Ledger, settings: PaymentSettings) ->
 
     @app.get("/api/orchestrators/{orchestrator_id}", response_model=OrchestratorRecord)
     async def get_orchestrator(
-        orchestrator_id: str, request: Request, _: Any = Depends(require_view_access)
+        orchestrator_id: str, request: Request, _: Any = Depends(require_admin)
     ) -> OrchestratorRecord:
         record = registry.get_record(orchestrator_id)
         if not record:
@@ -471,7 +450,7 @@ def create_app(registry: Registry, ledger: Ledger, settings: PaymentSettings) ->
         since: Optional[str] = Query(default=None),
         until: Optional[str] = Query(default=None),
         limit: Optional[int] = Query(default=None, ge=1, le=500),
-        _: Any = Depends(require_view_access),
+        _: Any = Depends(require_admin),
     ) -> WorkloadListResponse:
         since_ts = parse_iso8601(since)
         until_ts = parse_iso8601(until)
@@ -524,7 +503,7 @@ def create_app(registry: Registry, ledger: Ledger, settings: PaymentSettings) ->
     async def workload_summary(
         since: Optional[str] = Query(default=None),
         until: Optional[str] = Query(default=None),
-        _: Any = Depends(require_view_access),
+        _: Any = Depends(require_admin),
     ) -> WorkloadSummaryResponse:
         since_ts = parse_iso8601(since)
         until_ts = parse_iso8601(until)
