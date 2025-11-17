@@ -113,6 +113,10 @@ class PaymentSettings(BaseSettings):
         default_factory=list,
         env="PAYMENTS_MANAGER_IP_ALLOWLIST",
     )
+    viewer_tokens: List[str] = Field(
+        default_factory=list,
+        env="PAYMENTS_VIEWER_TOKENS",
+    )
     workload_archive_base: Path = Field(
         default=Path("/app/recordings"),
         env="PAYMENTS_WORKLOAD_ARCHIVE_BASE",
@@ -238,6 +242,16 @@ class PaymentSettings(BaseSettings):
             normalized.append(canonical)
         return normalized
 
+    @field_validator("viewer_tokens", mode="before")
+    @classmethod
+    def parse_viewer_tokens(cls, value):  # type: ignore[override]
+        if value is None:
+            return []
+        if isinstance(value, str):
+            parts = re.split(r"[\s,]+", value.strip())
+            return [part for part in parts if part]
+        return value
+
     @model_validator(mode="after")
     def populate_lists_and_validate(self) -> "PaymentSettings":
         if not self.address_denylist:
@@ -250,6 +264,10 @@ class PaymentSettings(BaseSettings):
             if raw_ips:
                 parts = self.parse_manager_ip_allowlist(raw_ips)
                 self.manager_ip_allowlist = self.normalize_manager_ip_allowlist(parts)
+        if not self.viewer_tokens:
+            raw_view = os.environ.get("PAYMENTS_VIEWER_TOKENS")
+            if raw_view:
+                self.viewer_tokens = self.parse_viewer_tokens(raw_view)
         if self.single_orchestrator_mode:
             if not self.orchestrator_id:
                 raise ValueError(
