@@ -55,6 +55,7 @@ def build_settings(temp_paths, **overrides):
         registration_rate_limit_burst=5,
         api_admin_token=None,
         manager_ip_allowlist=[],
+        viewer_tokens=[],
         workloads_path=base_dir / "workloads.json",
         workload_archive_base=base_dir / "recordings",
     )
@@ -288,3 +289,30 @@ async def test_workload_summary(temp_paths):
     body = summary.json()
     assert body["orchestrators"][0]["workloads"] == 2
     assert body["orchestrators"][0]["pending_eth"] == "0.001"
+
+
+@pytest.mark.anyio("asyncio")
+async def test_viewer_tokens_allow_readonly_access(temp_paths):
+    registry, ledger = build_registry(temp_paths)
+    address = "0xCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+    with patch.object(Registry, "_resolve_top_set", return_value={address.lower()}):
+        registry.register(orchestrator_id="orch-view", address=address)
+
+    app_settings = build_settings(
+        temp_paths,
+        api_admin_token="secret",
+        viewer_tokens=["viewer-token"],
+    )
+    app = create_app(registry, ledger, app_settings)
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        blocked = await client.get("/api/orchestrators")
+        assert blocked.status_code == 401
+
+        response = await client.get(
+            "/api/orchestrators",
+            headers={"X-Admin-Token": "viewer-token"},
+        )
+
+    assert response.status_code == 200
