@@ -440,3 +440,94 @@ async def test_viewer_tokens_allow_readonly_access(temp_paths):
         )
 
     assert response.status_code == 200
+
+
+@pytest.mark.anyio("asyncio")
+async def test_ledger_adjustment_requires_admin(temp_paths):
+    balances_path, registry_path = temp_paths
+    journal_path = balances_path.parent / "ledger-events.log"
+    ledger = Ledger(balances_path, journal_path=journal_path)
+    settings = build_settings(temp_paths, api_admin_token="secret")
+    registry = Registry(
+        path=registry_path,
+        settings=settings,
+        ledger=ledger,
+        web3=None,
+    )
+
+    orch_addr = "0xCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+    with patch.object(Registry, "_resolve_top_set", return_value={orch_addr.lower()}):
+        registry.register(orchestrator_id="orch-adjust", address=orch_addr)
+
+    app = create_app(registry, ledger, settings)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        unauthorized = await client.post(
+            "/api/ledger/adjustments",
+            json={"orchestrator_id": "orch-adjust", "amount_eth": "0.1"},
+        )
+        assert unauthorized.status_code == 401
+
+        authorized = await client.post(
+            "/api/ledger/adjustments",
+            json={"orchestrator_id": "orch-adjust", "amount_eth": "0.1"},
+            headers={"X-Admin-Token": "secret"},
+        )
+        assert authorized.status_code == 200
+
+
+@pytest.mark.anyio("asyncio")
+async def test_ledger_adjustment_updates_balance_and_journal(temp_paths):
+    balances_path, registry_path = temp_paths
+    journal_path = balances_path.parent / "ledger-events.log"
+    ledger = Ledger(balances_path, journal_path=journal_path)
+    settings = build_settings(temp_paths, api_admin_token="secret")
+    registry = Registry(
+        path=registry_path,
+        settings=settings,
+        ledger=ledger,
+        web3=None,
+    )
+
+    orch_addr = "0xDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD"
+    with patch.object(Registry, "_resolve_top_set", return_value={orch_addr.lower()}):
+        registry.register(orchestrator_id="orch-adjust-journal", address=orch_addr)
+
+    app = create_app(registry, ledger, settings)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/api/ledger/adjustments",
+            json={
+                "orchestrator_id": "orch-adjust-journal",
+                "amount_eth": "0.001",
+                "reason": "manual-fix",
+                "reference_workload_id": "run-123",
+                "notes": "rectify missing artifact",
+            },
+            headers={"X-Admin-Token": "secret"},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["balance_eth"] == "0.001"
+        assert body["delta_eth"] == "0.001"
+        assert body["reason"] == "manual-fix"
+        assert body["reference_workload_id"] == "run-123"
+        assert body["notes"] == "rectify missing artifact"
+
+        zero = await client.post(
+            "/api/ledger/adjustments",
+            json={"orchestrator_id": "orch-adjust-journal", "amount_eth": "0"},
+            headers={"X-Admin-Token": "secret"},
+        )
+        assert zero.status_code == 422
+
+    assert ledger.get_balance("orch-adjust-journal") == Decimal("0.001")
+    lines = journal_path.read_text().strip().splitlines()
+    assert lines
+    entry = json.loads(lines[-1])
+    assert entry["event"] == "credit"
+    assert entry["orchestrator_id"] == "orch-adjust-journal"
+    assert entry["reason"] == "manual-fix"
+    assert entry["metadata"]["reference_workload_id"] == "run-123"
+    assert entry["metadata"]["notes"] == "rectify missing artifact"

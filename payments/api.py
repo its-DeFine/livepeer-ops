@@ -200,6 +200,29 @@ class LedgerEvent(BaseModel):
 class LedgerEventsResponse(BaseModel):
     events: List[LedgerEvent]
 
+class LedgerAdjustmentPayload(BaseModel):
+    orchestrator_id: str = Field(min_length=1, max_length=128)
+    amount_eth: Decimal
+    reason: Optional[str] = Field(default=None, max_length=256)
+    reference_workload_id: Optional[str] = Field(default=None, max_length=256)
+    notes: Optional[str] = Field(default=None, max_length=1024)
+
+    @model_validator(mode="after")
+    def ensure_non_zero_amount(cls, values):  # type: ignore[override]
+        amount = values.amount_eth
+        if amount == 0:
+            raise ValueError("amount_eth must be non-zero")
+        return values
+
+
+class LedgerAdjustmentResponse(BaseModel):
+    orchestrator_id: str
+    balance_eth: str
+    delta_eth: str
+    reason: Optional[str]
+    reference_workload_id: Optional[str]
+    notes: Optional[str]
+
 
 class WorkloadUpdatePayload(BaseModel):
     status: Optional[str] = None
@@ -628,6 +651,32 @@ def create_app(registry: Registry, ledger: Ledger, settings: PaymentSettings) ->
             range_start=since,
             range_end=until,
             orchestrators=summary,
+        )
+
+    @app.post("/api/ledger/adjustments", response_model=LedgerAdjustmentResponse)
+    async def adjust_ledger(
+        payload: LedgerAdjustmentPayload,
+        _: Any = Depends(require_admin),
+    ) -> LedgerAdjustmentResponse:
+        _ensure_orchestrator_exists(payload.orchestrator_id)
+        metadata: Dict[str, Any] = {}
+        if payload.reference_workload_id:
+            metadata["reference_workload_id"] = payload.reference_workload_id
+        if payload.notes:
+            metadata["notes"] = payload.notes
+        balance = ledger.credit(
+            payload.orchestrator_id,
+            payload.amount_eth,
+            reason=payload.reason or "adjustment",
+            metadata=metadata or None,
+        )
+        return LedgerAdjustmentResponse(
+            orchestrator_id=payload.orchestrator_id,
+            balance_eth=str(balance),
+            delta_eth=str(payload.amount_eth),
+            reason=payload.reason or "adjustment",
+            reference_workload_id=payload.reference_workload_id,
+            notes=payload.notes,
         )
 
     @app.get("/api/ledger/events", response_model=LedgerEventsResponse)
