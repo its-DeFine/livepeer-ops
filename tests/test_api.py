@@ -2,6 +2,7 @@ import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
+from decimal import Decimal
 
 import httpx
 import pytest
@@ -289,6 +290,74 @@ async def test_workload_summary(temp_paths):
     body = summary.json()
     assert body["orchestrators"][0]["workloads"] == 2
     assert body["orchestrators"][0]["pending_eth"] == "0.001"
+
+
+@pytest.mark.anyio("asyncio")
+async def test_workload_credit_requires_artifact_and_status(temp_paths):
+    registry, ledger = build_registry(temp_paths)
+    address = "0x1111111111111111111111111111111111111111"
+    with patch.object(Registry, "_resolve_top_set", return_value={address.lower()}):
+        registry.register(orchestrator_id="orch-credit", address=address)
+
+    app_settings = build_settings(temp_paths, api_admin_token="secret")
+    app = create_app(registry, ledger, app_settings)
+    transport = httpx.ASGITransport(app=app)
+
+    payload = {
+        "workload_id": "orch-credit-1",
+        "orchestrator_id": "orch-credit",
+        "plan_id": "plan-1",
+        "run_id": "run-1",
+        "artifact_uri": "s3://logs/run-1.out",
+        "payout_amount_eth": "0.5",
+    }
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        created = await client.post(
+            "/api/workloads",
+            json=payload,
+            headers={"X-Admin-Token": "secret"},
+        )
+        assert created.status_code == 200
+        assert ledger.get_balance("orch-credit") == Decimal("0")
+
+        # Status update without webm should not credit
+        no_artifact = await client.patch(
+            "/api/workloads/orch-credit-1",
+            json={"status": "verified"},
+            headers={"X-Admin-Token": "secret"},
+        )
+        assert no_artifact.status_code == 200
+        assert ledger.get_balance("orch-credit") == Decimal("0")
+
+        # Provide webm + verified -> credit once
+        with_webm = await client.patch(
+            "/api/workloads/orch-credit-1",
+            json={"status": "verified", "artifact_uri": "s3://clips/run-1.webm"},
+            headers={"X-Admin-Token": "secret"},
+        )
+        assert with_webm.status_code == 200
+        assert ledger.get_balance("orch-credit") == Decimal("0.5")
+
+        # Second update should not double-credit
+        second = await client.patch(
+            "/api/workloads/orch-credit-1",
+            json={"status": "paid"},
+            headers={"X-Admin-Token": "secret"},
+        )
+        assert second.status_code == 200
+        assert ledger.get_balance("orch-credit") == Decimal("0.5")
+
+        listing = await client.get(
+            "/api/workloads",
+            headers={"X-Admin-Token": "secret"},
+        )
+
+    body = listing.json()
+    record = body["workloads"][0]
+    assert record["credited"] is True
+    assert record["credited_at"] is not None
+    assert record["status"] == "paid"
 
 
 @pytest.mark.anyio("asyncio")

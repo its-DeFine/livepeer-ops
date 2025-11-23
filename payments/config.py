@@ -108,6 +108,10 @@ class PaymentSettings(BaseSettings):
     default_health_timeout: float = Field(default=5.0, env="PAYMENTS_DEFAULT_HEALTH_TIMEOUT")
     default_min_service_uptime: float = Field(default=80.0, env="PAYMENTS_DEFAULT_MIN_SERVICE_UPTIME")
     audit_log_path: Path = Field(default=Path("/app/data/audit/registry.log"), env="PAYMENTS_AUDIT_LOG_PATH")
+    ledger_journal_path: Path = Field(
+        default=Path("/app/data/audit/ledger-events.log"),
+        env="PAYMENTS_LEDGER_JOURNAL_PATH",
+    )
     address_denylist: List[str] = Field(default_factory=list, env="PAYMENTS_ADDRESS_DENYLIST")
     manager_ip_allowlist: List[str] = Field(
         default_factory=list,

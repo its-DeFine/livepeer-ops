@@ -39,6 +39,8 @@ class WorkloadStore:
         record = dict(payload)
         record.setdefault("status", "pending")
         record.setdefault("submitted_at", datetime.utcnow().isoformat() + "Z")
+        record.setdefault("credited", False)
+        record.setdefault("credited_at", None)
         with self._lock:
             self._records[workload_id] = record
             self._persist()
