@@ -572,6 +572,8 @@ def create_app(registry: Registry, ledger: Ledger, settings: PaymentSettings) ->
                     "plan_id": record.get("plan_id"),
                     "run_id": record.get("run_id"),
                     "status": record.get("status"),
+                    "artifact_uri": record.get("artifact_uri"),
+                    "artifact_hash": record.get("artifact_hash"),
                 },
             )
             credited_at = datetime.utcnow().isoformat() + "Z"
