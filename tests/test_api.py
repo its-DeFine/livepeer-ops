@@ -1,4 +1,5 @@
 import tempfile
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -358,6 +359,60 @@ async def test_workload_credit_requires_artifact_and_status(temp_paths):
     assert record["credited"] is True
     assert record["credited_at"] is not None
     assert record["status"] == "paid"
+
+
+@pytest.mark.anyio("asyncio")
+async def test_workload_credit_includes_artifact_metadata(temp_paths):
+    balances_path, registry_path = temp_paths
+    journal_path = balances_path.parent / "ledger-events.log"
+    ledger = Ledger(balances_path, journal_path=journal_path)
+    settings = build_settings(
+        temp_paths,
+        api_admin_token="secret",
+    )
+    registry = Registry(
+        path=registry_path,
+        settings=settings,
+        ledger=ledger,
+        web3=None,
+    )
+
+    orch_addr = "0x2222222222222222222222222222222222222222"
+    with patch.object(Registry, "_resolve_top_set", return_value={orch_addr.lower()}):
+        registry.register(orchestrator_id="orch-meta", address=orch_addr)
+
+    app = create_app(registry, ledger, settings)
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        payload = {
+            "workload_id": "orch-meta-1",
+            "orchestrator_id": "orch-meta",
+            "plan_id": "plan-meta",
+            "run_id": "run-meta",
+            "artifact_uri": "s3://logs/run-meta.out",
+            "payout_amount_eth": "0.5",
+        }
+        created = await client.post(
+            "/api/workloads",
+            json=payload,
+            headers={"X-Admin-Token": "secret"},
+        )
+        assert created.status_code == 200
+
+        patch_resp = await client.patch(
+            "/api/workloads/orch-meta-1",
+            json={"status": "verified", "artifact_uri": "s3://clips/run-meta.webm", "artifact_hash": "hash123"},
+            headers={"X-Admin-Token": "secret"},
+        )
+        assert patch_resp.status_code == 200
+
+    lines = journal_path.read_text().strip().splitlines()
+    assert lines
+    entry = json.loads(lines[-1])
+    assert entry["event"] == "credit"
+    assert entry["metadata"]["artifact_uri"] == "s3://clips/run-meta.webm"
+    assert entry["metadata"]["artifact_hash"] == "hash123"
 
 
 @pytest.mark.anyio("asyncio")
