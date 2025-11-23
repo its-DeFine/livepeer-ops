@@ -105,7 +105,16 @@ class PaymentProcessor:
 
         if eligible and services_up == total_services and total_services > 0:
             increment = self.settings.payment_increment_eth
-            new_balance = self.ledger.credit(orchestrator_id, increment)
+            new_balance = self.ledger.credit(
+                orchestrator_id,
+                increment,
+                reason="cycle",
+                metadata={
+                    "services_up": services_up,
+                    "total_services": total_services,
+                    "eligible": eligible,
+                },
+            )
             logger.info(
                 "[%s] Eligible cycle → credited %s ETH. Balance=%s",
                 orchestrator_id,
@@ -217,9 +226,26 @@ class PaymentProcessor:
         amount = balance
         logger.info("[%s] Triggering payout of %s ETH to %s", orchestrator_id, amount, payout_address)
         tx_hash = self.payment_client.send_payment(payout_address, amount)
-        if tx_hash is not None or self.payment_client.dry_run:
-            self.ledger.set_balance(orchestrator_id, Decimal("0"))
-            logger.info("[%s] Ledger reset after payout (tx=%s)", orchestrator_id, tx_hash)
+        if tx_hash is None:
+            if self.payment_client.dry_run:
+                logger.info(
+                    "[%s] Dry-run payout simulated; leaving ledger balance unchanged",
+                    orchestrator_id,
+                )
+            else:
+                logger.warning(
+                    "[%s] Payout attempt returned no tx hash; balance left unchanged",
+                    orchestrator_id,
+                )
+            return
+
+        self.ledger.set_balance(
+            orchestrator_id,
+            Decimal("0"),
+            reason="payout",
+            metadata={"recipient": payout_address, "tx_hash": tx_hash},
+        )
+        logger.info("[%s] Ledger reset after payout (tx=%s)", orchestrator_id, tx_hash)
 
     def run_forever(self) -> None:
         """Blocking loop that runs the evaluation every configured interval."""

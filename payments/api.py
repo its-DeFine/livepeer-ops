@@ -2,11 +2,14 @@
 from __future__ import annotations
 
 import ipaddress
+import json
+import logging
 import threading
 import time
 from collections import deque
 from datetime import datetime, timezone
 from decimal import Decimal
+from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
@@ -162,6 +165,8 @@ class WorkloadRecord(BaseModel):
     submitted_at: str
     notes: Optional[str]
     tx_hash: Optional[str]
+    credited: Optional[bool] = False
+    credited_at: Optional[str] = None
 
 
 class WorkloadListResponse(BaseModel):
@@ -181,10 +186,27 @@ class WorkloadSummaryResponse(BaseModel):
     orchestrators: List[WorkloadSummaryItem]
 
 
+class LedgerEvent(BaseModel):
+    timestamp: str
+    event: str
+    orchestrator_id: str
+    amount: str
+    balance: str
+    delta: Optional[str] = None
+    reason: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None
+
+
+class LedgerEventsResponse(BaseModel):
+    events: List[LedgerEvent]
+
+
 class WorkloadUpdatePayload(BaseModel):
     status: Optional[str] = None
     notes: Optional[str] = Field(default=None, max_length=1024)
     tx_hash: Optional[str] = Field(default=None, max_length=128)
+    artifact_uri: Optional[str] = Field(default=None, max_length=512)
+    artifact_hash: Optional[str] = Field(default=None, max_length=256)
 
     @field_validator("status")
     @classmethod
@@ -443,6 +465,22 @@ def create_app(registry: Registry, ledger: Ledger, settings: PaymentSettings) ->
     def _workload_to_model(workload_id: str, payload: Dict[str, Any]) -> WorkloadRecord:
         return WorkloadRecord(workload_id=workload_id, **payload)
 
+    def _has_artifact(record: Dict[str, Any]) -> bool:
+        uri = record.get("artifact_uri")
+        if uri and isinstance(uri, str) and uri.lower().endswith(".webm"):
+            return True
+        if record.get("artifact_hash"):
+            return True
+        return False
+
+    def _should_credit(record: Dict[str, Any]) -> bool:
+        if record.get("credited"):
+            return False
+        status = record.get("status")
+        if status not in {"verified", "paid"}:
+            return False
+        return _has_artifact(record)
+
     @app.post("/api/workloads", response_model=WorkloadRecord)
     async def create_workload(payload: WorkloadCreatePayload, _: Any = Depends(require_admin)) -> WorkloadRecord:
         _ensure_orchestrator_exists(payload.orchestrator_id)
@@ -458,9 +496,10 @@ def create_app(registry: Registry, ledger: Ledger, settings: PaymentSettings) ->
             "payout_amount_eth": str(payload.payout_amount_eth),
             "notes": payload.notes,
             "tx_hash": None,
+            "credited": False,
+            "credited_at": None,
         }
         workload_store.upsert(payload.workload_id, record)
-        ledger.credit(payload.orchestrator_id, payload.payout_amount_eth)
         stored = workload_store.get(payload.workload_id) or record
         return _workload_to_model(payload.workload_id, stored)
 
@@ -513,11 +552,35 @@ def create_app(registry: Registry, ledger: Ledger, settings: PaymentSettings) ->
             updates["notes"] = payload.notes
         if payload.tx_hash is not None:
             updates["tx_hash"] = payload.tx_hash
+        if payload.artifact_uri is not None:
+            updates["artifact_uri"] = payload.artifact_uri
+        if payload.artifact_hash is not None:
+            updates["artifact_hash"] = payload.artifact_hash
         if updates:
             updated = workload_store.update(workload_id, updates)
             if updated is None:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workload not found")
             record = updated
+        if _should_credit(record):
+            amount = Decimal(record.get("payout_amount_eth", "0"))
+            ledger.credit(
+                record["orchestrator_id"],
+                amount,
+                reason="workload",
+                metadata={
+                    "workload_id": workload_id,
+                    "plan_id": record.get("plan_id"),
+                    "run_id": record.get("run_id"),
+                    "status": record.get("status"),
+                },
+            )
+            credited_at = datetime.utcnow().isoformat() + "Z"
+            credited_update = workload_store.update(
+                workload_id,
+                {"credited": True, "credited_at": credited_at},
+            )
+            if credited_update is not None:
+                record = credited_update
         return _workload_to_model(workload_id, record)
 
     @app.get("/api/workloads/summary", response_model=WorkloadSummaryResponse)
@@ -564,6 +627,38 @@ def create_app(registry: Registry, ledger: Ledger, settings: PaymentSettings) ->
             range_end=until,
             orchestrators=summary,
         )
+
+    @app.get("/api/ledger/events", response_model=LedgerEventsResponse)
+    async def ledger_events(
+        orchestrator_id: Optional[str] = Query(default=None),
+        limit: int = Query(default=200, ge=1, le=1000),
+        _: Any = Depends(require_view_access),
+    ) -> LedgerEventsResponse:
+        path = getattr(ledger, "journal_path", None)
+        if not path:
+            return LedgerEventsResponse(events=[])
+        journal_path = Path(path)
+        if not journal_path.exists():
+            return LedgerEventsResponse(events=[])
+
+        events: List[Dict[str, Any]] = []
+        try:
+            with journal_path.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    try:
+                        entry = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    events.append(entry)
+        except OSError:
+            return LedgerEventsResponse(events=[])
+
+        if orchestrator_id:
+            events = [entry for entry in events if entry.get("orchestrator_id") == orchestrator_id]
+
+        sliced = list(reversed(events))[:limit]
+        parsed = [LedgerEvent(**entry) for entry in sliced]
+        return LedgerEventsResponse(events=parsed)
 
     return app
 

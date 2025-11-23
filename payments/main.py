@@ -157,7 +157,10 @@ def main() -> None:
     logger.info("Starting payments backend")
 
     monitor = ServiceMonitor()
-    ledger = Ledger(settings.ledger.balances)
+    ledger = Ledger(
+        settings.ledger.balances,
+        journal_path=getattr(settings, "ledger_journal_path", None),
+    )
     payment_client = PaymentClient(
         rpc_url=settings.eth_rpc_url,
         chain_id=settings.chain_id,
