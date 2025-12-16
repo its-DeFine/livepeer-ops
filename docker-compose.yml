@@ -1,5 +1,9 @@
 services:
   payments-backend:
+    # For reproducible deployments, prefer pulling a published image:
+    #   PAYMENTS_IMAGE=ghcr.io/its-define/payments-backend:latest
+    #   docker compose pull payments-backend && docker compose up -d
+    image: ${PAYMENTS_IMAGE:-ghcr.io/its-define/payments-backend:latest}
     build:
       context: .
       dockerfile: Dockerfile
