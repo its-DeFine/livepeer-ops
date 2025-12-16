@@ -19,6 +19,13 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from .config import PaymentSettings
 from .ledger import Ledger
 from .registry import Registry, RegistryError
+from .licenses import (
+    ImageAccessStore,
+    ImageKeyStore,
+    LeaseStore,
+    OrchestratorTokenStore,
+    parse_iso8601 as parse_license_iso8601,
+)
 from .workloads import WorkloadStore
 
 
@@ -241,10 +248,112 @@ class WorkloadUpdatePayload(BaseModel):
         return value
 
 
+class LicenseTokenCreateResponse(BaseModel):
+    token_id: str
+    token: str
+
+
+class LicenseTokenRecord(BaseModel):
+    token_id: str
+    orchestrator_id: str
+    created_at: str
+    revoked_at: Optional[str]
+    last_seen_at: Optional[str]
+
+
+class LicenseTokenListResponse(BaseModel):
+    tokens: List[LicenseTokenRecord]
+
+
+class LicenseImageUpsertPayload(BaseModel):
+    image_ref: str = Field(min_length=1, max_length=512)
+    secret_b64: Optional[str] = Field(default=None, max_length=2048)
+
+
+class LicenseImageRevokePayload(BaseModel):
+    image_ref: str = Field(min_length=1, max_length=512)
+
+
+class LicenseImageRecord(BaseModel):
+    image_ref: str
+    created_at: str
+    rotated_at: str
+    revoked_at: Optional[str]
+
+
+class LicenseImageWithSecret(LicenseImageRecord):
+    secret_b64: str
+
+
+class LicenseImageListResponse(BaseModel):
+    images: List[LicenseImageRecord]
+
+
+class LicenseAccessPayload(BaseModel):
+    orchestrator_id: str = Field(min_length=1, max_length=128)
+    image_ref: str = Field(min_length=1, max_length=512)
+
+
+class LicenseAccessListResponse(BaseModel):
+    access: Dict[str, List[str]]
+
+
+class LicenseLeaseRequest(BaseModel):
+    image_ref: str = Field(min_length=1, max_length=512)
+
+
+class LicenseLeaseResponse(BaseModel):
+    lease_id: str
+    orchestrator_id: str
+    image_ref: str
+    expires_at: str
+    lease_seconds: int
+    secret_b64: str
+
+
+class LicenseHeartbeatResponse(BaseModel):
+    lease_id: str
+    expires_at: str
+    lease_seconds: int
+
+
+class LicenseLeaseRecord(BaseModel):
+    lease_id: str
+    orchestrator_id: str
+    image_ref: str
+    issued_at: str
+    last_seen_at: str
+    last_seen_ip: Optional[str]
+    expires_at: str
+    revoked_at: Optional[str]
+    active: bool
+
+
+class LicenseLeaseListResponse(BaseModel):
+    leases: List[LicenseLeaseRecord]
+
+
 def create_app(registry: Registry, ledger: Ledger, settings: PaymentSettings) -> FastAPI:
     app = FastAPI(title="Embody Payments", version="1.0.0")
 
     workload_store = WorkloadStore(settings.workloads_path)
+    data_dir = Path(getattr(settings, "workloads_path", Path("/app/data/workloads.json"))).parent
+    license_tokens = OrchestratorTokenStore(
+        Path(getattr(settings, "license_tokens_path", data_dir / "license_tokens.json"))
+    )
+    license_images = ImageKeyStore(
+        Path(getattr(settings, "license_images_path", data_dir / "license_images.json"))
+    )
+    license_access = ImageAccessStore(
+        Path(getattr(settings, "license_access_path", data_dir / "license_access.json"))
+    )
+    license_leases = LeaseStore(
+        Path(getattr(settings, "license_leases_path", data_dir / "license_leases.json"))
+    )
+    license_lease_seconds = int(getattr(settings, "license_lease_seconds", 900))
+    license_audit_log_path = Path(
+        getattr(settings, "license_audit_log_path", data_dir / "audit" / "license.log")
+    )
 
     per_minute_limiter = RateLimiter(
         max_calls=settings.registration_rate_limit_per_minute,
@@ -282,6 +391,20 @@ def create_app(registry: Registry, ledger: Ledger, settings: PaymentSettings) ->
         client_host = request.client.host if request.client else None
         return normalize_ip(client_host)
 
+    def log_license_event(event: str, payload: Dict[str, Any]) -> None:
+        try:
+            license_audit_log_path.parent.mkdir(parents=True, exist_ok=True)
+            entry = {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "event": event,
+                **payload,
+            }
+            with license_audit_log_path.open("a", encoding="utf-8") as handle:
+                json.dump(entry, handle, separators=(",", ":"))
+                handle.write("\n")
+        except Exception:
+            return
+
     def include_sensitive_fields(request: Request) -> bool:
         if not manager_ip_allowlist:
             return True
@@ -297,6 +420,34 @@ def create_app(registry: Registry, ledger: Ledger, settings: PaymentSettings) ->
 
     def _provided_token(request: Request) -> Optional[str]:
         return request.headers.get("X-Admin-Token")
+
+    def _provided_orchestrator_token(request: Request) -> Optional[str]:
+        auth_header = request.headers.get("Authorization") or ""
+        if auth_header.lower().startswith("bearer "):
+            candidate = auth_header.split(" ", 1)[1].strip()
+            if candidate:
+                return candidate
+        token = request.headers.get("X-Orchestrator-Token")
+        if token:
+            candidate = token.strip()
+            if candidate:
+                return candidate
+        return None
+
+    async def require_orchestrator_token(request: Request) -> Dict[str, str]:
+        provided = _provided_orchestrator_token(request)
+        if not provided:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Orchestrator token required",
+            )
+        info = license_tokens.authenticate(provided)
+        if not info or not info.get("orchestrator_id"):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Orchestrator token required",
+            )
+        return info
 
     async def require_admin(request: Request) -> None:
         token = settings.api_admin_token
@@ -652,6 +803,282 @@ def create_app(registry: Registry, ledger: Ledger, settings: PaymentSettings) ->
             range_end=until,
             orchestrators=summary,
         )
+
+    # ======================================================
+    # IMAGE LICENSING (public image, encrypted payload v1)
+    # ======================================================
+
+    @app.post(
+        "/api/licenses/orchestrators/{orchestrator_id}/tokens",
+        response_model=LicenseTokenCreateResponse,
+    )
+    async def mint_license_token(
+        orchestrator_id: str,
+        _: Any = Depends(require_admin),
+    ) -> LicenseTokenCreateResponse:
+        _ensure_orchestrator_exists(orchestrator_id)
+        minted = license_tokens.mint(orchestrator_id)
+        log_license_event(
+            "token_minted",
+            {"orchestrator_id": orchestrator_id, "token_id": minted["token_id"]},
+        )
+        return LicenseTokenCreateResponse(**minted)
+
+    @app.get(
+        "/api/licenses/orchestrators/{orchestrator_id}/tokens",
+        response_model=LicenseTokenListResponse,
+    )
+    async def list_license_tokens(
+        orchestrator_id: str,
+        _: Any = Depends(require_admin),
+    ) -> LicenseTokenListResponse:
+        _ensure_orchestrator_exists(orchestrator_id)
+        tokens = license_tokens.list_for_orchestrator(orchestrator_id)
+        parsed = [
+            LicenseTokenRecord(
+                token_id=item["token_id"],
+                orchestrator_id=item.get("orchestrator_id", orchestrator_id),
+                created_at=item.get("created_at", ""),
+                revoked_at=item.get("revoked_at"),
+                last_seen_at=item.get("last_seen_at"),
+            )
+            for item in tokens
+        ]
+        return LicenseTokenListResponse(tokens=parsed)
+
+    @app.delete("/api/licenses/orchestrators/{orchestrator_id}/tokens/{token_id}")
+    async def revoke_license_token(
+        orchestrator_id: str,
+        token_id: str,
+        _: Any = Depends(require_admin),
+    ) -> Dict[str, Any]:
+        _ensure_orchestrator_exists(orchestrator_id)
+        ok = license_tokens.revoke(token_id)
+        if not ok:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Token not found")
+        log_license_event(
+            "token_revoked",
+            {"orchestrator_id": orchestrator_id, "token_id": token_id},
+        )
+        return {"ok": True}
+
+    @app.put("/api/licenses/images", response_model=LicenseImageWithSecret)
+    async def upsert_license_image(
+        payload: LicenseImageUpsertPayload,
+        _: Any = Depends(require_admin),
+    ) -> LicenseImageWithSecret:
+        try:
+            record = license_images.upsert(payload.image_ref, secret_b64=payload.secret_b64)
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+        log_license_event(
+            "image_upserted",
+            {"image_ref": payload.image_ref},
+        )
+        return LicenseImageWithSecret(**record)
+
+    @app.get("/api/licenses/images", response_model=LicenseImageListResponse)
+    async def list_license_images(
+        _: Any = Depends(require_admin),
+    ) -> LicenseImageListResponse:
+        images = [
+            LicenseImageRecord(
+                image_ref=item.get("image_ref", ""),
+                created_at=item.get("created_at", ""),
+                rotated_at=item.get("rotated_at", ""),
+                revoked_at=item.get("revoked_at"),
+            )
+            for item in license_images.list()
+        ]
+        return LicenseImageListResponse(images=images)
+
+    @app.post("/api/licenses/images/revoke", response_model=Dict[str, Any])
+    async def revoke_license_image(
+        payload: LicenseImageRevokePayload,
+        _: Any = Depends(require_admin),
+    ) -> Dict[str, Any]:
+        ok = license_images.revoke(payload.image_ref)
+        if not ok:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Image not found")
+        log_license_event("image_revoked", {"image_ref": payload.image_ref})
+        return {"ok": True}
+
+    @app.get("/api/licenses/access", response_model=LicenseAccessListResponse)
+    async def list_license_access(_: Any = Depends(require_admin)) -> LicenseAccessListResponse:
+        return LicenseAccessListResponse(access=license_access.list())
+
+    @app.post("/api/licenses/access/grant", response_model=LicenseAccessListResponse)
+    async def grant_license_access(
+        payload: LicenseAccessPayload,
+        _: Any = Depends(require_admin),
+    ) -> LicenseAccessListResponse:
+        _ensure_orchestrator_exists(payload.orchestrator_id)
+        if license_images.get(payload.image_ref) is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Image not found")
+        license_access.grant(payload.orchestrator_id, payload.image_ref)
+        log_license_event(
+            "access_granted",
+            {"orchestrator_id": payload.orchestrator_id, "image_ref": payload.image_ref},
+        )
+        return LicenseAccessListResponse(access=license_access.list())
+
+    @app.post("/api/licenses/access/revoke", response_model=LicenseAccessListResponse)
+    async def revoke_license_access(
+        payload: LicenseAccessPayload,
+        _: Any = Depends(require_admin),
+    ) -> LicenseAccessListResponse:
+        _ensure_orchestrator_exists(payload.orchestrator_id)
+        license_access.revoke(payload.orchestrator_id, payload.image_ref)
+        log_license_event(
+            "access_revoked",
+            {"orchestrator_id": payload.orchestrator_id, "image_ref": payload.image_ref},
+        )
+        return LicenseAccessListResponse(access=license_access.list())
+
+    @app.post("/api/licenses/lease", response_model=LicenseLeaseResponse)
+    async def issue_license_lease(
+        payload: LicenseLeaseRequest,
+        request: Request,
+        auth: Dict[str, str] = Depends(require_orchestrator_token),
+    ) -> LicenseLeaseResponse:
+        orchestrator_id = auth.get("orchestrator_id", "")
+        if not orchestrator_id:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Orchestrator token required")
+        _ensure_orchestrator_exists(orchestrator_id)
+
+        image = license_images.get(payload.image_ref)
+        if image is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Image not found")
+        if image.get("revoked_at"):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Image access revoked")
+
+        allowed = license_access.allowed_images(orchestrator_id)
+        if payload.image_ref not in allowed:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Image access denied")
+
+        client = request_ip(request)
+        lease = license_leases.issue(
+            orchestrator_id=orchestrator_id,
+            image_ref=payload.image_ref,
+            client_ip=client,
+            lease_seconds=license_lease_seconds,
+        )
+        log_license_event(
+            "lease_issued",
+            {
+                "orchestrator_id": orchestrator_id,
+                "image_ref": payload.image_ref,
+                "lease_id": lease["lease_id"],
+                "request_ip": client,
+            },
+        )
+        return LicenseLeaseResponse(
+            lease_id=lease["lease_id"],
+            orchestrator_id=orchestrator_id,
+            image_ref=payload.image_ref,
+            expires_at=lease["expires_at"],
+            lease_seconds=license_lease_seconds,
+            secret_b64=str(image.get("secret_b64", "")),
+        )
+
+    @app.post("/api/licenses/lease/{lease_id}/heartbeat", response_model=LicenseHeartbeatResponse)
+    async def heartbeat_license_lease(
+        lease_id: str,
+        request: Request,
+        auth: Dict[str, str] = Depends(require_orchestrator_token),
+    ) -> LicenseHeartbeatResponse:
+        orchestrator_id = auth.get("orchestrator_id", "")
+        if not orchestrator_id:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Orchestrator token required")
+        record = license_leases.get(lease_id)
+        if record is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Lease not found")
+        if record.get("orchestrator_id") != orchestrator_id:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Lease not found")
+        if record.get("revoked_at"):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Lease revoked")
+
+        expires_at = record.get("expires_at")
+        try:
+            expires = parse_license_iso8601(str(expires_at))
+        except ValueError:
+            raise HTTPException(status_code=status.HTTP_410_GONE, detail="Lease expired")
+        if expires <= datetime.now(timezone.utc):
+            raise HTTPException(status_code=status.HTTP_410_GONE, detail="Lease expired")
+
+        image_ref = str(record.get("image_ref", ""))
+        image = license_images.get(image_ref)
+        if image is None or image.get("revoked_at"):
+            license_leases.revoke(lease_id)
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Image access revoked")
+        if image_ref not in license_access.allowed_images(orchestrator_id):
+            license_leases.revoke(lease_id)
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Image access denied")
+
+        client = request_ip(request)
+        updated = license_leases.heartbeat(
+            lease_id=lease_id,
+            orchestrator_id=orchestrator_id,
+            client_ip=client,
+            lease_seconds=license_lease_seconds,
+        )
+        if updated is None:
+            raise HTTPException(status_code=status.HTTP_410_GONE, detail="Lease expired")
+        log_license_event(
+            "lease_heartbeat",
+            {
+                "orchestrator_id": orchestrator_id,
+                "image_ref": image_ref,
+                "lease_id": lease_id,
+                "request_ip": client,
+            },
+        )
+        return LicenseHeartbeatResponse(
+            lease_id=lease_id,
+            expires_at=updated["expires_at"],
+            lease_seconds=license_lease_seconds,
+        )
+
+    @app.get("/api/licenses/leases", response_model=LicenseLeaseListResponse)
+    async def list_license_leases(
+        orchestrator_id: Optional[str] = Query(default=None),
+        image_ref: Optional[str] = Query(default=None),
+        active_only: bool = Query(default=True),
+        limit: int = Query(default=200, ge=1, le=2000),
+        _: Any = Depends(require_view_access),
+    ) -> LicenseLeaseListResponse:
+        now = datetime.now(timezone.utc)
+        leases: List[LicenseLeaseRecord] = []
+        for lease_id, payload in license_leases.iter_with_ids():
+            if orchestrator_id and payload.get("orchestrator_id") != orchestrator_id:
+                continue
+            if image_ref and payload.get("image_ref") != image_ref:
+                continue
+            expires_at = payload.get("expires_at")
+            revoked_at = payload.get("revoked_at")
+            try:
+                expires = parse_license_iso8601(str(expires_at))
+            except ValueError:
+                expires = now
+            active = not revoked_at and expires > now
+            if active_only and not active:
+                continue
+            leases.append(
+                LicenseLeaseRecord(
+                    lease_id=lease_id,
+                    orchestrator_id=str(payload.get("orchestrator_id", "")),
+                    image_ref=str(payload.get("image_ref", "")),
+                    issued_at=str(payload.get("issued_at", "")),
+                    last_seen_at=str(payload.get("last_seen_at", "")),
+                    last_seen_ip=payload.get("last_seen_ip"),
+                    expires_at=str(expires_at or ""),
+                    revoked_at=revoked_at,
+                    active=active,
+                )
+            )
+
+        leases.sort(key=lambda entry: entry.issued_at, reverse=True)
+        return LicenseLeaseListResponse(leases=leases[:limit])
 
     @app.post("/api/ledger/adjustments", response_model=LedgerAdjustmentResponse)
     async def adjust_ledger(
