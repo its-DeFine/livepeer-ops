@@ -284,6 +284,12 @@ class PaymentSettings(BaseSettings):
 
     @model_validator(mode="after")
     def populate_lists_and_validate(self) -> "PaymentSettings":
+        if not self.api_admin_token:
+            raw_admin = os.environ.get("PAYMENTS_API_ADMIN_TOKEN")
+            if raw_admin:
+                candidate = raw_admin.strip()
+                if candidate:
+                    self.api_admin_token = candidate
         if not self.address_denylist:
             raw = os.environ.get("PAYMENTS_ADDRESS_DENYLIST")
             if raw:
