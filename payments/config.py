@@ -130,6 +130,31 @@ class PaymentSettings(BaseSettings):
         env="PAYMENTS_WORKLOADS_PATH",
     )
 
+    license_tokens_path: Path = Field(
+        default=Path("/app/data/license_tokens.json"),
+        env="PAYMENTS_LICENSE_TOKENS_PATH",
+    )
+    license_images_path: Path = Field(
+        default=Path("/app/data/license_images.json"),
+        env="PAYMENTS_LICENSE_IMAGES_PATH",
+    )
+    license_access_path: Path = Field(
+        default=Path("/app/data/license_access.json"),
+        env="PAYMENTS_LICENSE_ACCESS_PATH",
+    )
+    license_leases_path: Path = Field(
+        default=Path("/app/data/license_leases.json"),
+        env="PAYMENTS_LICENSE_LEASES_PATH",
+    )
+    license_lease_seconds: int = Field(
+        default=900,
+        env="PAYMENTS_LICENSE_LEASE_SECONDS",
+    )
+    license_audit_log_path: Path = Field(
+        default=Path("/app/data/audit/license.log"),
+        env="PAYMENTS_LICENSE_AUDIT_LOG_PATH",
+    )
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
@@ -165,6 +190,7 @@ class PaymentSettings(BaseSettings):
         "payment_miss_threshold",
         "payment_cooldown_seconds",
         "top_cache_ttl_seconds",
+        "license_lease_seconds",
     )
     def validate_positive_int(cls, value: int) -> int:
         if value <= 0:
@@ -258,6 +284,12 @@ class PaymentSettings(BaseSettings):
 
     @model_validator(mode="after")
     def populate_lists_and_validate(self) -> "PaymentSettings":
+        if not self.api_admin_token:
+            raw_admin = os.environ.get("PAYMENTS_API_ADMIN_TOKEN")
+            if raw_admin:
+                candidate = raw_admin.strip()
+                if candidate:
+                    self.api_admin_token = candidate
         if not self.address_denylist:
             raw = os.environ.get("PAYMENTS_ADDRESS_DENYLIST")
             if raw:
