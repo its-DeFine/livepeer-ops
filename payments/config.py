@@ -317,6 +317,20 @@ class PaymentSettings(BaseSettings):
             raw_view = os.environ.get("PAYMENTS_VIEWER_TOKENS")
             if raw_view:
                 self.viewer_tokens = self.parse_viewer_tokens(raw_view)
+        if not self.session_reporter_token:
+            raw_session_token = os.environ.get("PAYMENTS_SESSION_REPORTER_TOKEN")
+            if raw_session_token:
+                candidate = raw_session_token.strip()
+                if candidate:
+                    self.session_reporter_token = candidate
+        raw_session_rate = os.environ.get("PAYMENTS_SESSION_CREDIT_ETH_PER_MINUTE")
+        if raw_session_rate is not None:
+            candidate = raw_session_rate.strip()
+            if candidate:
+                try:
+                    self.session_credit_eth_per_minute = Decimal(candidate)
+                except Exception as exc:
+                    raise ValueError("PAYMENTS_SESSION_CREDIT_ETH_PER_MINUTE must be a decimal string") from exc
         if self.single_orchestrator_mode:
             if not self.orchestrator_id:
                 raise ValueError(
