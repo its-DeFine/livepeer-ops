@@ -51,10 +51,19 @@ curl -sS -X POST \
 2. Register an image secret (used to decrypt the payload):
 
 ```bash
+IMAGE_REF="ghcr.io/its-define/unreal_vtuber/embody-ue-ps:enc-v1"
+
+# secret_b64 is expected to be base64(age-identity-file-bytes)
+SECRET_B64="$(python3 - <<'PY'
+import base64, pathlib
+print(base64.b64encode(pathlib.Path("embody-ue-ps-enc-v1.agekey").read_bytes()).decode("ascii"))
+PY
+)"
+
 curl -sS -X PUT \
   -H "X-Admin-Token: $PAYMENTS_ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"image_ref":"ghcr.io/its-define/unreal_vtuber/embody-ue-ps:enc-v1"}' \
+  -d "{\"image_ref\":\"$IMAGE_REF\",\"secret_b64\":\"$SECRET_B64\"}" \
   "https://<payments>/api/licenses/images"
 ```
 
@@ -64,7 +73,7 @@ curl -sS -X PUT \
 curl -sS -X POST \
   -H "X-Admin-Token: $PAYMENTS_ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"orchestrator_id":"<orchestrator_id>","image_ref":"ghcr.io/its-define/unreal_vtuber/embody-ue-ps:enc-v1"}' \
+  -d "{\"orchestrator_id\":\"<orchestrator_id>\",\"image_ref\":\"$IMAGE_REF\"}" \
   "https://<payments>/api/licenses/access/grant"
 ```
 
@@ -76,9 +85,11 @@ Request a lease + decryption secret:
 curl -sS -X POST \
   -H "Authorization: Bearer $ORCH_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"image_ref":"ghcr.io/its-define/unreal_vtuber/embody-ue-ps:enc-v1"}' \
+  -d "{\"image_ref\":\"$IMAGE_REF\"}" \
   "https://<payments>/api/licenses/lease"
 ```
+
+The lease response includes `secret_b64` which can be used to decrypt an encrypted image artifact (see `Unreal_Vtuber/tools/encrypted-game-image/consume.sh`).
 
 Then periodically renew:
 
@@ -88,3 +99,13 @@ curl -sS -X POST -H "Authorization: Bearer $ORCH_TOKEN" \
 ```
 
 Audit log: `data/audit/license.log` (JSONL).
+
+## Session Billing (Pixel Streaming usage)
+
+Edges can report “session connected / heartbeat / disconnected” events to the Payments backend, so orchestrators are credited by **connected session time**.
+
+- Enable on Payments: set `PAYMENTS_SESSION_CREDIT_ETH_PER_MINUTE` (non-zero) and optionally require `PAYMENTS_SESSION_REPORTER_TOKEN`.
+- Configure each edge `ps-gateway`: set `PAYMENTS_API_URL` and `PAYMENTS_SESSION_TOKEN` (must match `PAYMENTS_SESSION_REPORTER_TOKEN`).
+- Reporting endpoint: `POST /api/sessions/events`
+- Audit endpoint (viewer/admin token): `GET /api/sessions`
+- Ledger entries use `reason="session_time"` with `session_id`, `edge_id`, and `delta_ms` in metadata.

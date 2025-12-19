@@ -129,6 +129,18 @@ class PaymentSettings(BaseSettings):
         default=Path("/app/data/workloads.json"),
         env="PAYMENTS_WORKLOADS_PATH",
     )
+    sessions_path: Path = Field(
+        default=Path("/app/data/sessions.json"),
+        env="PAYMENTS_SESSIONS_PATH",
+    )
+    session_reporter_token: Optional[str] = Field(
+        default=None,
+        env="PAYMENTS_SESSION_REPORTER_TOKEN",
+    )
+    session_credit_eth_per_minute: Decimal = Field(
+        default=Decimal("0"),
+        env="PAYMENTS_SESSION_CREDIT_ETH_PER_MINUTE",
+    )
 
     license_tokens_path: Path = Field(
         default=Path("/app/data/license_tokens.json"),
@@ -172,6 +184,7 @@ class PaymentSettings(BaseSettings):
     @field_validator(
         "payment_increment_eth",
         "payout_threshold_eth",
+        "session_credit_eth_per_minute",
         mode="before",
     )
     def coerc_decimal(cls, value):  # type: ignore[override]
