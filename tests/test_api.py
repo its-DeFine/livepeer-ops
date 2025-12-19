@@ -4,6 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 from decimal import Decimal
+from datetime import datetime, timedelta, timezone
 
 import httpx
 import pytest
@@ -531,3 +532,79 @@ async def test_ledger_adjustment_updates_balance_and_journal(temp_paths):
     assert entry["reason"] == "manual-fix"
     assert entry["metadata"]["reference_workload_id"] == "run-123"
     assert entry["metadata"]["notes"] == "rectify missing artifact"
+
+
+@pytest.mark.anyio("asyncio")
+async def test_session_events_require_reporter_token_when_configured(temp_paths):
+    registry, ledger = build_registry(temp_paths)
+    app_settings = build_settings(
+        temp_paths,
+        session_reporter_token="secret-token",
+        session_credit_eth_per_minute=Decimal("0"),
+    )
+    app = create_app(registry, ledger, app_settings)
+
+    payload = {
+        "session_id": "sess-1",
+        "upstream_addr": "203.0.113.10",
+        "upstream_port": 8080,
+        "edge_id": "a",
+        "event": "start",
+    }
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        missing = await client.post("/api/sessions/events", json=payload)
+        ok = await client.post("/api/sessions/events", json=payload, headers={"X-Session-Token": "secret-token"})
+
+    assert missing.status_code == 401
+    assert ok.status_code == 200
+    assert ok.json()["session_id"] == "sess-1"
+
+
+@pytest.mark.anyio("asyncio")
+async def test_session_events_credit_by_time_delta(temp_paths):
+    registry, ledger = build_registry(temp_paths)
+
+    upstream_ip = "203.0.113.10"
+    registry.register(
+        orchestrator_id="orch-session",
+        address="0x" + "D" * 40,
+        metadata={"host_public_ip": upstream_ip},
+        skip_rank_validation=True,
+    )
+
+    app_settings = build_settings(
+        temp_paths,
+        session_credit_eth_per_minute=Decimal("0.06"),  # 0.001 ETH/sec
+    )
+    app = create_app(registry, ledger, app_settings)
+
+    t0 = datetime(2025, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+    t1 = t0 + timedelta(seconds=10)
+    times = [t0, t1]
+
+    class FakeDateTime:
+        @classmethod
+        def now(cls, _tz=None):  # noqa: ANN001 - test stub
+            return times.pop(0)
+
+    payload = {
+        "session_id": "sess-credit-1",
+        "upstream_addr": upstream_ip,
+        "upstream_port": 8080,
+        "edge_id": "a",
+    }
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        with patch("payments.api.datetime", FakeDateTime):
+            start = await client.post("/api/sessions/events", json={**payload, "event": "start"})
+            heartbeat = await client.post("/api/sessions/events", json={**payload, "event": "heartbeat"})
+
+    assert start.status_code == 200
+    assert heartbeat.status_code == 200
+    assert ledger.get_balance("orch-session") == Decimal("0.01")
+    body = heartbeat.json()
+    assert body["billed_ms"] == 10_000
+    assert body["billed_eth"] == "0.01"

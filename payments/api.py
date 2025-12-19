@@ -26,6 +26,7 @@ from .licenses import (
     OrchestratorTokenStore,
     parse_iso8601 as parse_license_iso8601,
 )
+from .sessions import SessionStore
 from .workloads import WorkloadStore
 
 
@@ -332,12 +333,70 @@ class LicenseLeaseRecord(BaseModel):
 class LicenseLeaseListResponse(BaseModel):
     leases: List[LicenseLeaseRecord]
 
+# -------------------------
+# Session metering (PS usage)
+# -------------------------
+
+SESSION_EVENTS = {"start", "heartbeat", "end"}
+
+
+class SessionEventPayload(BaseModel):
+    session_id: str = Field(min_length=1, max_length=128)
+    upstream_addr: str = Field(min_length=1, max_length=255)
+    upstream_port: int = Field(ge=1, le=65535)
+    edge_id: Optional[str] = Field(default=None, max_length=64)
+    event: str = Field(default="heartbeat", max_length=32)
+
+    @field_validator("event")
+    @classmethod
+    def validate_event(cls, value: str) -> str:
+        candidate = (value or "").strip().lower()
+        if candidate not in SESSION_EVENTS:
+            raise ValueError("invalid session event")
+        return candidate
+
+    @field_validator("upstream_addr")
+    @classmethod
+    def validate_upstream_addr(cls, value: str) -> str:
+        candidate = (value or "").strip()
+        if not candidate:
+            raise ValueError("upstream_addr required")
+        # Accept IP literals (recommended). Hostnames are rejected to keep attribution unambiguous.
+        try:
+            ipaddress.ip_address(candidate)
+        except ValueError as exc:
+            raise ValueError("upstream_addr must be an IP address") from exc
+        return candidate
+
+
+class SessionRecord(BaseModel):
+    session_id: str
+    orchestrator_id: Optional[str] = None
+    upstream_addr: str
+    upstream_port: int
+    edge_id: Optional[str] = None
+    started_at: str
+    last_seen_at: str
+    ended_at: Optional[str]
+    last_billed_at: str
+    billed_ms: int
+    billed_eth: str
+    last_credited_eth: Optional[str] = None
+    heartbeat_count: int = 0
+    last_event: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+class SessionListResponse(BaseModel):
+    sessions: List[SessionRecord]
+
 
 def create_app(registry: Registry, ledger: Ledger, settings: PaymentSettings) -> FastAPI:
     app = FastAPI(title="Embody Payments", version="1.0.0")
 
     workload_store = WorkloadStore(settings.workloads_path)
     data_dir = Path(getattr(settings, "workloads_path", Path("/app/data/workloads.json"))).parent
+    session_store = SessionStore(Path(getattr(settings, "sessions_path", data_dir / "sessions.json")))
     license_tokens = OrchestratorTokenStore(
         Path(getattr(settings, "license_tokens_path", data_dir / "license_tokens.json"))
     )
@@ -434,6 +493,19 @@ def create_app(registry: Registry, ledger: Ledger, settings: PaymentSettings) ->
                 return candidate
         return None
 
+    def _provided_session_token(request: Request) -> Optional[str]:
+        token = request.headers.get("X-Session-Token")
+        if token:
+            candidate = token.strip()
+            if candidate:
+                return candidate
+        auth = request.headers.get("Authorization") or ""
+        if auth.lower().startswith("bearer "):
+            candidate = auth.split(" ", 1)[1].strip()
+            if candidate:
+                return candidate
+        return None
+
     async def require_orchestrator_token(request: Request) -> Dict[str, str]:
         provided = _provided_orchestrator_token(request)
         if not provided:
@@ -448,6 +520,14 @@ def create_app(registry: Registry, ledger: Ledger, settings: PaymentSettings) ->
                 detail="Orchestrator token required",
             )
         return info
+
+    async def require_session_reporter(request: Request) -> None:
+        expected = getattr(settings, "session_reporter_token", None) or None
+        if not expected:
+            return
+        provided = _provided_session_token(request)
+        if provided != expected:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Session reporter token required")
 
     async def require_admin(request: Request) -> None:
         token = settings.api_admin_token
@@ -803,6 +883,62 @@ def create_app(registry: Registry, ledger: Ledger, settings: PaymentSettings) ->
             range_end=until,
             orchestrators=summary,
         )
+
+    # ======================================================
+    # SESSION METERING (Pixel Streaming usage)
+    # ======================================================
+
+    @app.post("/api/sessions/events", response_model=SessionRecord)
+    async def record_session_event(
+        payload: SessionEventPayload,
+        _: Request,
+        __: Any = Depends(require_session_reporter),
+    ) -> SessionRecord:
+        now = datetime.now(timezone.utc)
+        upstream_addr = payload.upstream_addr
+
+        orch_id: Optional[str] = None
+        for candidate_id, record in registry.all_records().items():
+            if not isinstance(record, dict):
+                continue
+            host_ip = record.get("host_public_ip")
+            if host_ip and str(host_ip) == upstream_addr:
+                orch_id = candidate_id
+                break
+
+        credit_rate = Decimal(str(getattr(settings, "session_credit_eth_per_minute", "0") or "0"))
+        stored = session_store.apply_event(
+            session_id=payload.session_id,
+            event=payload.event,
+            now=now,
+            orchestrator_id=orch_id,
+            upstream_addr=payload.upstream_addr,
+            upstream_port=payload.upstream_port,
+            edge_id=payload.edge_id,
+            credit_eth_per_minute=credit_rate,
+            ledger=ledger,
+        )
+        return SessionRecord(**stored)
+
+    @app.get("/api/sessions", response_model=SessionListResponse)
+    async def list_sessions(
+        orchestrator_id: Optional[str] = Query(default=None),
+        active_only: bool = Query(default=False),
+        limit: int = Query(default=200, ge=1, le=2000),
+        _: Any = Depends(require_view_access),
+    ) -> SessionListResponse:
+        sessions: List[SessionRecord] = []
+        for _, record in session_store.iter_with_ids():
+            if orchestrator_id and record.get("orchestrator_id") != orchestrator_id:
+                continue
+            if active_only and record.get("ended_at"):
+                continue
+            try:
+                sessions.append(SessionRecord(**record))
+            except Exception:
+                continue
+        sessions.sort(key=lambda entry: entry.started_at, reverse=True)
+        return SessionListResponse(sessions=sessions[:limit])
 
     # ======================================================
     # IMAGE LICENSING (public image, encrypted payload v1)
