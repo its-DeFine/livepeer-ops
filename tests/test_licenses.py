@@ -203,3 +203,86 @@ async def test_license_access_revocation_blocks_heartbeat(temp_paths):
             headers={"X-Orchestrator-Token": token},
         )
         assert heartbeat.status_code == 403
+
+
+@pytest.mark.anyio("asyncio")
+async def test_license_invite_redeem_mints_token_and_grants_access(temp_paths):
+    registry, ledger = build_registry(temp_paths)
+    app_settings = build_settings(temp_paths, license_lease_seconds=30)
+    app = create_app(registry, ledger, app_settings)
+
+    image_ref = "ghcr.io/its-define/unreal_vtuber/embody-ue-ps:enc-v1"
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        # Admin: register image secret (required to create invites)
+        image = await client.put(
+            "/api/licenses/images",
+            json={"image_ref": image_ref},
+            headers={"X-Admin-Token": "secret"},
+        )
+        assert image.status_code == 200
+
+        # Admin: create invite
+        invite = await client.post(
+            "/api/licenses/invites",
+            json={"image_ref": image_ref, "ttl_seconds": 3600, "note": "test"},
+            headers={"X-Admin-Token": "secret"},
+        )
+        assert invite.status_code == 200
+        invite_body = invite.json()
+        code = invite_body["code"]
+        assert code
+
+        # Orchestrator: redeem invite -> token
+        orchestrator_id = "orch-invite"
+        address = "0xCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+        redeemed = await client.post(
+            "/api/licenses/invites/redeem",
+            json={"code": code, "orchestrator_id": orchestrator_id, "address": address},
+        )
+        assert redeemed.status_code == 200
+        redeemed_body = redeemed.json()
+        token = redeemed_body["token"]
+        assert token
+        assert redeemed_body["token_id"]
+        assert redeemed_body["image_ref"] == image_ref
+
+        # Orchestrator: lease now works (invite redeem granted access)
+        lease = await client.post(
+            "/api/licenses/lease",
+            json={"image_ref": image_ref},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert lease.status_code == 200
+        lease_body = lease.json()
+        assert lease_body["orchestrator_id"] == orchestrator_id
+        assert lease_body["secret_b64"]
+
+        # Redeeming the same code again is rejected
+        redeemed_again = await client.post(
+            "/api/licenses/invites/redeem",
+            json={"code": code, "orchestrator_id": orchestrator_id, "address": address},
+        )
+        assert redeemed_again.status_code == 409
+
+        # Unknown code => 404
+        missing = await client.post(
+            "/api/licenses/invites/redeem",
+            json={"code": "NOT-A-REAL-CODE", "orchestrator_id": "x", "address": address},
+        )
+        assert missing.status_code == 404
+
+        # Expired code => 410
+        expired = await client.post(
+            "/api/licenses/invites",
+            json={"image_ref": image_ref, "expires_at": "2000-01-01T00:00:00Z"},
+            headers={"X-Admin-Token": "secret"},
+        )
+        assert expired.status_code == 200
+        expired_code = expired.json()["code"]
+        expired_redeem = await client.post(
+            "/api/licenses/invites/redeem",
+            json={"code": expired_code, "orchestrator_id": "orch-expired", "address": address},
+        )
+        assert expired_redeem.status_code == 410

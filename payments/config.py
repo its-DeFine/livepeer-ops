@@ -158,9 +158,17 @@ class PaymentSettings(BaseSettings):
         default=Path("/app/data/license_leases.json"),
         env="PAYMENTS_LICENSE_LEASES_PATH",
     )
+    license_invites_path: Path = Field(
+        default=Path("/app/data/license_invites.json"),
+        env="PAYMENTS_LICENSE_INVITES_PATH",
+    )
     license_lease_seconds: int = Field(
         default=900,
         env="PAYMENTS_LICENSE_LEASE_SECONDS",
+    )
+    license_invite_default_ttl_seconds: int = Field(
+        default=7 * 24 * 60 * 60,
+        env="PAYMENTS_LICENSE_INVITE_DEFAULT_TTL_SECONDS",
     )
     license_audit_log_path: Path = Field(
         default=Path("/app/data/audit/license.log"),
@@ -204,6 +212,7 @@ class PaymentSettings(BaseSettings):
         "payment_cooldown_seconds",
         "top_cache_ttl_seconds",
         "license_lease_seconds",
+        "license_invite_default_ttl_seconds",
     )
     def validate_positive_int(cls, value: int) -> int:
         if value <= 0:

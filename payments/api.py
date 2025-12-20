@@ -7,7 +7,7 @@ import logging
 import threading
 import time
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional
@@ -22,6 +22,7 @@ from .registry import Registry, RegistryError
 from .licenses import (
     ImageAccessStore,
     ImageKeyStore,
+    InviteCodeStore,
     LeaseStore,
     OrchestratorTokenStore,
     parse_iso8601 as parse_license_iso8601,
@@ -333,6 +334,76 @@ class LicenseLeaseRecord(BaseModel):
 class LicenseLeaseListResponse(BaseModel):
     leases: List[LicenseLeaseRecord]
 
+
+class LicenseInviteCreatePayload(BaseModel):
+    image_ref: str = Field(min_length=1, max_length=512)
+    ttl_seconds: Optional[int] = Field(default=None, ge=60, le=60 * 60 * 24 * 90)
+    expires_at: Optional[str] = Field(default=None, max_length=64)
+    note: Optional[str] = Field(default=None, max_length=256)
+
+    @model_validator(mode="after")
+    def validate_expiration(self):  # type: ignore[override]
+        if self.ttl_seconds is not None and self.expires_at:
+            raise ValueError("Provide ttl_seconds or expires_at, not both")
+        return self
+
+
+class LicenseInviteCreateResponse(BaseModel):
+    invite_id: str
+    code: str
+    image_ref: str
+    created_at: str
+    expires_at: Optional[str]
+
+
+class LicenseInviteRecord(BaseModel):
+    invite_id: str
+    image_ref: str
+    created_at: str
+    expires_at: Optional[str]
+    note: Optional[str]
+    revoked_at: Optional[str]
+    redeeming_at: Optional[str]
+    redeemed_at: Optional[str]
+    redeemed_by: Optional[str]
+    redeemed_ip: Optional[str]
+    redeemed_token_id: Optional[str]
+
+
+class LicenseInviteListResponse(BaseModel):
+    invites: List[LicenseInviteRecord]
+
+
+class LicenseInviteRevokePayload(BaseModel):
+    invite_id: str = Field(min_length=1, max_length=128)
+
+
+class LicenseInviteRedeemPayload(BaseModel):
+    code: str = Field(min_length=4, max_length=128)
+    orchestrator_id: str = Field(min_length=1, max_length=128)
+    address: str = Field(pattern=r"^0x[a-fA-F0-9]{40}$")
+    capability: Optional[str] = Field(default=None, max_length=128)
+    contact_email: Optional[str] = Field(default=None, max_length=255)
+
+    @field_validator("contact_email")
+    @classmethod
+    def validate_contact_email(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return value
+        candidate = value.strip()
+        if not candidate:
+            return None
+        if "@" not in candidate or candidate.startswith("@") or candidate.endswith("@"):
+            raise ValueError("contact_email must include '@'")
+        return candidate
+
+
+class LicenseInviteRedeemResponse(BaseModel):
+    orchestrator_id: str
+    image_ref: str
+    token_id: str
+    token: str
+
 # -------------------------
 # Session metering (PS usage)
 # -------------------------
@@ -409,7 +480,11 @@ def create_app(registry: Registry, ledger: Ledger, settings: PaymentSettings) ->
     license_leases = LeaseStore(
         Path(getattr(settings, "license_leases_path", data_dir / "license_leases.json"))
     )
+    license_invites = InviteCodeStore(
+        Path(getattr(settings, "license_invites_path", data_dir / "license_invites.json"))
+    )
     license_lease_seconds = int(getattr(settings, "license_lease_seconds", 900))
+    license_invite_default_ttl_seconds = int(getattr(settings, "license_invite_default_ttl_seconds", 7 * 24 * 60 * 60))
     license_audit_log_path = Path(
         getattr(settings, "license_audit_log_path", data_dir / "audit" / "license.log")
     )
@@ -1070,6 +1145,156 @@ def create_app(registry: Registry, ledger: Ledger, settings: PaymentSettings) ->
             {"orchestrator_id": payload.orchestrator_id, "image_ref": payload.image_ref},
         )
         return LicenseAccessListResponse(access=license_access.list())
+
+    @app.post("/api/licenses/invites", response_model=LicenseInviteCreateResponse)
+    async def create_license_invite(
+        payload: LicenseInviteCreatePayload,
+        _: Any = Depends(require_admin),
+    ) -> LicenseInviteCreateResponse:
+        if license_images.get(payload.image_ref) is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Image not found")
+
+        expires_at: Optional[datetime] = None
+        if payload.expires_at:
+            try:
+                expires_at = parse_license_iso8601(payload.expires_at)
+            except ValueError:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid expires_at timestamp")
+        else:
+            ttl = payload.ttl_seconds if payload.ttl_seconds is not None else license_invite_default_ttl_seconds
+            expires_at = datetime.now(timezone.utc) + timedelta(seconds=ttl)
+
+        created = license_invites.create(
+            image_ref=payload.image_ref,
+            expires_at=expires_at,
+            note=payload.note,
+        )
+        log_license_event(
+            "invite_created",
+            {
+                "invite_id": created.get("invite_id"),
+                "image_ref": payload.image_ref,
+                "expires_at": created.get("expires_at"),
+            },
+        )
+        return LicenseInviteCreateResponse(
+            invite_id=str(created.get("invite_id", "")),
+            code=str(created.get("code", "")),
+            image_ref=str(created.get("image_ref", payload.image_ref)),
+            created_at=str(created.get("created_at", "")),
+            expires_at=created.get("expires_at"),
+        )
+
+    @app.get("/api/licenses/invites", response_model=LicenseInviteListResponse)
+    async def list_license_invites(_: Any = Depends(require_admin)) -> LicenseInviteListResponse:
+        invites: List[LicenseInviteRecord] = []
+        for item in license_invites.list():
+            if not isinstance(item, dict):
+                continue
+            invites.append(
+                LicenseInviteRecord(
+                    invite_id=str(item.get("invite_id", "")),
+                    image_ref=str(item.get("image_ref", "")),
+                    created_at=str(item.get("created_at", "")),
+                    expires_at=item.get("expires_at"),
+                    note=item.get("note"),
+                    revoked_at=item.get("revoked_at"),
+                    redeeming_at=item.get("redeeming_at"),
+                    redeemed_at=item.get("redeemed_at"),
+                    redeemed_by=item.get("redeemed_by"),
+                    redeemed_ip=item.get("redeemed_ip"),
+                    redeemed_token_id=item.get("redeemed_token_id"),
+                )
+            )
+        return LicenseInviteListResponse(invites=invites)
+
+    @app.post("/api/licenses/invites/revoke", response_model=Dict[str, Any])
+    async def revoke_license_invite(
+        payload: LicenseInviteRevokePayload,
+        _: Any = Depends(require_admin),
+    ) -> Dict[str, Any]:
+        ok = license_invites.revoke(payload.invite_id)
+        if not ok:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Invite not found")
+        log_license_event("invite_revoked", {"invite_id": payload.invite_id})
+        return {"ok": True}
+
+    invite_redeem_limiter = RateLimiter(max_calls=30, window_seconds=60)
+
+    @app.post("/api/licenses/invites/redeem", response_model=LicenseInviteRedeemResponse)
+    async def redeem_license_invite(payload: LicenseInviteRedeemPayload, request: Request) -> LicenseInviteRedeemResponse:
+        client = request_ip(request) or "unknown"
+        if not invite_redeem_limiter.allow(f"ip:{client}"):
+            raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Too many attempts; slow down")
+
+        try:
+            reserved = license_invites.reserve(payload.code, client_ip=request_ip(request))
+        except KeyError:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Invite not found")
+        except TimeoutError:
+            raise HTTPException(status_code=status.HTTP_410_GONE, detail="Invite expired")
+        except PermissionError:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invite revoked")
+        except FileExistsError:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Invite already redeemed")
+        except RuntimeError:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Invite redemption already in progress")
+
+        invite_id = str(reserved.get("invite_id", ""))
+        image_ref = str(reserved.get("image_ref", ""))
+        if not invite_id or not image_ref:
+            license_invites.release(invite_id)
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Invalid invite record")
+
+        try:
+            image = license_images.get(image_ref)
+            if image is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Image not found")
+            if image.get("revoked_at"):
+                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Image access revoked")
+
+            metadata = {
+                "capability": payload.capability,
+                "contact_email": payload.contact_email,
+                "request_ip": request_ip(request),
+                # Invite codes are admin-issued; treat as authorized for payouts.
+                "is_top_100": True,
+            }
+            registry.register(
+                orchestrator_id=payload.orchestrator_id,
+                address=payload.address,
+                metadata=metadata,
+                skip_rank_validation=True,
+            )
+
+            license_access.grant(payload.orchestrator_id, image_ref)
+            minted = license_tokens.mint(payload.orchestrator_id)
+            license_invites.commit(
+                invite_id=invite_id,
+                orchestrator_id=payload.orchestrator_id,
+                token_id=minted["token_id"],
+                client_ip=request_ip(request),
+            )
+        except Exception:
+            license_invites.release(invite_id)
+            raise
+
+        log_license_event(
+            "invite_redeemed",
+            {
+                "invite_id": invite_id,
+                "orchestrator_id": payload.orchestrator_id,
+                "image_ref": image_ref,
+                "token_id": minted.get("token_id"),
+                "request_ip": request_ip(request),
+            },
+        )
+        return LicenseInviteRedeemResponse(
+            orchestrator_id=payload.orchestrator_id,
+            image_ref=image_ref,
+            token_id=minted["token_id"],
+            token=minted["token"],
+        )
 
     @app.post("/api/licenses/lease", response_model=LicenseLeaseResponse)
     async def issue_license_lease(
