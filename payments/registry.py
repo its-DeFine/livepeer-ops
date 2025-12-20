@@ -472,6 +472,18 @@ class Registry:
             record["last_healthy_at"] = datetime.now(timezone.utc).isoformat()
             self._persist()
 
+    def record_forwarder_health(self, orchestrator_id: str, payload: Dict[str, Any], *, source: str = "forwarder") -> None:
+        with self._lock:
+            record = self._records.get(orchestrator_id)
+            if not record:
+                return
+            record["forwarder_health"] = {
+                "source": source,
+                "reported_at": datetime.now(timezone.utc).isoformat(),
+                "data": payload,
+            }
+            self._persist()
+
     def get_record(self, orchestrator_id: str) -> Optional[Dict[str, Any]]:
         with self._lock:
             record = self._records.get(orchestrator_id)

@@ -160,6 +160,30 @@ class PaymentProcessor:
     def _collect_health_summary(
         self, orchestrator_id: str, record: Dict[str, Any]
     ) -> Optional[Dict[str, Any]]:
+        forwarder_health = record.get("forwarder_health")
+        if isinstance(forwarder_health, dict):
+            reported_at = forwarder_health.get("reported_at")
+            data = forwarder_health.get("data")
+            if isinstance(reported_at, str) and isinstance(data, dict) and isinstance(data.get("summary"), dict):
+                try:
+                    from datetime import datetime, timezone
+
+                    reported_dt = datetime.fromisoformat(reported_at)
+                    if reported_dt.tzinfo is None:
+                        reported_dt = reported_dt.replace(tzinfo=timezone.utc)
+                    age_seconds = (datetime.now(timezone.utc) - reported_dt).total_seconds()
+                except Exception:
+                    age_seconds = None
+                ttl_seconds = int(getattr(self.settings, "forwarder_health_ttl_seconds", 120) or 120)
+                if age_seconds is not None and 0 <= age_seconds <= ttl_seconds:
+                    summary = dict(data.get("summary") or {})
+                    summary.setdefault("health_source", "forwarder")
+                    if record.get("min_service_uptime") is not None:
+                        summary["min_service_uptime"] = float(record["min_service_uptime"])
+                    else:
+                        summary.setdefault("min_service_uptime", self.settings.default_min_service_uptime)
+                    return summary
+
         health_url = record.get("health_url")
         monitor_services = record.get("monitored_services")
 

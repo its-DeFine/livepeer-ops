@@ -142,6 +142,11 @@ class PaymentSettings(BaseSettings):
         env="PAYMENTS_SESSION_CREDIT_ETH_PER_MINUTE",
     )
 
+    forwarder_health_ttl_seconds: int = Field(
+        default=120,
+        env="PAYMENTS_FORWARDER_HEALTH_TTL_SECONDS",
+    )
+
     license_tokens_path: Path = Field(
         default=Path("/app/data/license_tokens.json"),
         env="PAYMENTS_LICENSE_TOKENS_PATH",

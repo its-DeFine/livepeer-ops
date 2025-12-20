@@ -143,6 +143,12 @@ class OrchestratorRecord(BaseModel):
     monitored_services: Optional[List[str]]
     min_service_uptime: Optional[float]
 
+class ForwarderHealthReportPayload(BaseModel):
+    """Allows a trusted watcher (typically running on the forwarder) to report health."""
+
+    source: str = Field(default="forwarder", max_length=64)
+    data: Dict[str, Any]
+
 
 class OrchestratorsResponse(BaseModel):
     orchestrators: List[OrchestratorRecord]
@@ -827,6 +833,16 @@ def create_app(registry: Registry, ledger: Ledger, settings: PaymentSettings) ->
             min_service_uptime=record.get("min_service_uptime"),
         )
         return redact_record(entry, include_sensitive_fields(request))
+
+    @app.post("/api/orchestrators/{orchestrator_id}/health")
+    async def report_forwarder_health(
+        orchestrator_id: str,
+        payload: ForwarderHealthReportPayload,
+        _: Any = Depends(require_admin),
+    ) -> Dict[str, Any]:
+        _ensure_orchestrator_exists(orchestrator_id)
+        registry.record_forwarder_health(orchestrator_id, payload.data, source=payload.source)
+        return {"ok": True}
 
     def _ensure_orchestrator_exists(orchestrator_id: str) -> None:
         if not registry.get_record(orchestrator_id):

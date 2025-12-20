@@ -34,6 +34,15 @@ docker compose up -d
 
 See `docs/backups.md`.
 
+## Forwarder Health Reports (recommended)
+
+To avoid Payments polling every orchestrator on every cycle, a trusted watcher (typically running on the forwarder) can push periodic health snapshots into the registry:
+
+- Report endpoint (admin token): `POST /api/orchestrators/{orchestrator_id}/health`
+- Controls staleness: `PAYMENTS_FORWARDER_HEALTH_TTL_SECONDS` (default `120`)
+
+When a fresh forwarder health snapshot exists, Payments uses it for payment eligibility decisions instead of calling the orchestrator `health_url`.
+
 ## Image Licensing (public-but-encrypted images)
 
 This backend can act as a minimal “license/key + lease” service for containers that ship an encrypted payload.
