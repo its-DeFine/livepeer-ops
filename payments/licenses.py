@@ -5,6 +5,7 @@ import base64
 import hashlib
 import hmac
 import json
+import re
 import secrets
 import threading
 import uuid
@@ -40,6 +41,34 @@ def _random_secret_b64(byte_count: int = 64) -> str:
 def normalize_invite_code(code: str) -> str:
     """Normalizes a human-entered invite code for stable matching."""
     return "".join(ch for ch in (code or "").strip().upper() if ch.isalnum())
+
+
+_ETH_ADDRESS_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
+
+
+def normalize_eth_address(address: str) -> str:
+    candidate = (address or "").strip()
+    if not _ETH_ADDRESS_RE.match(candidate):
+        raise ValueError("invalid address")
+    return "0x" + candidate[2:].lower()
+
+
+def parse_s3_uri(uri: str) -> Tuple[str, str]:
+    candidate = (uri or "").strip()
+    if not candidate.startswith("s3://"):
+        raise ValueError("invalid s3 uri")
+    stripped = candidate[5:]
+    if "/" not in stripped:
+        raise ValueError("invalid s3 uri")
+    bucket, key = stripped.split("/", 1)
+    if not bucket or not key:
+        raise ValueError("invalid s3 uri")
+    return bucket, key
+
+
+def normalize_s3_uri(uri: str) -> str:
+    bucket, key = parse_s3_uri(uri)
+    return f"s3://{bucket}/{key}"
 
 
 def _generate_invite_code() -> str:
@@ -163,21 +192,45 @@ class ImageKeyStore:
             json.dump(self._images, handle, indent=2, sort_keys=True)
         tmp.replace(self.path)
 
-    def upsert(self, image_ref: str, *, secret_b64: Optional[str] = None) -> Dict[str, Any]:
-        candidate = secret_b64 or _random_secret_b64(64)
+    def upsert(
+        self,
+        image_ref: str,
+        *,
+        secret_b64: Optional[str] = None,
+        artifact_s3_uri: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        with self._lock:
+            existing = self._images.get(image_ref)
+
+        existing_secret = existing.get("secret_b64") if isinstance(existing, dict) else None
+        existing_created_at = existing.get("created_at") if isinstance(existing, dict) else None
+        existing_rotated_at = existing.get("rotated_at") if isinstance(existing, dict) else None
+        existing_artifact_s3_uri = existing.get("artifact_s3_uri") if isinstance(existing, dict) else None
+
+        secret_rotated = secret_b64 is not None or not isinstance(existing_secret, str)
+        candidate_secret = secret_b64 or (existing_secret if isinstance(existing_secret, str) else _random_secret_b64(64))
+
         try:
-            decoded = base64.b64decode(candidate.encode("ascii"), validate=True)
+            decoded = base64.b64decode(candidate_secret.encode("ascii"), validate=True)
         except Exception as exc:
             raise ValueError("secret_b64 must be valid base64") from exc
         if len(decoded) < 32:
             raise ValueError("secret_b64 must decode to at least 32 bytes")
 
+        candidate_artifact_s3_uri = existing_artifact_s3_uri if isinstance(existing_artifact_s3_uri, str) else None
+        if artifact_s3_uri is not None:
+            cleaned = (artifact_s3_uri or "").strip()
+            candidate_artifact_s3_uri = normalize_s3_uri(cleaned) if cleaned else None
+
         now = isoformat(utcnow())
+        created_at = existing_created_at if isinstance(existing_created_at, str) and existing_created_at else now
+        rotated_at = now if secret_rotated else (existing_rotated_at if isinstance(existing_rotated_at, str) else created_at)
         record = {
             "image_ref": image_ref,
-            "secret_b64": candidate,
-            "created_at": now,
-            "rotated_at": now,
+            "secret_b64": candidate_secret,
+            "artifact_s3_uri": candidate_artifact_s3_uri,
+            "created_at": created_at,
+            "rotated_at": rotated_at,
             "revoked_at": None,
         }
         with self._lock:
@@ -394,11 +447,13 @@ class InviteCodeStore:
         self,
         *,
         image_ref: str,
+        bound_address: str,
         expires_at: Optional[datetime] = None,
         note: Optional[str] = None,
     ) -> Dict[str, Any]:
         now = utcnow()
         expires = expires_at.astimezone(timezone.utc) if expires_at else None
+        normalized_address = normalize_eth_address(bound_address)
 
         with self._lock:
             code = _generate_invite_code()
@@ -416,6 +471,7 @@ class InviteCodeStore:
                 "invite_id": invite_id,
                 "code_hash": code_hash,
                 "image_ref": image_ref,
+                "bound_address": normalized_address,
                 "created_at": isoformat(now),
                 "expires_at": isoformat(expires) if expires else None,
                 "note": note,
@@ -424,6 +480,7 @@ class InviteCodeStore:
                 "redeemed_at": None,
                 "redeemed_by": None,
                 "redeemed_ip": None,
+                "redeemed_address": None,
                 "redeemed_token_id": None,
             }
             self._invites[invite_id] = record
@@ -506,6 +563,7 @@ class InviteCodeStore:
         invite_id: str,
         orchestrator_id: str,
         token_id: str,
+        address: Optional[str] = None,
         client_ip: Optional[str] = None,
     ) -> bool:
         now = utcnow()
@@ -523,6 +581,11 @@ class InviteCodeStore:
             updated["redeemed_at"] = isoformat(now)
             updated["redeemed_by"] = orchestrator_id
             updated["redeemed_ip"] = client_ip or updated.get("redeemed_ip")
+            if address:
+                try:
+                    updated["redeemed_address"] = normalize_eth_address(address)
+                except ValueError:
+                    updated["redeemed_address"] = address
             updated["redeemed_token_id"] = token_id
             self._invites[invite_id] = updated
             self._persist()

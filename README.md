@@ -38,20 +38,13 @@ See `docs/backups.md`.
 
 This backend can act as a minimal “license/key + lease” service for containers that ship an encrypted payload.
 
-**Admin flow**
+**Admin flow (recommended)**
 
-1. Mint an orchestrator token:
-
-```bash
-curl -sS -X POST \
-  -H "X-Admin-Token: $PAYMENTS_ADMIN_TOKEN" \
-  "https://<payments>/api/licenses/orchestrators/<orchestrator_id>/tokens"
-```
-
-2. Register an image secret (used to decrypt the payload):
+1. Register an image secret (used to decrypt the payload) and an artifact location (so Payments can presign per lease):
 
 ```bash
 IMAGE_REF="ghcr.io/its-define/unreal_vtuber/embody-ue-ps:enc-v1"
+ARTIFACT_S3_URI="s3://<bucket>/<path>/embody-ue-ps.tar.zst.age"
 
 # secret_b64 is expected to be base64(age-identity-file-bytes)
 SECRET_B64="$(python3 - <<'PY'
@@ -63,21 +56,30 @@ PY
 curl -sS -X PUT \
   -H "X-Admin-Token: $PAYMENTS_ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
-  -d "{\"image_ref\":\"$IMAGE_REF\",\"secret_b64\":\"$SECRET_B64\"}" \
+  -d "{\"image_ref\":\"$IMAGE_REF\",\"secret_b64\":\"$SECRET_B64\",\"artifact_s3_uri\":\"$ARTIFACT_S3_URI\"}" \
   "https://<payments>/api/licenses/images"
 ```
 
-3. Allow the orchestrator to access that image:
+2. Create a wallet-bound invite code (single-use) and give it to the orchestrator:
 
 ```bash
 curl -sS -X POST \
   -H "X-Admin-Token: $PAYMENTS_ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
-  -d "{\"orchestrator_id\":\"<orchestrator_id>\",\"image_ref\":\"$IMAGE_REF\"}" \
-  "https://<payments>/api/licenses/access/grant"
+  -d "{\"image_ref\":\"$IMAGE_REF\",\"bound_address\":\"0x1111111111111111111111111111111111111111\",\"ttl_seconds\":604800,\"note\":\"onboarding\"}" \
+  "https://<payments>/api/licenses/invites"
 ```
 
 **Orchestrator runtime flow**
+
+Redeem invite → mint token + grant access:
+
+```bash
+curl -sS -X POST \
+  -H "Content-Type: application/json" \
+  -d "{\"code\":\"<INVITE_CODE>\",\"orchestrator_id\":\"<orchestrator_id>\",\"address\":\"0x1111111111111111111111111111111111111111\"}" \
+  "https://<payments>/api/licenses/invites/redeem"
+```
 
 Request a lease + decryption secret:
 
@@ -89,7 +91,9 @@ curl -sS -X POST \
   "https://<payments>/api/licenses/lease"
 ```
 
-The lease response includes `secret_b64` which can be used to decrypt an encrypted image artifact (see `Unreal_Vtuber/tools/encrypted-game-image/consume.sh`).
+The lease response includes:
+- `secret_b64` (age identity bytes, base64)
+- `artifact_url` (fresh presigned URL per lease when `artifact_s3_uri` is configured and Payments has AWS creds/region)
 
 Then periodically renew:
 

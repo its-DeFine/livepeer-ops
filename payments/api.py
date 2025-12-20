@@ -12,6 +12,11 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional
 
+try:
+    import boto3  # type: ignore
+except Exception:  # pragma: no cover
+    boto3 = None  # type: ignore
+
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -25,6 +30,8 @@ from .licenses import (
     InviteCodeStore,
     LeaseStore,
     OrchestratorTokenStore,
+    normalize_eth_address,
+    parse_s3_uri,
     parse_iso8601 as parse_license_iso8601,
 )
 from .sessions import SessionStore
@@ -270,6 +277,7 @@ class LicenseTokenListResponse(BaseModel):
 class LicenseImageUpsertPayload(BaseModel):
     image_ref: str = Field(min_length=1, max_length=512)
     secret_b64: Optional[str] = Field(default=None, max_length=2048)
+    artifact_s3_uri: Optional[str] = Field(default=None, max_length=2048)
 
 
 class LicenseImageRevokePayload(BaseModel):
@@ -278,6 +286,7 @@ class LicenseImageRevokePayload(BaseModel):
 
 class LicenseImageRecord(BaseModel):
     image_ref: str
+    artifact_s3_uri: Optional[str] = None
     created_at: str
     rotated_at: str
     revoked_at: Optional[str]
@@ -311,6 +320,7 @@ class LicenseLeaseResponse(BaseModel):
     expires_at: str
     lease_seconds: int
     secret_b64: str
+    artifact_url: Optional[str] = None
 
 
 class LicenseHeartbeatResponse(BaseModel):
@@ -337,6 +347,7 @@ class LicenseLeaseListResponse(BaseModel):
 
 class LicenseInviteCreatePayload(BaseModel):
     image_ref: str = Field(min_length=1, max_length=512)
+    bound_address: str = Field(pattern=r"^0x[a-fA-F0-9]{40}$")
     ttl_seconds: Optional[int] = Field(default=None, ge=60, le=60 * 60 * 24 * 90)
     expires_at: Optional[str] = Field(default=None, max_length=64)
     note: Optional[str] = Field(default=None, max_length=256)
@@ -352,6 +363,7 @@ class LicenseInviteCreateResponse(BaseModel):
     invite_id: str
     code: str
     image_ref: str
+    bound_address: str
     created_at: str
     expires_at: Optional[str]
 
@@ -359,6 +371,7 @@ class LicenseInviteCreateResponse(BaseModel):
 class LicenseInviteRecord(BaseModel):
     invite_id: str
     image_ref: str
+    bound_address: Optional[str]
     created_at: str
     expires_at: Optional[str]
     note: Optional[str]
@@ -367,6 +380,7 @@ class LicenseInviteRecord(BaseModel):
     redeemed_at: Optional[str]
     redeemed_by: Optional[str]
     redeemed_ip: Optional[str]
+    redeemed_address: Optional[str]
     redeemed_token_id: Optional[str]
 
 
@@ -484,6 +498,10 @@ def create_app(registry: Registry, ledger: Ledger, settings: PaymentSettings) ->
         Path(getattr(settings, "license_invites_path", data_dir / "license_invites.json"))
     )
     license_lease_seconds = int(getattr(settings, "license_lease_seconds", 900))
+    license_artifact_region = getattr(settings, "license_artifact_region", None)
+    license_artifact_presign_seconds = int(
+        getattr(settings, "license_artifact_presign_seconds", license_lease_seconds)
+    )
     license_invite_default_ttl_seconds = int(getattr(settings, "license_invite_default_ttl_seconds", 7 * 24 * 60 * 60))
     license_audit_log_path = Path(
         getattr(settings, "license_audit_log_path", data_dir / "audit" / "license.log")
@@ -524,6 +542,29 @@ def create_app(registry: Registry, ledger: Ledger, settings: PaymentSettings) ->
                 return normalized
         client_host = request.client.host if request.client else None
         return normalize_ip(client_host)
+
+    def presign_artifact_url(image_ref: str, image: Dict[str, Any]) -> Optional[str]:
+        artifact_s3_uri = image.get("artifact_s3_uri")
+        if not artifact_s3_uri:
+            return None
+        if boto3 is None:
+            logging.getLogger(__name__).warning("boto3 unavailable; cannot presign artifact for %s", image_ref)
+            return None
+        try:
+            bucket, key = parse_s3_uri(str(artifact_s3_uri))
+        except ValueError:
+            logging.getLogger(__name__).warning("invalid artifact_s3_uri for %s: %s", image_ref, artifact_s3_uri)
+            return None
+        try:
+            client = boto3.client("s3", region_name=license_artifact_region)
+            return client.generate_presigned_url(
+                "get_object",
+                Params={"Bucket": bucket, "Key": key},
+                ExpiresIn=license_artifact_presign_seconds,
+            )
+        except Exception as exc:  # pragma: no cover
+            logging.getLogger(__name__).warning("failed to presign artifact for %s: %s", image_ref, exc)
+            return None
 
     def log_license_event(event: str, payload: Dict[str, Any]) -> None:
         try:
@@ -1079,7 +1120,11 @@ def create_app(registry: Registry, ledger: Ledger, settings: PaymentSettings) ->
         _: Any = Depends(require_admin),
     ) -> LicenseImageWithSecret:
         try:
-            record = license_images.upsert(payload.image_ref, secret_b64=payload.secret_b64)
+            record = license_images.upsert(
+                payload.image_ref,
+                secret_b64=payload.secret_b64,
+                artifact_s3_uri=payload.artifact_s3_uri,
+            )
         except ValueError as exc:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
         log_license_event(
@@ -1095,6 +1140,7 @@ def create_app(registry: Registry, ledger: Ledger, settings: PaymentSettings) ->
         images = [
             LicenseImageRecord(
                 image_ref=item.get("image_ref", ""),
+                artifact_s3_uri=item.get("artifact_s3_uri"),
                 created_at=item.get("created_at", ""),
                 rotated_at=item.get("rotated_at", ""),
                 revoked_at=item.get("revoked_at"),
@@ -1166,6 +1212,7 @@ def create_app(registry: Registry, ledger: Ledger, settings: PaymentSettings) ->
 
         created = license_invites.create(
             image_ref=payload.image_ref,
+            bound_address=payload.bound_address,
             expires_at=expires_at,
             note=payload.note,
         )
@@ -1181,6 +1228,7 @@ def create_app(registry: Registry, ledger: Ledger, settings: PaymentSettings) ->
             invite_id=str(created.get("invite_id", "")),
             code=str(created.get("code", "")),
             image_ref=str(created.get("image_ref", payload.image_ref)),
+            bound_address=str(created.get("bound_address", "")),
             created_at=str(created.get("created_at", "")),
             expires_at=created.get("expires_at"),
         )
@@ -1195,6 +1243,7 @@ def create_app(registry: Registry, ledger: Ledger, settings: PaymentSettings) ->
                 LicenseInviteRecord(
                     invite_id=str(item.get("invite_id", "")),
                     image_ref=str(item.get("image_ref", "")),
+                    bound_address=item.get("bound_address"),
                     created_at=str(item.get("created_at", "")),
                     expires_at=item.get("expires_at"),
                     note=item.get("note"),
@@ -1203,6 +1252,7 @@ def create_app(registry: Registry, ledger: Ledger, settings: PaymentSettings) ->
                     redeemed_at=item.get("redeemed_at"),
                     redeemed_by=item.get("redeemed_by"),
                     redeemed_ip=item.get("redeemed_ip"),
+                    redeemed_address=item.get("redeemed_address"),
                     redeemed_token_id=item.get("redeemed_token_id"),
                 )
             )
@@ -1246,6 +1296,26 @@ def create_app(registry: Registry, ledger: Ledger, settings: PaymentSettings) ->
             license_invites.release(invite_id)
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Invalid invite record")
 
+        bound_address = reserved.get("bound_address")
+        if not bound_address:
+            license_invites.release(invite_id)
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Invite is missing wallet binding; ask your admin for a new invite code",
+            )
+        try:
+            normalized_bound = normalize_eth_address(str(bound_address))
+            normalized_payload = normalize_eth_address(payload.address)
+        except ValueError:
+            license_invites.release(invite_id)
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Invalid wallet binding on invite")
+        if normalized_bound != normalized_payload:
+            license_invites.release(invite_id)
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Wallet address does not match this invite code",
+            )
+
         try:
             image = license_images.get(image_ref)
             if image is None:
@@ -1273,6 +1343,7 @@ def create_app(registry: Registry, ledger: Ledger, settings: PaymentSettings) ->
                 invite_id=invite_id,
                 orchestrator_id=payload.orchestrator_id,
                 token_id=minted["token_id"],
+                address=payload.address,
                 client_ip=request_ip(request),
             )
         except Exception:
@@ -1340,6 +1411,7 @@ def create_app(registry: Registry, ledger: Ledger, settings: PaymentSettings) ->
             expires_at=lease["expires_at"],
             lease_seconds=license_lease_seconds,
             secret_b64=str(image.get("secret_b64", "")),
+            artifact_url=presign_artifact_url(payload.image_ref, image),
         )
 
     @app.post("/api/licenses/lease/{lease_id}/heartbeat", response_model=LicenseHeartbeatResponse)

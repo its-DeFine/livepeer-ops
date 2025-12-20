@@ -75,7 +75,12 @@ def parse_iso8601(value: str) -> datetime:
 @pytest.mark.anyio("asyncio")
 async def test_license_token_mint_and_lease_flow(temp_paths):
     registry, ledger = build_registry(temp_paths)
-    app_settings = build_settings(temp_paths, license_lease_seconds=10)
+    app_settings = build_settings(
+        temp_paths,
+        license_lease_seconds=10,
+        license_artifact_region="us-east-2",
+        license_artifact_presign_seconds=55,
+    )
     app = create_app(registry, ledger, app_settings)
 
     orchestrator_id = "orch-license"
@@ -87,70 +92,81 @@ async def test_license_token_mint_and_lease_flow(temp_paths):
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        # Admin: mint orchestrator token
-        minted = await client.post(
-            f"/api/licenses/orchestrators/{orchestrator_id}/tokens",
-            headers={"X-Admin-Token": "secret"},
-        )
-        assert minted.status_code == 200
-        minted_body = minted.json()
-        token = minted_body["token"]
-        token_id = minted_body["token_id"]
+        with patch("payments.api.boto3") as mocked_boto3:
+            mocked_boto3.client.return_value.generate_presigned_url.return_value = "https://example.com/presigned"
 
-        # Admin: register image secret
-        image = await client.put(
-            "/api/licenses/images",
-            json={"image_ref": image_ref},
-            headers={"X-Admin-Token": "secret"},
-        )
-        assert image.status_code == 200
-        assert image.json()["secret_b64"]
+            # Admin: mint orchestrator token
+            minted = await client.post(
+                f"/api/licenses/orchestrators/{orchestrator_id}/tokens",
+                headers={"X-Admin-Token": "secret"},
+            )
+            assert minted.status_code == 200
+            minted_body = minted.json()
+            token = minted_body["token"]
+            token_id = minted_body["token_id"]
 
-        # Admin: allow orchestrator to access image
-        grant = await client.post(
-            "/api/licenses/access/grant",
-            json={"orchestrator_id": orchestrator_id, "image_ref": image_ref},
-            headers={"X-Admin-Token": "secret"},
-        )
-        assert grant.status_code == 200
+            # Admin: register image secret
+            image = await client.put(
+                "/api/licenses/images",
+                json={"image_ref": image_ref, "artifact_s3_uri": "s3://embody-test/artifacts/game.enc.zst"},
+                headers={"X-Admin-Token": "secret"},
+            )
+            assert image.status_code == 200
+            assert image.json()["secret_b64"]
 
-        # Orchestrator: request lease + key
-        lease = await client.post(
-            "/api/licenses/lease",
-            json={"image_ref": image_ref},
-            headers={"Authorization": f"Bearer {token}"},
-        )
-        assert lease.status_code == 200
-        lease_body = lease.json()
-        assert lease_body["orchestrator_id"] == orchestrator_id
-        assert lease_body["image_ref"] == image_ref
-        assert lease_body["lease_id"]
-        assert lease_body["secret_b64"]
+            # Admin: allow orchestrator to access image
+            grant = await client.post(
+                "/api/licenses/access/grant",
+                json={"orchestrator_id": orchestrator_id, "image_ref": image_ref},
+                headers={"X-Admin-Token": "secret"},
+            )
+            assert grant.status_code == 200
 
-        expires_before = parse_iso8601(lease_body["expires_at"])
+            # Orchestrator: request lease + key
+            lease = await client.post(
+                "/api/licenses/lease",
+                json={"image_ref": image_ref},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            assert lease.status_code == 200
+            lease_body = lease.json()
+            assert lease_body["orchestrator_id"] == orchestrator_id
+            assert lease_body["image_ref"] == image_ref
+            assert lease_body["lease_id"]
+            assert lease_body["secret_b64"]
+            assert lease_body["artifact_url"] == "https://example.com/presigned"
 
-        # Orchestrator: heartbeat extends lease
-        heartbeat = await client.post(
-            f"/api/licenses/lease/{lease_body['lease_id']}/heartbeat",
-            headers={"Authorization": f"Bearer {token}"},
-        )
-        assert heartbeat.status_code == 200
-        expires_after = parse_iso8601(heartbeat.json()["expires_at"])
-        assert expires_after > expires_before
+            mocked_boto3.client.assert_called_with("s3", region_name="us-east-2")
+            mocked_boto3.client.return_value.generate_presigned_url.assert_called_with(
+                "get_object",
+                Params={"Bucket": "embody-test", "Key": "artifacts/game.enc.zst"},
+                ExpiresIn=55,
+            )
 
-        # Admin: revoke token => further requests denied
-        revoked = await client.delete(
-            f"/api/licenses/orchestrators/{orchestrator_id}/tokens/{token_id}",
-            headers={"X-Admin-Token": "secret"},
-        )
-        assert revoked.status_code == 200
+            expires_before = parse_iso8601(lease_body["expires_at"])
 
-        denied = await client.post(
-            "/api/licenses/lease",
-            json={"image_ref": image_ref},
-            headers={"Authorization": f"Bearer {token}"},
-        )
-        assert denied.status_code == 401
+            # Orchestrator: heartbeat extends lease
+            heartbeat = await client.post(
+                f"/api/licenses/lease/{lease_body['lease_id']}/heartbeat",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            assert heartbeat.status_code == 200
+            expires_after = parse_iso8601(heartbeat.json()["expires_at"])
+            assert expires_after > expires_before
+
+            # Admin: revoke token => further requests denied
+            revoked = await client.delete(
+                f"/api/licenses/orchestrators/{orchestrator_id}/tokens/{token_id}",
+                headers={"X-Admin-Token": "secret"},
+            )
+            assert revoked.status_code == 200
+
+            denied = await client.post(
+                "/api/licenses/lease",
+                json={"image_ref": image_ref},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            assert denied.status_code == 401
 
 
 @pytest.mark.anyio("asyncio")
@@ -215,6 +231,9 @@ async def test_license_invite_redeem_mints_token_and_grants_access(temp_paths):
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        orchestrator_id = "orch-invite"
+        address = "0xCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+
         # Admin: register image secret (required to create invites)
         image = await client.put(
             "/api/licenses/images",
@@ -226,7 +245,7 @@ async def test_license_invite_redeem_mints_token_and_grants_access(temp_paths):
         # Admin: create invite
         invite = await client.post(
             "/api/licenses/invites",
-            json={"image_ref": image_ref, "ttl_seconds": 3600, "note": "test"},
+            json={"image_ref": image_ref, "bound_address": address, "ttl_seconds": 3600, "note": "test"},
             headers={"X-Admin-Token": "secret"},
         )
         assert invite.status_code == 200
@@ -234,9 +253,15 @@ async def test_license_invite_redeem_mints_token_and_grants_access(temp_paths):
         code = invite_body["code"]
         assert code
 
+        # Wrong wallet => rejected (invite remains redeemable)
+        bad_address = "0xDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD"
+        wrong_wallet = await client.post(
+            "/api/licenses/invites/redeem",
+            json={"code": code, "orchestrator_id": orchestrator_id, "address": bad_address},
+        )
+        assert wrong_wallet.status_code == 403
+
         # Orchestrator: redeem invite -> token
-        orchestrator_id = "orch-invite"
-        address = "0xCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
         redeemed = await client.post(
             "/api/licenses/invites/redeem",
             json={"code": code, "orchestrator_id": orchestrator_id, "address": address},
@@ -276,7 +301,7 @@ async def test_license_invite_redeem_mints_token_and_grants_access(temp_paths):
         # Expired code => 410
         expired = await client.post(
             "/api/licenses/invites",
-            json={"image_ref": image_ref, "expires_at": "2000-01-01T00:00:00Z"},
+            json={"image_ref": image_ref, "bound_address": address, "expires_at": "2000-01-01T00:00:00Z"},
             headers={"X-Admin-Token": "secret"},
         )
         assert expired.status_code == 200

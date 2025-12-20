@@ -166,6 +166,14 @@ class PaymentSettings(BaseSettings):
         default=900,
         env="PAYMENTS_LICENSE_LEASE_SECONDS",
     )
+    license_artifact_region: Optional[str] = Field(
+        default=None,
+        env="PAYMENTS_LICENSE_ARTIFACT_REGION",
+    )
+    license_artifact_presign_seconds: int = Field(
+        default=900,
+        env="PAYMENTS_LICENSE_ARTIFACT_PRESIGN_SECONDS",
+    )
     license_invite_default_ttl_seconds: int = Field(
         default=7 * 24 * 60 * 60,
         env="PAYMENTS_LICENSE_INVITE_DEFAULT_TTL_SECONDS",
