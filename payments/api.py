@@ -142,6 +142,10 @@ class OrchestratorRecord(BaseModel):
     health_timeout: Optional[float]
     monitored_services: Optional[List[str]]
     min_service_uptime: Optional[float]
+    last_contact_source: Optional[str] = None
+    last_session_upstream_addr: Optional[str] = None
+    last_session_seen_at: Optional[str] = None
+    last_session_edge_id: Optional[str] = None
 
 class ForwarderHealthReportPayload(BaseModel):
     """Allows a trusted watcher (typically running on the forwarder) to report health."""
@@ -529,6 +533,8 @@ def create_app(registry: Registry, ledger: Ledger, settings: PaymentSettings) ->
         "host_public_ip": None,
         "last_seen_ip": None,
         "health_url": None,
+        "last_session_upstream_addr": None,
+        "last_session_edge_id": None,
     }
 
     def normalize_ip(value: Optional[str]) -> Optional[str]:
@@ -785,6 +791,10 @@ def create_app(registry: Registry, ledger: Ledger, settings: PaymentSettings) ->
                 health_timeout=record.get("health_timeout"),
                 monitored_services=record.get("monitored_services"),
                 min_service_uptime=record.get("min_service_uptime"),
+                last_contact_source=record.get("last_contact_source"),
+                last_session_upstream_addr=record.get("last_session_upstream_addr"),
+                last_session_seen_at=record.get("last_session_seen_at"),
+                last_session_edge_id=record.get("last_session_edge_id"),
             )
             response.append(redact_record(entry, sensitive_allowed))
 
@@ -831,6 +841,10 @@ def create_app(registry: Registry, ledger: Ledger, settings: PaymentSettings) ->
             health_timeout=record.get("health_timeout"),
             monitored_services=record.get("monitored_services"),
             min_service_uptime=record.get("min_service_uptime"),
+            last_contact_source=record.get("last_contact_source"),
+            last_session_upstream_addr=record.get("last_session_upstream_addr"),
+            last_session_seen_at=record.get("last_session_seen_at"),
+            last_session_edge_id=record.get("last_session_edge_id"),
         )
         return redact_record(entry, include_sensitive_fields(request))
 
@@ -842,6 +856,19 @@ def create_app(registry: Registry, ledger: Ledger, settings: PaymentSettings) ->
     ) -> Dict[str, Any]:
         _ensure_orchestrator_exists(orchestrator_id)
         registry.record_forwarder_health(orchestrator_id, payload.data, source=payload.source)
+        try:
+            data = payload.data if isinstance(payload.data, dict) else {}
+            summary = data.get("summary") if isinstance(data.get("summary"), dict) else {}
+            services_up = summary.get("services_up")
+            if isinstance(services_up, int) and services_up > 0:
+                ip = data.get("ip")
+                registry.record_contact(
+                    orchestrator_id,
+                    source=payload.source,
+                    ip=ip if isinstance(ip, str) else None,
+                )
+        except Exception:
+            pass
         return {"ok": True}
 
     def _ensure_orchestrator_exists(orchestrator_id: str) -> None:
@@ -1029,14 +1056,74 @@ def create_app(registry: Registry, ledger: Ledger, settings: PaymentSettings) ->
         now = datetime.now(timezone.utc)
         upstream_addr = payload.upstream_addr
 
+        def parse_host(candidate: Any) -> Optional[str]:
+            if not isinstance(candidate, str) or not candidate:
+                return None
+            try:
+                from urllib.parse import urlparse
+
+                return urlparse(candidate).hostname
+            except Exception:
+                return None
+
+        def parse_iso(candidate: Any) -> Optional[datetime]:
+            if not isinstance(candidate, str) or not candidate:
+                return None
+            value = candidate
+            if value.endswith("Z"):
+                value = value[:-1] + "+00:00"
+            try:
+                return datetime.fromisoformat(value)
+            except Exception:
+                return None
+
+        records = registry.all_records()
         orch_id: Optional[str] = None
-        for candidate_id, record in registry.all_records().items():
+        for candidate_id, record in records.items():
             if not isinstance(record, dict):
                 continue
-            host_ip = record.get("host_public_ip")
-            if host_ip and str(host_ip) == upstream_addr:
+            for key in ("host_public_ip", "last_seen_ip", "last_session_upstream_addr"):
+                ip = record.get(key)
+                if isinstance(ip, str) and ip == upstream_addr:
+                    orch_id = candidate_id
+                    break
+            if orch_id:
+                break
+            host = parse_host(record.get("health_url"))
+            if host and host == upstream_addr:
                 orch_id = candidate_id
                 break
+            forwarder_health = record.get("forwarder_health")
+            if isinstance(forwarder_health, dict):
+                data = forwarder_health.get("data")
+                ip = data.get("ip") if isinstance(data, dict) else None
+                if isinstance(ip, str) and ip == upstream_addr:
+                    orch_id = candidate_id
+                    break
+
+        if orch_id is None:
+            best: Optional[str] = None
+            best_seen: Optional[datetime] = None
+            for _, session in session_store.iter_with_ids():
+                if session.get("upstream_addr") != upstream_addr:
+                    continue
+                candidate = session.get("orchestrator_id")
+                if not candidate or not isinstance(candidate, str):
+                    continue
+                if candidate not in records:
+                    continue
+                seen = parse_iso(session.get("last_seen_at") or session.get("updated_at") or session.get("started_at"))
+                if best_seen is None or (seen and seen > best_seen):
+                    best = candidate
+                    best_seen = seen or best_seen
+            orch_id = best
+
+        if orch_id:
+            try:
+                registry.record_session_upstream(orch_id, upstream_addr, edge_id=payload.edge_id)
+                registry.record_contact(orch_id, source="session", ip=upstream_addr)
+            except Exception:
+                pass
 
         credit_rate = Decimal(str(getattr(settings, "session_credit_eth_per_minute", "0") or "0"))
         stored = session_store.apply_event(
@@ -1059,12 +1146,35 @@ def create_app(registry: Registry, ledger: Ledger, settings: PaymentSettings) ->
         limit: int = Query(default=200, ge=1, le=2000),
         _: Any = Depends(require_view_access),
     ) -> SessionListResponse:
+        def parse_session_timestamp(value: Any) -> Optional[datetime]:
+            if not isinstance(value, str) or not value:
+                return None
+            candidate = value
+            if candidate.endswith("Z"):
+                candidate = candidate[:-1] + "+00:00"
+            try:
+                parsed = datetime.fromisoformat(candidate)
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                return parsed.astimezone(timezone.utc)
+            except Exception:
+                return None
+
+        now = datetime.now(timezone.utc)
+        idle_timeout = int(getattr(settings, "session_idle_timeout_seconds", 120) or 120)
         sessions: List[SessionRecord] = []
         for _, record in session_store.iter_with_ids():
             if orchestrator_id and record.get("orchestrator_id") != orchestrator_id:
                 continue
-            if active_only and record.get("ended_at"):
-                continue
+            if active_only:
+                if record.get("ended_at"):
+                    continue
+                last_seen = record.get("last_seen_at") or record.get("updated_at") or record.get("started_at")
+                last_seen_dt = parse_session_timestamp(last_seen)
+                if not last_seen_dt:
+                    continue
+                if (now - last_seen_dt).total_seconds() > idle_timeout:
+                    continue
             try:
                 sessions.append(SessionRecord(**record))
             except Exception:

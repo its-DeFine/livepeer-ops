@@ -141,6 +141,10 @@ class PaymentSettings(BaseSettings):
         default=Decimal("0"),
         env="PAYMENTS_SESSION_CREDIT_ETH_PER_MINUTE",
     )
+    session_idle_timeout_seconds: int = Field(
+        default=120,
+        env="PAYMENTS_SESSION_IDLE_TIMEOUT_SECONDS",
+    )
 
     forwarder_health_ttl_seconds: int = Field(
         default=120,

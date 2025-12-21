@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import time
 from collections import defaultdict
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Dict, Optional
 
@@ -166,8 +167,6 @@ class PaymentProcessor:
             data = forwarder_health.get("data")
             if isinstance(reported_at, str) and isinstance(data, dict) and isinstance(data.get("summary"), dict):
                 try:
-                    from datetime import datetime, timezone
-
                     reported_dt = datetime.fromisoformat(reported_at)
                     if reported_dt.tzinfo is None:
                         reported_dt = reported_dt.replace(tzinfo=timezone.utc)
@@ -176,6 +175,18 @@ class PaymentProcessor:
                     age_seconds = None
                 ttl_seconds = int(getattr(self.settings, "forwarder_health_ttl_seconds", 120) or 120)
                 if age_seconds is not None and 0 <= age_seconds <= ttl_seconds:
+                    try:
+                        ip = data.get("ip")
+                        summary = data.get("summary") if isinstance(data.get("summary"), dict) else {}
+                        services_up = summary.get("services_up")
+                        if isinstance(services_up, int) and services_up > 0:
+                            self.registry.record_contact(
+                                orchestrator_id,
+                                source="forwarder_health",
+                                ip=ip if isinstance(ip, str) else None,
+                            )
+                    except Exception:
+                        pass
                     summary = dict(data.get("summary") or {})
                     summary.setdefault("health_source", "forwarder")
                     if record.get("min_service_uptime") is not None:
@@ -205,6 +216,20 @@ class PaymentProcessor:
             if not isinstance(payload, dict) or "summary" not in payload:
                 logger.warning("[%s] Remote health payload malformed: %s", orchestrator_id, payload)
                 return None
+            try:
+                from urllib.parse import urlparse
+
+                host = urlparse(str(health_url)).hostname
+            except Exception:
+                host = None
+            try:
+                self.registry.record_contact(
+                    orchestrator_id,
+                    source="health_url",
+                    ip=host if isinstance(host, str) else None,
+                )
+            except Exception:
+                pass
             summary = payload.get("summary") or {}
             if monitor_services and isinstance(payload.get("services"), dict):
                 missing = [svc for svc in monitor_services if svc not in payload["services"]]
@@ -228,6 +253,10 @@ class PaymentProcessor:
             monitor = ServiceMonitor(services=monitor_services)
             self._monitors[orchestrator_id] = monitor
         status = monitor.check_services()
+        try:
+            self.registry.record_contact(orchestrator_id, source="local_monitor")
+        except Exception:
+            pass
         summary = status.get("summary") or {}
         if record.get("min_service_uptime") is not None:
             summary = dict(summary)

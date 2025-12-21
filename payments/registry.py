@@ -484,6 +484,43 @@ class Registry:
             }
             self._persist()
 
+    def record_contact(
+        self,
+        orchestrator_id: str,
+        *,
+        source: str,
+        ip: Optional[str] = None,
+    ) -> None:
+        """Record any trusted liveness signal (registration, health check, session event)."""
+        with self._lock:
+            record = self._records.get(orchestrator_id)
+            if not record:
+                return
+            now_iso = datetime.now(timezone.utc).isoformat()
+            record["last_seen"] = now_iso
+            if ip:
+                record["last_seen_ip"] = ip
+            record["last_contact_source"] = source
+            self._persist()
+
+    def record_session_upstream(
+        self,
+        orchestrator_id: str,
+        upstream_addr: str,
+        *,
+        edge_id: Optional[str] = None,
+    ) -> None:
+        with self._lock:
+            record = self._records.get(orchestrator_id)
+            if not record:
+                return
+            now_iso = datetime.now(timezone.utc).isoformat()
+            record["last_session_upstream_addr"] = upstream_addr
+            record["last_session_seen_at"] = now_iso
+            if edge_id:
+                record["last_session_edge_id"] = edge_id
+            self._persist()
+
     def get_record(self, orchestrator_id: str) -> Optional[Dict[str, Any]]:
         with self._lock:
             record = self._records.get(orchestrator_id)
