@@ -1,3 +1,4 @@
+import base64
 import tempfile
 import json
 from pathlib import Path
@@ -608,3 +609,58 @@ async def test_session_events_credit_by_time_delta(temp_paths):
     body = heartbeat.json()
     assert body["billed_ms"] == 10_000
     assert body["billed_eth"] == "0.01"
+
+
+@pytest.mark.anyio("asyncio")
+async def test_tee_status_and_attestation_without_signer(temp_paths):
+    registry, ledger = build_registry(temp_paths)
+    app_settings = build_settings(temp_paths)
+    app = create_app(registry, ledger, app_settings)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        status = await client.get("/api/tee/status")
+        assert status.status_code == 200
+        body = status.json()
+        assert body["mode"] == "none"
+        assert body["address"] is None
+        assert body["attestation_available"] is False
+
+        attestation = await client.get("/api/tee/attestation")
+        assert attestation.status_code == 404
+
+
+@pytest.mark.anyio("asyncio")
+async def test_tee_attestation_returns_base64_document(temp_paths):
+    registry, ledger = build_registry(temp_paths)
+    app_settings = build_settings(temp_paths)
+
+    class StubSigner:
+        address = "0x" + "A" * 40
+
+        def sign_transaction(self, tx):  # noqa: ANN001 - test stub
+            raise NotImplementedError
+
+        def sign_message_defunct(self, message_hash):  # noqa: ANN001 - test stub
+            raise NotImplementedError
+
+        def attestation_document(self, nonce=None):  # noqa: ANN001 - test stub
+            return b"hello"
+
+    app = create_app(registry, ledger, app_settings, signer=StubSigner())
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        status = await client.get("/api/tee/status")
+        assert status.status_code == 200
+        body = status.json()
+        assert body["mode"] == "local"
+        assert body["address"] == StubSigner.address
+        assert body["attestation_available"] is True
+
+        attestation = await client.get("/api/tee/attestation?nonce=0x01")
+        assert attestation.status_code == 200
+        payload = attestation.json()
+        assert payload["address"] == StubSigner.address
+        assert payload["nonce_hex"] == "0x01"
+        assert base64.b64decode(payload["document_b64"]) == b"hello"

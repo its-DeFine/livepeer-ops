@@ -8,9 +8,10 @@ from pathlib import Path
 from typing import Any, Optional
 
 from eth_account import Account
-from eth_account.signers.local import LocalAccount
 from web3 import Web3
 from web3.middleware.proof_of_authority import ExtraDataToPOAMiddleware
+
+from .signer import LocalSigner, Signer
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +26,7 @@ class PaymentClient:
         private_key: Optional[str] = None,
         keystore_path: Optional[Path] = None,
         keystore_password: Optional[str] = None,
+        signer: Optional[Signer] = None,
         dry_run: bool = True,
     ) -> None:
         self.web3 = Web3(Web3.HTTPProvider(rpc_url))
@@ -32,26 +34,31 @@ class PaymentClient:
         self.web3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
         self.chain_id = chain_id
         self.dry_run = dry_run
-        self._account: Optional[LocalAccount] = None
+        self._signer: Optional[Signer] = signer
 
-        if private_key:
-            self._account = Account.from_key(private_key)
-        elif keystore_path and keystore_password:
-            try:
-                with Path(keystore_path).expanduser().open("r", encoding="utf-8") as handle:
-                    data = json.load(handle)
-                decrypted = Account.decrypt(data, keystore_password)
-                self._account = Account.from_key(decrypted)
-            except Exception as exc:
-                logger.error("Failed to decrypt keystore %s: %s", keystore_path, exc)
-        else:
-            logger.info("Payment client running without signing key (dry-run=%s)", dry_run)
+        if signer is None:
+            if private_key:
+                self._signer = LocalSigner(Account.from_key(private_key))
+            elif keystore_path and keystore_password:
+                try:
+                    with Path(keystore_path).expanduser().open("r", encoding="utf-8") as handle:
+                        data = json.load(handle)
+                    decrypted = Account.decrypt(data, keystore_password)
+                    self._signer = LocalSigner(Account.from_key(decrypted))
+                except Exception as exc:
+                    logger.error("Failed to decrypt keystore %s: %s", keystore_path, exc)
+            else:
+                logger.info("Payment client running without signing key (dry-run=%s)", dry_run)
 
     @property
     def sender(self) -> Optional[str]:
-        if isinstance(self._account, LocalAccount):
-            return self._account.address
-        return None
+        if self._signer is None:
+            return None
+        return self._signer.address
+
+    @property
+    def signer(self) -> Optional[Signer]:
+        return self._signer
 
     def send_transaction(
         self,
@@ -66,7 +73,7 @@ class PaymentClient:
             logger.info("Skipping zero-value transaction to %s", to)
             return None
 
-        if not self._account or self.dry_run:
+        if not self._signer or self.dry_run:
             logger.info(
                 "Dry-run transaction: would send tx to %s (value=%s wei sender=%s data=%s)",
                 to,
@@ -126,10 +133,7 @@ class PaymentClient:
         else:
             tx["gasPrice"] = gas_price * 2
 
-        signed = self.web3.eth.account.sign_transaction(tx, self._account.key)
-        raw_tx = getattr(signed, "rawTransaction", None) or getattr(signed, "raw_transaction", None)
-        if raw_tx is None:  # pragma: no cover - defensive, should not happen
-            raise RuntimeError("Signed transaction missing raw data")
+        raw_tx = self._signer.sign_transaction(tx)
         tx_hash = self.web3.eth.send_raw_transaction(raw_tx)
         logger.info("Submitted tx %s to %s (value=%s wei)", tx_hash.hex(), to_checksum, value_wei)
         return tx_hash.hex()

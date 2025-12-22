@@ -18,10 +18,10 @@ from pathlib import Path
 from typing import Any, Optional, Tuple
 
 from eth_abi.packed import encode_packed
-from eth_account.messages import encode_defunct
 from web3 import Web3
 
 from .payment_client import PaymentClient, WEI_PER_ETH
+from .signer import Signer
 
 logger = logging.getLogger(__name__)
 
@@ -203,6 +203,7 @@ class LivepeerTicketBrokerPaymentClient(PaymentClient):
         private_key: Optional[str] = None,
         keystore_path: Optional[Path] = None,
         keystore_password: Optional[str] = None,
+        signer: Optional[Signer] = None,
         dry_run: bool = True,
     ) -> None:
         super().__init__(
@@ -211,6 +212,7 @@ class LivepeerTicketBrokerPaymentClient(PaymentClient):
             private_key=private_key,
             keystore_path=keystore_path,
             keystore_password=keystore_password,
+            signer=signer,
             dry_run=dry_run,
         )
         self.ticket_broker_address = Web3.to_checksum_address(ticket_broker_address)
@@ -299,10 +301,10 @@ class LivepeerTicketBrokerPaymentClient(PaymentClient):
         return Web3.keccak(packed)
 
     def _sign_ticket_hash(self, ticket_hash: bytes) -> bytes:
-        if not self._account:
-            raise RuntimeError("Cannot sign ticket without a configured account")
-        signed = self._account.sign_message(encode_defunct(primitive=ticket_hash))
-        return bytes(signed.signature)
+        signer = self.signer
+        if signer is None:
+            raise RuntimeError("Cannot sign ticket without a configured signer")
+        return signer.sign_message_defunct(ticket_hash)
 
     def _build_ticket(self, *, recipient: str, face_value_wei: int) -> tuple[LivepeerTicket, bytes, int, bytes]:
         sender = self.sender

@@ -1,6 +1,7 @@
 """HTTP API for orchestrator self-registration and admin visibility."""
 from __future__ import annotations
 
+import base64
 import ipaddress
 import json
 import logging
@@ -36,6 +37,7 @@ from .licenses import (
     parse_iso8601 as parse_license_iso8601,
 )
 from .sessions import SessionStore
+from .signer import Signer, SignerError
 from .workloads import WorkloadStore
 
 
@@ -117,6 +119,17 @@ class RegistrationResponse(BaseModel):
     cooldown_expires_at: Optional[str]
     message: str
 
+
+class TeeStatusResponse(BaseModel):
+    mode: str
+    address: Optional[str] = None
+    attestation_available: bool = False
+
+
+class TeeAttestationResponse(BaseModel):
+    address: str
+    document_b64: str
+    nonce_hex: Optional[str] = None
 
 class OrchestratorRecord(BaseModel):
     orchestrator_id: str
@@ -517,7 +530,12 @@ class ActivityLeaseListResponse(BaseModel):
     leases: List[ActivityLeaseRecord]
 
 
-def create_app(registry: Registry, ledger: Ledger, settings: PaymentSettings) -> FastAPI:
+def create_app(
+    registry: Registry,
+    ledger: Ledger,
+    settings: PaymentSettings,
+    signer: Optional[Signer] = None,
+) -> FastAPI:
     app = FastAPI(title="Embody Payments", version="1.0.0")
 
     workload_store = WorkloadStore(settings.workloads_path)
@@ -733,6 +751,64 @@ def create_app(registry: Registry, ledger: Ledger, settings: PaymentSettings) ->
     @app.exception_handler(RegistryError)
     async def registry_error_handler(_: Request, exc: RegistryError) -> JSONResponse:
         return JSONResponse(status_code=exc.status_code, content={"detail": str(exc)})
+
+    @app.get("/api/tee/status", response_model=TeeStatusResponse)
+    async def tee_status(_: Any = Depends(require_view_access)) -> TeeStatusResponse:
+        signer_endpoint = getattr(settings, "signer_endpoint", None)
+        mode = "remote" if signer_endpoint else ("local" if signer else "none")
+        address: Optional[str] = None
+        attestation_available = False
+        if signer is not None:
+            try:
+                address = signer.address
+                attestation_available = signer.attestation_document() is not None
+            except SignerError:
+                address = None
+        return TeeStatusResponse(
+            mode=mode,
+            address=address,
+            attestation_available=attestation_available,
+        )
+
+    @app.get("/api/tee/attestation", response_model=TeeAttestationResponse)
+    async def tee_attestation(
+        nonce: Optional[str] = Query(default=None),
+        _: Any = Depends(require_view_access),
+    ) -> TeeAttestationResponse:
+        if signer is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="TEE signer unavailable")
+
+        nonce_bytes: Optional[bytes] = None
+        nonce_hex: Optional[str] = None
+        if nonce is not None:
+            candidate = nonce.strip()
+            if candidate:
+                if candidate.startswith("0x"):
+                    candidate = candidate[2:]
+                if len(candidate) % 2 != 0:
+                    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="nonce must be hex")
+                try:
+                    nonce_bytes = bytes.fromhex(candidate)
+                except ValueError:
+                    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="nonce must be hex")
+                nonce_hex = "0x" + candidate.lower()
+
+        try:
+            address = signer.address
+            doc = signer.attestation_document(nonce_bytes)
+        except SignerError as exc:
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc))
+
+        if doc is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="TEE attestation document unavailable"
+            )
+
+        return TeeAttestationResponse(
+            address=address,
+            document_b64=base64.b64encode(doc).decode("utf-8"),
+            nonce_hex=nonce_hex,
+        )
 
     @app.post("/api/orchestrators/register", response_model=RegistrationResponse)
     async def register(payload: RegistrationPayload, request: Request) -> RegistrationResponse:
