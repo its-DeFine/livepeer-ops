@@ -34,6 +34,35 @@ docker compose up -d
 
 See `docs/backups.md`.
 
+## Livepeer TicketBroker payouts (experimental)
+
+This backend can pay orchestrators by issuing an *always-winning* Livepeer TicketBroker ticket and redeeming it while paying gas.
+
+- Configure:
+  - `PAYMENTS_PAYOUT_STRATEGY=livepeer_ticket`
+  - `PAYMENTS_LIVEPEER_TICKET_BROKER_ADDRESS=0xa8bb618b1520e284046f3dfc448851a1ff26e41b` (Arbitrum mainnet proxy)
+  - `ETH_RPC_URL=<arbitrum rpc>`
+  - `ETH_CHAIN_ID=42161`
+  - `PAYMENT_PRIVATE_KEY=<sender key>` (this address must keep its TicketBroker deposit funded)
+  - `PAYMENTS_LIVEPEER_DEPOSIT_AUTOFUND=true` (optional; keep deposit topped up)
+  - `PAYMENTS_LIVEPEER_DEPOSIT_TARGET_ETH=0.02` (optional; target deposit)
+  - `PAYMENTS_LIVEPEER_DEPOSIT_LOW_WATERMARK_ETH=0.01` (optional; only top up when below this)
+  - `PAYMENTS_LIVEPEER_BATCH_PAYOUTS=true` and `PAYMENTS_LIVEPEER_BATCH_MAX_TICKETS=20` (optional; batch multiple payouts into one onchain tx)
+  - `PAYMENTS_PAYOUT_CONFIRMATIONS=1` and `PAYMENTS_PAYOUT_RECEIPT_TIMEOUT_SECONDS=300` (optional; ledger is cleared only after receipt success)
+  - `PAYMENTS_PAYOUTS_PATH=/app/data/payouts.json` (optional; persists pending payouts to avoid double pays across restarts/timeouts)
+
+Demo (single payout):
+
+```bash
+python3 scripts/livepeer_ticket_demo.py --recipient 0x... --amount-eth 0.001
+```
+
+Demo (batch payout):
+
+```bash
+python3 scripts/livepeer_ticket_demo.py --batch-payouts-json payouts.json
+```
+
 ## Forwarder Health Reports (recommended)
 
 To avoid Payments polling every orchestrator on every cycle, a trusted watcher (typically running on the forwarder) can push periodic health snapshots into the registry:

@@ -64,9 +64,32 @@ class PaymentSettings(BaseSettings):
     payment_keystore_password: Optional[str] = Field(default=None, env="PAYMENT_KEYSTORE_PASSWORD")
 
     payment_dry_run: bool = Field(default=True, env="PAYMENT_DRY_RUN")
+    payout_strategy: str = Field(default="eth_transfer", env="PAYMENTS_PAYOUT_STRATEGY")
+    livepeer_ticket_broker_address: Optional[str] = Field(
+        default=None,
+        env="PAYMENTS_LIVEPEER_TICKET_BROKER_ADDRESS",
+    )
+    payout_confirmations: int = Field(default=1, env="PAYMENTS_PAYOUT_CONFIRMATIONS")
+    payout_receipt_timeout_seconds: int = Field(
+        default=300,
+        env="PAYMENTS_PAYOUT_RECEIPT_TIMEOUT_SECONDS",
+    )
+
+    livepeer_deposit_autofund: bool = Field(default=True, env="PAYMENTS_LIVEPEER_DEPOSIT_AUTOFUND")
+    livepeer_deposit_target_eth: Decimal = Field(
+        default=Decimal("0.02"),
+        env="PAYMENTS_LIVEPEER_DEPOSIT_TARGET_ETH",
+    )
+    livepeer_deposit_low_watermark_eth: Decimal = Field(
+        default=Decimal("0.01"),
+        env="PAYMENTS_LIVEPEER_DEPOSIT_LOW_WATERMARK_ETH",
+    )
+    livepeer_batch_payouts: bool = Field(default=True, env="PAYMENTS_LIVEPEER_BATCH_PAYOUTS")
+    livepeer_batch_max_tickets: int = Field(default=20, env="PAYMENTS_LIVEPEER_BATCH_MAX_TICKETS")
 
     ledger: LedgerPaths = Field(default_factory=LedgerPaths)
     registry_paths: RegistryPaths = Field(default_factory=RegistryPaths)
+    payouts_path: Path = Field(default=Path("/app/data/payouts.json"), env="PAYMENTS_PAYOUTS_PATH")
 
     bootstrap_orchestrators_path: Optional[Path] = Field(
         default=Path("/app/data/orchestrators.json"),
@@ -132,6 +155,18 @@ class PaymentSettings(BaseSettings):
     sessions_path: Path = Field(
         default=Path("/app/data/sessions.json"),
         env="PAYMENTS_SESSIONS_PATH",
+    )
+    activity_leases_path: Path = Field(
+        default=Path("/app/data/activity_leases.json"),
+        env="PAYMENTS_ACTIVITY_LEASES_PATH",
+    )
+    activity_lease_seconds: int = Field(
+        default=900,
+        env="PAYMENTS_ACTIVITY_LEASE_SECONDS",
+    )
+    activity_lease_max_seconds: int = Field(
+        default=3600,
+        env="PAYMENTS_ACTIVITY_LEASE_MAX_SECONDS",
     )
     session_reporter_token: Optional[str] = Field(
         default=None,
@@ -206,9 +241,26 @@ class PaymentSettings(BaseSettings):
             raise ValueError("ORCHESTRATOR_ADDRESS must be a 42-character hex string")
         return value
 
+    @field_validator("livepeer_ticket_broker_address")
+    def validate_livepeer_ticket_broker_address(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return value
+        if not value.startswith("0x") or len(value) != 42:
+            raise ValueError("PAYMENTS_LIVEPEER_TICKET_BROKER_ADDRESS must be a 42-character hex string")
+        return value
+
+    @field_validator("payout_strategy")
+    def validate_payout_strategy(cls, value: str) -> str:
+        normalized = (value or "").strip().lower()
+        if normalized not in {"eth_transfer", "livepeer_ticket"}:
+            raise ValueError("PAYMENTS_PAYOUT_STRATEGY must be one of: eth_transfer, livepeer_ticket")
+        return normalized
+
     @field_validator(
         "payment_increment_eth",
         "payout_threshold_eth",
+        "livepeer_deposit_target_eth",
+        "livepeer_deposit_low_watermark_eth",
         "session_credit_eth_per_minute",
         mode="before",
     )
@@ -223,6 +275,9 @@ class PaymentSettings(BaseSettings):
     @field_validator(
         "payment_interval_seconds",
         "api_port",
+        "payout_confirmations",
+        "payout_receipt_timeout_seconds",
+        "livepeer_batch_max_tickets",
         "registration_rate_limit_per_minute",
         "registration_rate_limit_burst",
         "payment_miss_threshold",
@@ -365,6 +420,21 @@ class PaymentSettings(BaseSettings):
             if not self.orchestrator_address:
                 raise ValueError(
                     "ORCHESTRATOR_ADDRESS must be set when PAYMENTS_SINGLE_ORCHESTRATOR_MODE is enabled"
+                )
+        if self.payout_strategy == "livepeer_ticket" and not self.livepeer_ticket_broker_address:
+            raise ValueError(
+                "PAYMENTS_LIVEPEER_TICKET_BROKER_ADDRESS must be set when PAYMENTS_PAYOUT_STRATEGY=livepeer_ticket"
+            )
+        if self.payout_strategy == "livepeer_ticket" and self.livepeer_deposit_autofund:
+            if self.livepeer_deposit_target_eth <= 0:
+                raise ValueError(
+                    "PAYMENTS_LIVEPEER_DEPOSIT_TARGET_ETH must be > 0 when PAYMENTS_LIVEPEER_DEPOSIT_AUTOFUND=true"
+                )
+            if self.livepeer_deposit_low_watermark_eth < 0:
+                raise ValueError("PAYMENTS_LIVEPEER_DEPOSIT_LOW_WATERMARK_ETH must be >= 0")
+            if self.livepeer_deposit_low_watermark_eth > self.livepeer_deposit_target_eth:
+                raise ValueError(
+                    "PAYMENTS_LIVEPEER_DEPOSIT_LOW_WATERMARK_ETH must be <= PAYMENTS_LIVEPEER_DEPOSIT_TARGET_ETH"
                 )
         return self
 

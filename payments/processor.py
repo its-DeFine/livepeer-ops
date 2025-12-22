@@ -1,4 +1,4 @@
-"""Main payment loop that ties monitoring + ledger + Web3 payouts."""
+"""Payment loop that pays out ledger balances via Web3."""
 from __future__ import annotations
 
 import logging
@@ -12,7 +12,8 @@ import requests
 
 from .config import PaymentSettings
 from .ledger import Ledger
-from .payment_client import PaymentClient
+from .payment_client import PaymentClient, WEI_PER_ETH
+from .payout_store import PendingPayoutStore
 from .registry import Registry
 from .service_monitor import ServiceMonitor
 
@@ -27,12 +28,15 @@ class PaymentProcessor:
         ledger: Ledger,
         payment_client: PaymentClient,
         registry: Registry,
+        payout_store: Optional[PendingPayoutStore] = None,
     ) -> None:
         self.settings = settings
         self.monitor = monitor
         self.ledger = ledger
         self.payment_client = payment_client
         self.registry = registry
+        self.payout_store = payout_store
+        self._batch_payout_queue: list[tuple[str, str, Decimal]] = []
 
         self._missing_cycles: Dict[str, int] = defaultdict(int)
         self._monitors: Dict[str, ServiceMonitor] = {}
@@ -40,6 +44,8 @@ class PaymentProcessor:
 
     def evaluate_once(self) -> None:
         """Run a single monitoring + payment evaluation cycle over all orchestrators."""
+        self._batch_payout_queue = []
+        self._maybe_autofund_livepeer_deposit()
         records = self.registry.all_records()
         if not records:
             logger.debug("No orchestrators registered; skipping payment evaluation")
@@ -51,81 +57,337 @@ class PaymentProcessor:
             except Exception as exc:  # pragma: no cover - defensive guard per orchestrator
                 logger.exception("Cycle evaluation failed for %s: %s", orchestrator_id, exc)
 
+        self._flush_batch_payouts()
+
+    def _batch_payouts_enabled(self) -> bool:
+        if not getattr(self.settings, "livepeer_batch_payouts", False):
+            return False
+        if getattr(self.settings, "payout_strategy", None) != "livepeer_ticket":
+            return False
+        batch_send = getattr(self.payment_client, "batch_send_payments", None)
+        return callable(batch_send)
+
+    def _ensure_livepeer_deposit(self, required_wei: int) -> bool:
+        get_sender_info = getattr(self.payment_client, "get_sender_info", None)
+        fund_deposit = getattr(self.payment_client, "fund_deposit", None)
+        if not callable(get_sender_info) or not callable(fund_deposit):
+            return True
+
+        if required_wei <= 0:
+            return True
+
+        if self.payment_client.dry_run:
+            return True
+
+        sender = self.payment_client.sender
+        if not sender:
+            logger.warning("Cannot auto-fund TicketBroker deposit without a configured sender key")
+            return False
+
+        info = self.payment_client.get_sender_info(sender)
+        deposit_wei = int(info.get("deposit_wei", 0))
+        if deposit_wei >= required_wei:
+            return True
+
+        if not getattr(self.settings, "livepeer_deposit_autofund", False):
+            logger.error(
+                "Insufficient TicketBroker deposit for payout: deposit=%s wei needed=%s wei (autofund disabled)",
+                deposit_wei,
+                required_wei,
+            )
+            return False
+
+        target_wei = int(self.settings.livepeer_deposit_target_eth * WEI_PER_ETH)
+        desired_wei = max(target_wei, required_wei)
+        topup_wei = desired_wei - deposit_wei
+        if topup_wei <= 0:
+            return True
+
+        topup_eth = Decimal(topup_wei) / WEI_PER_ETH
+        logger.info(
+            "Funding TicketBroker deposit for payout: deposit=%s wei needed=%s wei; adding %s ETH",
+            deposit_wei,
+            required_wei,
+            topup_eth,
+        )
+        tx_hash = self.payment_client.fund_deposit(topup_eth)
+        if tx_hash is None:
+            logger.error("TicketBroker deposit top-up returned no tx hash")
+            return False
+
+        receipt = self._wait_for_receipt(tx_hash)
+        if receipt is None:
+            logger.error("TicketBroker deposit top-up timed out or failed: %s", tx_hash)
+            return False
+        raw_status = getattr(receipt, "status", 1)
+        status = 1 if raw_status is None else int(raw_status)
+        if status != 1:
+            logger.error("TicketBroker deposit top-up reverted (tx=%s status=%s)", tx_hash, status)
+            return False
+
+        logger.info(
+            "TicketBroker deposit top-up confirmed (tx=%s block=%s)",
+            tx_hash,
+            getattr(receipt, "blockNumber", None),
+        )
+        return True
+
+    def _flush_batch_payouts(self) -> None:
+        if not self._batch_payout_queue:
+            return
+        if not self._batch_payouts_enabled():
+            return
+
+        batch_send = getattr(self.payment_client, "batch_send_payments", None)
+        assert callable(batch_send)
+
+        if self.payment_client.dry_run:
+            logger.info(
+                "Dry-run enabled; skipping %s queued batch payouts",
+                len(self._batch_payout_queue),
+            )
+            self._batch_payout_queue = []
+            return
+
+        # Dedupe by orchestrator_id, keeping the latest queued amount.
+        deduped: dict[str, tuple[str, Decimal]] = {}
+        for orchestrator_id, recipient, amount in self._batch_payout_queue:
+            deduped[orchestrator_id] = (recipient, amount)
+        items = [(orch_id, *payload) for orch_id, payload in sorted(deduped.items())]
+        self._batch_payout_queue = []
+
+        max_tickets = int(getattr(self.settings, "livepeer_batch_max_tickets", 20))
+        max_batch_total_wei = int(self.settings.livepeer_deposit_target_eth * WEI_PER_ETH)
+
+        current: list[tuple[str, str, Decimal, int]] = []
+        current_total_wei = 0
+
+        def flush_current() -> None:
+            nonlocal current, current_total_wei
+            if not current:
+                return
+
+            required_wei = current_total_wei
+            if not self._ensure_livepeer_deposit(required_wei):
+                logger.error("Skipping batch payout due to insufficient deposit funding")
+                current = []
+                current_total_wei = 0
+                return
+
+            payouts = [(recipient, amount) for _, recipient, amount, _ in current]
+            tx_hash = batch_send(payouts)
+            if tx_hash is None:
+                logger.warning("Batch payout returned no tx hash; leaving ledger unchanged")
+                current = []
+                current_total_wei = 0
+                return
+
+            if self.payout_store is not None:
+                for orchestrator_id, recipient, amount, _ in current:
+                    self.payout_store.upsert(
+                        orchestrator_id,
+                        {
+                            "tx_hash": tx_hash,
+                            "recipient": recipient,
+                            "amount_eth": str(amount),
+                            "strategy": getattr(self.settings, "payout_strategy", "eth_transfer"),
+                            "batch": True,
+                        },
+                    )
+
+            receipt = self._wait_for_receipt(tx_hash)
+            if receipt is None:
+                logger.error("Batch payout timed out waiting for receipt; will reconcile later (tx=%s)", tx_hash)
+                current = []
+                current_total_wei = 0
+                return
+
+            raw_status = getattr(receipt, "status", 1)
+            status = 1 if raw_status is None else int(raw_status)
+            if status != 1:
+                logger.error("Batch payout reverted (tx=%s status=%s); clearing pending markers", tx_hash, status)
+                if self.payout_store is not None:
+                    for orchestrator_id, _, _, _ in current:
+                        self.payout_store.delete(orchestrator_id)
+                current = []
+                current_total_wei = 0
+                return
+
+            for orchestrator_id, recipient, amount, _ in current:
+                current_balance = self.ledger.get_balance(orchestrator_id)
+                new_balance = current_balance - amount
+                if new_balance < 0:
+                    new_balance = Decimal("0")
+                self.ledger.set_balance(
+                    orchestrator_id,
+                    new_balance,
+                    reason="payout",
+                    metadata={
+                        "recipient": recipient,
+                        "tx_hash": tx_hash,
+                        "amount_eth": str(amount),
+                        "block_number": getattr(receipt, "blockNumber", None),
+                        "batch": True,
+                    },
+                )
+                if self.payout_store is not None:
+                    self.payout_store.delete(orchestrator_id)
+
+            logger.info(
+                "Batch payout confirmed: tickets=%s total_wei=%s tx=%s",
+                len(current),
+                required_wei,
+                tx_hash,
+            )
+            current = []
+            current_total_wei = 0
+
+        for orchestrator_id, recipient, amount in items:
+            wei_amount = int(Decimal(amount) * WEI_PER_ETH)
+            if wei_amount <= 0:
+                continue
+
+            if wei_amount > max_batch_total_wei:
+                # Single payout exceeds our normal deposit target; send as its own batch.
+                flush_current()
+                current = [(orchestrator_id, recipient, amount, wei_amount)]
+                current_total_wei = wei_amount
+                flush_current()
+                continue
+
+            if current and (
+                len(current) >= max_tickets or current_total_wei + wei_amount > max_batch_total_wei
+            ):
+                flush_current()
+
+            current.append((orchestrator_id, recipient, amount, wei_amount))
+            current_total_wei += wei_amount
+
+        flush_current()
+
+    def _maybe_autofund_livepeer_deposit(self) -> None:
+        get_sender_info = getattr(self.payment_client, "get_sender_info", None)
+        fund_deposit = getattr(self.payment_client, "fund_deposit", None)
+        if not callable(get_sender_info) or not callable(fund_deposit):
+            return
+
+        if not getattr(self.settings, "livepeer_deposit_autofund", False):
+            return
+
+        if self.payment_client.dry_run:
+            logger.debug("Skipping TicketBroker deposit autofund (dry-run enabled)")
+            return
+
+        sender = self.payment_client.sender
+        if not sender:
+            logger.warning("Skipping TicketBroker deposit autofund (missing sender key)")
+            return
+
+        target_wei = int(self.settings.livepeer_deposit_target_eth * WEI_PER_ETH)
+        low_watermark_wei = int(self.settings.livepeer_deposit_low_watermark_eth * WEI_PER_ETH)
+        info = self.payment_client.get_sender_info(sender)
+        deposit_wei = int(info.get("deposit_wei", 0))
+
+        if deposit_wei >= low_watermark_wei:
+            return
+
+        topup_wei = max(target_wei - deposit_wei, 0)
+        if topup_wei <= 0:
+            return
+
+        topup_eth = Decimal(topup_wei) / WEI_PER_ETH
+        logger.info(
+            "TicketBroker deposit low: deposit=%s wei (<%s wei); topping up by %s ETH to target %s ETH",
+            deposit_wei,
+            low_watermark_wei,
+            topup_eth,
+            self.settings.livepeer_deposit_target_eth,
+        )
+        tx_hash = self.payment_client.fund_deposit(topup_eth)
+        if tx_hash is None:
+            logger.warning("TicketBroker deposit top-up returned no tx hash")
+            return
+
+        receipt = self._wait_for_receipt(tx_hash)
+        if receipt is None:
+            logger.error("TicketBroker deposit top-up tx failed or timed out: %s", tx_hash)
+            return
+        raw_status = getattr(receipt, "status", 1)
+        status = 1 if raw_status is None else int(raw_status)
+        if status != 1:
+            logger.error("TicketBroker deposit top-up reverted (tx=%s status=%s)", tx_hash, status)
+            return
+        block_number = getattr(receipt, "blockNumber", None)
+        logger.info("TicketBroker deposit top-up confirmed (tx=%s block=%s)", tx_hash, block_number)
+
+    def _wait_for_receipt(self, tx_hash: str):
+        confirmations = max(int(getattr(self.settings, "payout_confirmations", 1)), 1)
+        timeout = int(getattr(self.settings, "payout_receipt_timeout_seconds", 300))
+        start = time.time()
+
+        try:
+            receipt = self.payment_client.web3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
+        except Exception as exc:
+            logger.warning("Timed out waiting for tx receipt %s: %s", tx_hash, exc)
+            return None
+
+        if confirmations <= 1:
+            return receipt
+
+        mined_block = getattr(receipt, "blockNumber", None)
+        if mined_block is None:
+            return receipt
+
+        target_block = int(mined_block) + confirmations - 1
+        while True:
+            current_block = int(self.payment_client.web3.eth.block_number)
+            if current_block >= target_block:
+                return receipt
+            if time.time() - start > timeout:
+                logger.warning(
+                    "Timed out waiting for %s confirmations on tx %s (mined=%s current=%s)",
+                    confirmations,
+                    tx_hash,
+                    mined_block,
+                    current_block,
+                )
+                return None
+            time.sleep(1)
+
+    def _get_confirmed_receipt_if_available(self, tx_hash: str):
+        confirmations = max(int(getattr(self.settings, "payout_confirmations", 1)), 1)
+        try:
+            receipt = self.payment_client.web3.eth.get_transaction_receipt(tx_hash)
+        except Exception:
+            return None
+        if not receipt:
+            return None
+        if confirmations <= 1:
+            return receipt
+        mined_block = getattr(receipt, "blockNumber", None)
+        if mined_block is None:
+            return receipt
+        target_block = int(mined_block) + confirmations - 1
+        current_block = int(self.payment_client.web3.eth.block_number)
+        if current_block >= target_block:
+            return receipt
+        return None
+
     def _evaluate_orchestrator(self, orchestrator_id: str, record: Dict[str, Any]) -> None:
         payout_address = record.get("address") or record.get("payout_address")
         if not payout_address:
             logger.error("[%s] Missing payout address; skipping evaluation", orchestrator_id)
             return
 
-        summary = self._collect_health_summary(orchestrator_id, record)
-        if summary is None:
-            logger.debug(
-                "Health summary unavailable for %s; falling back to outstanding balance check",
-                orchestrator_id,
-            )
-            self._payout_outstanding_balance(orchestrator_id, payout_address)
+        if record.get("denylisted", False):
+            logger.warning("[%s] Orchestrator is denylisted; skipping payout", orchestrator_id)
             return
 
-        services_up = summary.get("services_up", 0)
-        total_services = summary.get("total_services", 0)
-        eligible = summary.get("eligible_for_payment", False)
-        status_message = summary.get("status_message", "unknown")
-
-        missing_all = total_services > 0 and services_up == 0
-        if missing_all:
-            self._handle_missing_services(orchestrator_id, record)
-            self._payout_outstanding_balance(orchestrator_id, payout_address)
+        # Payout-only mode: balances accrue via workloads + session metering (and manual admin credits).
+        balance = self.ledger.get_balance(orchestrator_id)
+        if balance <= 0:
             return
-
-        if services_up > 0:
-            self.registry.record_healthy_cycle(orchestrator_id)
-        self._missing_cycles.pop(orchestrator_id, None)
-
-        if self.registry.is_in_cooldown(orchestrator_id):
-            cooldown = self.registry.get_record(orchestrator_id) or {}
-            logger.info(
-                "Payments paused for %s during cooldown (expires %s)",
-                orchestrator_id,
-                cooldown.get("cooldown_expires_at"),
-            )
-            self._payout_outstanding_balance(orchestrator_id, payout_address)
-            return
-
-        if not self.registry.is_eligible(orchestrator_id):
-            logger.debug("Orchestrator %s not eligible for payments", orchestrator_id)
-            self._payout_outstanding_balance(orchestrator_id, payout_address)
-            return
-
-        logger.debug(
-            "Service summary for %s: up=%s total=%s eligible=%s",
-            orchestrator_id,
-            services_up,
-            total_services,
-            eligible,
-        )
-
-        if eligible and services_up == total_services and total_services > 0:
-            increment = self.settings.payment_increment_eth
-            new_balance = self.ledger.credit(
-                orchestrator_id,
-                increment,
-                reason="cycle",
-                metadata={
-                    "services_up": services_up,
-                    "total_services": total_services,
-                    "eligible": eligible,
-                },
-            )
-            logger.info(
-                "[%s] Eligible cycle → credited %s ETH. Balance=%s",
-                orchestrator_id,
-                increment,
-                new_balance,
-            )
-            self._maybe_payout(orchestrator_id, payout_address, new_balance)
-        else:
-            logger.info("[%s] Cycle not eligible for payout credit: %s", orchestrator_id, status_message)
-            self._payout_outstanding_balance(orchestrator_id, payout_address)
+        self._maybe_payout(orchestrator_id, payout_address, balance)
 
     def _payout_outstanding_balance(self, orchestrator_id: str, payout_address: str) -> None:
         """Force a payout attempt for any accrued balance even if current cycle is unhealthy."""
@@ -266,6 +528,47 @@ class PaymentProcessor:
     def _maybe_payout(
         self, orchestrator_id: str, payout_address: str, balance: Decimal
     ) -> None:
+        pending = self.payout_store.get(orchestrator_id) if self.payout_store else None
+        if pending:
+            tx_hash = str(pending.get("tx_hash") or "")
+            if not tx_hash:
+                self.payout_store.delete(orchestrator_id)
+                return
+            receipt = self._get_confirmed_receipt_if_available(tx_hash)
+            if receipt is None:
+                logger.info("[%s] Pending payout still unconfirmed; skipping (tx=%s)", orchestrator_id, tx_hash)
+                return
+            raw_status = getattr(receipt, "status", 1)
+            status = 1 if raw_status is None else int(raw_status)
+            if status != 1:
+                logger.error("[%s] Pending payout reverted; clearing pending (tx=%s status=%s)", orchestrator_id, tx_hash, status)
+                self.payout_store.delete(orchestrator_id)
+                return
+
+            try:
+                paid_amount = Decimal(str(pending.get("amount_eth") or "0"))
+            except Exception:
+                paid_amount = Decimal("0")
+            current_balance = self.ledger.get_balance(orchestrator_id)
+            new_balance = current_balance - paid_amount
+            if new_balance < 0:
+                new_balance = Decimal("0")
+            self.ledger.set_balance(
+                orchestrator_id,
+                new_balance,
+                reason="payout",
+                metadata={
+                    "recipient": pending.get("recipient") or payout_address,
+                    "tx_hash": tx_hash,
+                    "amount_eth": str(paid_amount),
+                    "block_number": getattr(receipt, "blockNumber", None),
+                    "pending_reconciled": True,
+                },
+            )
+            self.payout_store.delete(orchestrator_id)
+            logger.info("[%s] Pending payout confirmed; ledger updated (tx=%s)", orchestrator_id, tx_hash)
+            return
+
         threshold = self.settings.payout_threshold_eth
         if balance < threshold:
             logger.debug(
@@ -277,6 +580,16 @@ class PaymentProcessor:
             return
 
         amount = balance
+        if self._batch_payouts_enabled():
+            logger.info(
+                "[%s] Queuing payout of %s ETH to %s for batch redemption",
+                orchestrator_id,
+                amount,
+                payout_address,
+            )
+            self._batch_payout_queue.append((orchestrator_id, payout_address, amount))
+            return
+
         logger.info("[%s] Triggering payout of %s ETH to %s", orchestrator_id, amount, payout_address)
         tx_hash = self.payment_client.send_payment(payout_address, amount)
         if tx_hash is None:
@@ -292,13 +605,57 @@ class PaymentProcessor:
                 )
             return
 
+        if self.payout_store is not None:
+            self.payout_store.upsert(
+                orchestrator_id,
+                {
+                    "tx_hash": tx_hash,
+                    "recipient": payout_address,
+                    "amount_eth": str(amount),
+                    "strategy": getattr(self.settings, "payout_strategy", "eth_transfer"),
+                },
+            )
+
+        receipt = self._wait_for_receipt(tx_hash)
+        if receipt is None:
+            logger.error(
+                "[%s] Payout tx failed or timed out; leaving ledger balance unchanged (tx=%s)",
+                orchestrator_id,
+                tx_hash,
+            )
+            return
+
+        raw_status = getattr(receipt, "status", 1)
+        status = 1 if raw_status is None else int(raw_status)
+        if status != 1:
+            logger.error(
+                "[%s] Payout tx reverted; leaving ledger balance unchanged (tx=%s status=%s)",
+                orchestrator_id,
+                tx_hash,
+                status,
+            )
+            if self.payout_store is not None:
+                self.payout_store.delete(orchestrator_id)
+            return
+
+        current_balance = self.ledger.get_balance(orchestrator_id)
+        new_balance = current_balance - amount
+        if new_balance < 0:
+            new_balance = Decimal("0")
         self.ledger.set_balance(
             orchestrator_id,
-            Decimal("0"),
+            new_balance,
             reason="payout",
-            metadata={"recipient": payout_address, "tx_hash": tx_hash},
+            metadata={
+                "recipient": payout_address,
+                "tx_hash": tx_hash,
+                "amount_eth": str(amount),
+                "block_number": getattr(receipt, "blockNumber", None),
+            },
         )
-        logger.info("[%s] Ledger reset after payout (tx=%s)", orchestrator_id, tx_hash)
+        if self.payout_store is not None:
+            self.payout_store.delete(orchestrator_id)
+        logger.info("[%s] Ledger updated after payout (tx=%s)", orchestrator_id, tx_hash)
 
     def run_forever(self) -> None:
         """Blocking loop that runs the evaluation every configured interval."""
