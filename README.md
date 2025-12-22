@@ -34,24 +34,55 @@ docker compose up -d
 
 See `docs/backups.md`.
 
+## Livepeer TicketBroker payouts (experimental)
+
+This backend can pay orchestrators by issuing an *always-winning* Livepeer TicketBroker ticket and redeeming it while paying gas.
+
+- Configure:
+  - `PAYMENTS_PAYOUT_STRATEGY=livepeer_ticket`
+  - `PAYMENTS_LIVEPEER_TICKET_BROKER_ADDRESS=0xa8bb618b1520e284046f3dfc448851a1ff26e41b` (Arbitrum mainnet proxy)
+  - `ETH_RPC_URL=<arbitrum rpc>`
+  - `ETH_CHAIN_ID=42161`
+  - `PAYMENT_PRIVATE_KEY=<sender key>` (this address must keep its TicketBroker deposit funded)
+  - `PAYMENTS_LIVEPEER_DEPOSIT_AUTOFUND=true` (optional; keep deposit topped up)
+  - `PAYMENTS_LIVEPEER_DEPOSIT_TARGET_ETH=0.02` (optional; target deposit)
+  - `PAYMENTS_LIVEPEER_DEPOSIT_LOW_WATERMARK_ETH=0.01` (optional; only top up when below this)
+  - `PAYMENTS_LIVEPEER_BATCH_PAYOUTS=true` and `PAYMENTS_LIVEPEER_BATCH_MAX_TICKETS=20` (optional; batch multiple payouts into one onchain tx)
+  - `PAYMENTS_PAYOUT_CONFIRMATIONS=1` and `PAYMENTS_PAYOUT_RECEIPT_TIMEOUT_SECONDS=300` (optional; ledger is cleared only after receipt success)
+  - `PAYMENTS_PAYOUTS_PATH=/app/data/payouts.json` (optional; persists pending payouts to avoid double pays across restarts/timeouts)
+
+Demo (single payout):
+
+```bash
+python3 scripts/livepeer_ticket_demo.py --recipient 0x... --amount-eth 0.001
+```
+
+Demo (batch payout):
+
+```bash
+python3 scripts/livepeer_ticket_demo.py --batch-payouts-json payouts.json
+```
+
+## Forwarder Health Reports (recommended)
+
+To avoid Payments polling every orchestrator on every cycle, a trusted watcher (typically running on the forwarder) can push periodic health snapshots into the registry:
+
+- Report endpoint (admin token): `POST /api/orchestrators/{orchestrator_id}/health`
+- Controls staleness: `PAYMENTS_FORWARDER_HEALTH_TTL_SECONDS` (default `120`)
+
+When a fresh forwarder health snapshot exists, Payments uses it for payment eligibility decisions instead of calling the orchestrator `health_url`.
+
 ## Image Licensing (public-but-encrypted images)
 
 This backend can act as a minimal “license/key + lease” service for containers that ship an encrypted payload.
 
-**Admin flow**
+**Admin flow (recommended)**
 
-1. Mint an orchestrator token:
-
-```bash
-curl -sS -X POST \
-  -H "X-Admin-Token: $PAYMENTS_ADMIN_TOKEN" \
-  "https://<payments>/api/licenses/orchestrators/<orchestrator_id>/tokens"
-```
-
-2. Register an image secret (used to decrypt the payload):
+1. Register an image secret (used to decrypt the payload) and an artifact location (so Payments can presign per lease):
 
 ```bash
 IMAGE_REF="ghcr.io/its-define/unreal_vtuber/embody-ue-ps:enc-v1"
+ARTIFACT_S3_URI="s3://<bucket>/<path>/embody-ue-ps.tar.zst.age"
 
 # secret_b64 is expected to be base64(age-identity-file-bytes)
 SECRET_B64="$(python3 - <<'PY'
@@ -63,21 +94,30 @@ PY
 curl -sS -X PUT \
   -H "X-Admin-Token: $PAYMENTS_ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
-  -d "{\"image_ref\":\"$IMAGE_REF\",\"secret_b64\":\"$SECRET_B64\"}" \
+  -d "{\"image_ref\":\"$IMAGE_REF\",\"secret_b64\":\"$SECRET_B64\",\"artifact_s3_uri\":\"$ARTIFACT_S3_URI\"}" \
   "https://<payments>/api/licenses/images"
 ```
 
-3. Allow the orchestrator to access that image:
+2. Create a wallet-bound invite code (single-use) and give it to the orchestrator:
 
 ```bash
 curl -sS -X POST \
   -H "X-Admin-Token: $PAYMENTS_ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
-  -d "{\"orchestrator_id\":\"<orchestrator_id>\",\"image_ref\":\"$IMAGE_REF\"}" \
-  "https://<payments>/api/licenses/access/grant"
+  -d "{\"image_ref\":\"$IMAGE_REF\",\"bound_address\":\"0x1111111111111111111111111111111111111111\",\"ttl_seconds\":604800,\"note\":\"onboarding\"}" \
+  "https://<payments>/api/licenses/invites"
 ```
 
 **Orchestrator runtime flow**
+
+Redeem invite → mint token + grant access:
+
+```bash
+curl -sS -X POST \
+  -H "Content-Type: application/json" \
+  -d "{\"code\":\"<INVITE_CODE>\",\"orchestrator_id\":\"<orchestrator_id>\",\"address\":\"0x1111111111111111111111111111111111111111\"}" \
+  "https://<payments>/api/licenses/invites/redeem"
+```
 
 Request a lease + decryption secret:
 
@@ -89,7 +129,9 @@ curl -sS -X POST \
   "https://<payments>/api/licenses/lease"
 ```
 
-The lease response includes `secret_b64` which can be used to decrypt an encrypted image artifact (see `Unreal_Vtuber/tools/encrypted-game-image/consume.sh`).
+The lease response includes:
+- `secret_b64` (age identity bytes, base64)
+- `artifact_url` (fresh presigned URL per lease when `artifact_s3_uri` is configured and Payments has AWS creds/region)
 
 Then periodically renew:
 

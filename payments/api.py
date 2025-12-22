@@ -7,23 +7,32 @@ import logging
 import threading
 import time
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional
+
+try:
+    import boto3  # type: ignore
+except Exception:  # pragma: no cover
+    boto3 = None  # type: ignore
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from .activity import ActivityLeaseStore, parse_iso8601 as parse_activity_iso8601
 from .config import PaymentSettings
 from .ledger import Ledger
 from .registry import Registry, RegistryError
 from .licenses import (
     ImageAccessStore,
     ImageKeyStore,
+    InviteCodeStore,
     LeaseStore,
     OrchestratorTokenStore,
+    normalize_eth_address,
+    parse_s3_uri,
     parse_iso8601 as parse_license_iso8601,
 )
 from .sessions import SessionStore
@@ -134,6 +143,16 @@ class OrchestratorRecord(BaseModel):
     health_timeout: Optional[float]
     monitored_services: Optional[List[str]]
     min_service_uptime: Optional[float]
+    last_contact_source: Optional[str] = None
+    last_session_upstream_addr: Optional[str] = None
+    last_session_seen_at: Optional[str] = None
+    last_session_edge_id: Optional[str] = None
+
+class ForwarderHealthReportPayload(BaseModel):
+    """Allows a trusted watcher (typically running on the forwarder) to report health."""
+
+    source: str = Field(default="forwarder", max_length=64)
+    data: Dict[str, Any]
 
 
 class OrchestratorsResponse(BaseModel):
@@ -269,6 +288,7 @@ class LicenseTokenListResponse(BaseModel):
 class LicenseImageUpsertPayload(BaseModel):
     image_ref: str = Field(min_length=1, max_length=512)
     secret_b64: Optional[str] = Field(default=None, max_length=2048)
+    artifact_s3_uri: Optional[str] = Field(default=None, max_length=2048)
 
 
 class LicenseImageRevokePayload(BaseModel):
@@ -277,6 +297,7 @@ class LicenseImageRevokePayload(BaseModel):
 
 class LicenseImageRecord(BaseModel):
     image_ref: str
+    artifact_s3_uri: Optional[str] = None
     created_at: str
     rotated_at: str
     revoked_at: Optional[str]
@@ -310,6 +331,7 @@ class LicenseLeaseResponse(BaseModel):
     expires_at: str
     lease_seconds: int
     secret_b64: str
+    artifact_url: Optional[str] = None
 
 
 class LicenseHeartbeatResponse(BaseModel):
@@ -332,6 +354,80 @@ class LicenseLeaseRecord(BaseModel):
 
 class LicenseLeaseListResponse(BaseModel):
     leases: List[LicenseLeaseRecord]
+
+
+class LicenseInviteCreatePayload(BaseModel):
+    image_ref: str = Field(min_length=1, max_length=512)
+    bound_address: str = Field(pattern=r"^0x[a-fA-F0-9]{40}$")
+    ttl_seconds: Optional[int] = Field(default=None, ge=60, le=60 * 60 * 24 * 90)
+    expires_at: Optional[str] = Field(default=None, max_length=64)
+    note: Optional[str] = Field(default=None, max_length=256)
+
+    @model_validator(mode="after")
+    def validate_expiration(self):  # type: ignore[override]
+        if self.ttl_seconds is not None and self.expires_at:
+            raise ValueError("Provide ttl_seconds or expires_at, not both")
+        return self
+
+
+class LicenseInviteCreateResponse(BaseModel):
+    invite_id: str
+    code: str
+    image_ref: str
+    bound_address: str
+    created_at: str
+    expires_at: Optional[str]
+
+
+class LicenseInviteRecord(BaseModel):
+    invite_id: str
+    image_ref: str
+    bound_address: Optional[str]
+    created_at: str
+    expires_at: Optional[str]
+    note: Optional[str]
+    revoked_at: Optional[str]
+    redeeming_at: Optional[str]
+    redeemed_at: Optional[str]
+    redeemed_by: Optional[str]
+    redeemed_ip: Optional[str]
+    redeemed_address: Optional[str]
+    redeemed_token_id: Optional[str]
+
+
+class LicenseInviteListResponse(BaseModel):
+    invites: List[LicenseInviteRecord]
+
+
+class LicenseInviteRevokePayload(BaseModel):
+    invite_id: str = Field(min_length=1, max_length=128)
+
+
+class LicenseInviteRedeemPayload(BaseModel):
+    code: str = Field(min_length=4, max_length=128)
+    orchestrator_id: str = Field(min_length=1, max_length=128)
+    address: str = Field(pattern=r"^0x[a-fA-F0-9]{40}$")
+    capability: Optional[str] = Field(default=None, max_length=128)
+    contact_email: Optional[str] = Field(default=None, max_length=255)
+
+    @field_validator("contact_email")
+    @classmethod
+    def validate_contact_email(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return value
+        candidate = value.strip()
+        if not candidate:
+            return None
+        if "@" not in candidate or candidate.startswith("@") or candidate.endswith("@"):
+            raise ValueError("contact_email must include '@'")
+        return candidate
+
+
+class LicenseInviteRedeemResponse(BaseModel):
+    orchestrator_id: str
+    image_ref: str
+    token_id: str
+    token: str
 
 # -------------------------
 # Session metering (PS usage)
@@ -391,12 +487,47 @@ class SessionListResponse(BaseModel):
     sessions: List[SessionRecord]
 
 
+class ActivityLeaseCreatePayload(BaseModel):
+    orchestrator_id: str = Field(min_length=1, max_length=128)
+    upstream_addr: str = Field(min_length=1, max_length=255)
+    kind: str = Field(default="workload", min_length=1, max_length=32)
+    lease_seconds: Optional[int] = Field(default=None, ge=30, le=86400)
+    metadata: Optional[Dict[str, Any]] = Field(default=None)
+
+
+class ActivityLeaseHeartbeatPayload(BaseModel):
+    orchestrator_id: str = Field(min_length=1, max_length=128)
+    lease_seconds: Optional[int] = Field(default=None, ge=30, le=86400)
+
+
+class ActivityLeaseRecord(BaseModel):
+    lease_id: str
+    orchestrator_id: str
+    upstream_addr: str
+    kind: str
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    issued_at: str
+    last_seen_at: str
+    last_seen_ip: Optional[str] = None
+    expires_at: str
+    revoked_at: Optional[str] = None
+
+
+class ActivityLeaseListResponse(BaseModel):
+    leases: List[ActivityLeaseRecord]
+
+
 def create_app(registry: Registry, ledger: Ledger, settings: PaymentSettings) -> FastAPI:
     app = FastAPI(title="Embody Payments", version="1.0.0")
 
     workload_store = WorkloadStore(settings.workloads_path)
     data_dir = Path(getattr(settings, "workloads_path", Path("/app/data/workloads.json"))).parent
     session_store = SessionStore(Path(getattr(settings, "sessions_path", data_dir / "sessions.json")))
+    activity_leases = ActivityLeaseStore(
+        Path(getattr(settings, "activity_leases_path", data_dir / "activity_leases.json"))
+    )
+    activity_lease_seconds = int(getattr(settings, "activity_lease_seconds", 900) or 900)
+    activity_lease_max_seconds = int(getattr(settings, "activity_lease_max_seconds", 3600) or 3600)
     license_tokens = OrchestratorTokenStore(
         Path(getattr(settings, "license_tokens_path", data_dir / "license_tokens.json"))
     )
@@ -409,7 +540,15 @@ def create_app(registry: Registry, ledger: Ledger, settings: PaymentSettings) ->
     license_leases = LeaseStore(
         Path(getattr(settings, "license_leases_path", data_dir / "license_leases.json"))
     )
+    license_invites = InviteCodeStore(
+        Path(getattr(settings, "license_invites_path", data_dir / "license_invites.json"))
+    )
     license_lease_seconds = int(getattr(settings, "license_lease_seconds", 900))
+    license_artifact_region = getattr(settings, "license_artifact_region", None)
+    license_artifact_presign_seconds = int(
+        getattr(settings, "license_artifact_presign_seconds", license_lease_seconds)
+    )
+    license_invite_default_ttl_seconds = int(getattr(settings, "license_invite_default_ttl_seconds", 7 * 24 * 60 * 60))
     license_audit_log_path = Path(
         getattr(settings, "license_audit_log_path", data_dir / "audit" / "license.log")
     )
@@ -430,6 +569,8 @@ def create_app(registry: Registry, ledger: Ledger, settings: PaymentSettings) ->
         "host_public_ip": None,
         "last_seen_ip": None,
         "health_url": None,
+        "last_session_upstream_addr": None,
+        "last_session_edge_id": None,
     }
 
     def normalize_ip(value: Optional[str]) -> Optional[str]:
@@ -449,6 +590,29 @@ def create_app(registry: Registry, ledger: Ledger, settings: PaymentSettings) ->
                 return normalized
         client_host = request.client.host if request.client else None
         return normalize_ip(client_host)
+
+    def presign_artifact_url(image_ref: str, image: Dict[str, Any]) -> Optional[str]:
+        artifact_s3_uri = image.get("artifact_s3_uri")
+        if not artifact_s3_uri:
+            return None
+        if boto3 is None:
+            logging.getLogger(__name__).warning("boto3 unavailable; cannot presign artifact for %s", image_ref)
+            return None
+        try:
+            bucket, key = parse_s3_uri(str(artifact_s3_uri))
+        except ValueError:
+            logging.getLogger(__name__).warning("invalid artifact_s3_uri for %s: %s", image_ref, artifact_s3_uri)
+            return None
+        try:
+            client = boto3.client("s3", region_name=license_artifact_region)
+            return client.generate_presigned_url(
+                "get_object",
+                Params={"Bucket": bucket, "Key": key},
+                ExpiresIn=license_artifact_presign_seconds,
+            )
+        except Exception as exc:  # pragma: no cover
+            logging.getLogger(__name__).warning("failed to presign artifact for %s: %s", image_ref, exc)
+            return None
 
     def log_license_event(event: str, payload: Dict[str, Any]) -> None:
         try:
@@ -663,6 +827,10 @@ def create_app(registry: Registry, ledger: Ledger, settings: PaymentSettings) ->
                 health_timeout=record.get("health_timeout"),
                 monitored_services=record.get("monitored_services"),
                 min_service_uptime=record.get("min_service_uptime"),
+                last_contact_source=record.get("last_contact_source"),
+                last_session_upstream_addr=record.get("last_session_upstream_addr"),
+                last_session_seen_at=record.get("last_session_seen_at"),
+                last_session_edge_id=record.get("last_session_edge_id"),
             )
             response.append(redact_record(entry, sensitive_allowed))
 
@@ -709,8 +877,35 @@ def create_app(registry: Registry, ledger: Ledger, settings: PaymentSettings) ->
             health_timeout=record.get("health_timeout"),
             monitored_services=record.get("monitored_services"),
             min_service_uptime=record.get("min_service_uptime"),
+            last_contact_source=record.get("last_contact_source"),
+            last_session_upstream_addr=record.get("last_session_upstream_addr"),
+            last_session_seen_at=record.get("last_session_seen_at"),
+            last_session_edge_id=record.get("last_session_edge_id"),
         )
         return redact_record(entry, include_sensitive_fields(request))
+
+    @app.post("/api/orchestrators/{orchestrator_id}/health")
+    async def report_forwarder_health(
+        orchestrator_id: str,
+        payload: ForwarderHealthReportPayload,
+        _: Any = Depends(require_admin),
+    ) -> Dict[str, Any]:
+        _ensure_orchestrator_exists(orchestrator_id)
+        registry.record_forwarder_health(orchestrator_id, payload.data, source=payload.source)
+        try:
+            data = payload.data if isinstance(payload.data, dict) else {}
+            summary = data.get("summary") if isinstance(data.get("summary"), dict) else {}
+            services_up = summary.get("services_up")
+            if isinstance(services_up, int) and services_up > 0:
+                ip = data.get("ip")
+                registry.record_contact(
+                    orchestrator_id,
+                    source=payload.source,
+                    ip=ip if isinstance(ip, str) else None,
+                )
+        except Exception:
+            pass
+        return {"ok": True}
 
     def _ensure_orchestrator_exists(orchestrator_id: str) -> None:
         if not registry.get_record(orchestrator_id):
@@ -885,6 +1080,113 @@ def create_app(registry: Registry, ledger: Ledger, settings: PaymentSettings) ->
         )
 
     # ======================================================
+    # ACTIVITY LEASES (autosleep/autostop guard for content jobs)
+    # ======================================================
+
+    def _resolve_activity_lease_seconds(requested: Optional[int]) -> int:
+        try:
+            value = int(requested) if requested is not None else int(activity_lease_seconds)
+        except (TypeError, ValueError):
+            value = int(activity_lease_seconds)
+        value = max(30, value)
+        value = min(value, int(activity_lease_max_seconds))
+        return value
+
+    @app.post("/api/activity/leases", response_model=ActivityLeaseRecord)
+    async def create_activity_lease(
+        payload: ActivityLeaseCreatePayload,
+        request: Request,
+        _: Any = Depends(require_admin),
+    ) -> ActivityLeaseRecord:
+        _ensure_orchestrator_exists(payload.orchestrator_id)
+        seconds = _resolve_activity_lease_seconds(payload.lease_seconds)
+        record = activity_leases.issue(
+            orchestrator_id=payload.orchestrator_id,
+            upstream_addr=payload.upstream_addr,
+            kind=payload.kind,
+            client_ip=request_ip(request),
+            lease_seconds=seconds,
+            metadata=payload.metadata,
+        )
+        try:
+            registry.record_contact(
+                payload.orchestrator_id,
+                source="activity_lease",
+                ip=payload.upstream_addr,
+            )
+        except Exception:
+            pass
+        return ActivityLeaseRecord(**record)
+
+    @app.post("/api/activity/leases/{lease_id}/heartbeat", response_model=ActivityLeaseRecord)
+    async def heartbeat_activity_lease(
+        lease_id: str,
+        payload: ActivityLeaseHeartbeatPayload,
+        request: Request,
+        _: Any = Depends(require_admin),
+    ) -> ActivityLeaseRecord:
+        seconds = _resolve_activity_lease_seconds(payload.lease_seconds)
+        updated = activity_leases.heartbeat(
+            lease_id=lease_id,
+            orchestrator_id=payload.orchestrator_id,
+            client_ip=request_ip(request),
+            lease_seconds=seconds,
+        )
+        if updated is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Lease not found")
+        try:
+            upstream_addr = updated.get("upstream_addr")
+            registry.record_contact(
+                payload.orchestrator_id,
+                source="activity_lease",
+                ip=upstream_addr if isinstance(upstream_addr, str) else None,
+            )
+        except Exception:
+            pass
+        return ActivityLeaseRecord(**updated)
+
+    @app.delete("/api/activity/leases/{lease_id}")
+    async def revoke_activity_lease(
+        lease_id: str,
+        _: Any = Depends(require_admin),
+    ) -> Dict[str, Any]:
+        ok = activity_leases.revoke(lease_id)
+        if not ok:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Lease not found")
+        return {"ok": True, "lease_id": lease_id}
+
+    @app.get("/api/activity/leases", response_model=ActivityLeaseListResponse)
+    async def list_activity_leases(
+        orchestrator_id: Optional[str] = Query(default=None),
+        active_only: bool = Query(default=False),
+        limit: int = Query(default=200, ge=1, le=2000),
+        _: Any = Depends(require_view_access),
+    ) -> ActivityLeaseListResponse:
+        now = datetime.now(timezone.utc)
+        leases: List[ActivityLeaseRecord] = []
+        for _, record in activity_leases.iter_with_ids():
+            if orchestrator_id and record.get("orchestrator_id") != orchestrator_id:
+                continue
+            if active_only:
+                if record.get("revoked_at"):
+                    continue
+                expires_raw = record.get("expires_at")
+                if not isinstance(expires_raw, str) or not expires_raw:
+                    continue
+                try:
+                    expires = parse_activity_iso8601(expires_raw)
+                except Exception:
+                    continue
+                if expires <= now:
+                    continue
+            try:
+                leases.append(ActivityLeaseRecord(**record))
+            except Exception:
+                continue
+        leases.sort(key=lambda entry: entry.last_seen_at, reverse=True)
+        return ActivityLeaseListResponse(leases=leases[:limit])
+
+    # ======================================================
     # SESSION METERING (Pixel Streaming usage)
     # ======================================================
 
@@ -897,14 +1199,74 @@ def create_app(registry: Registry, ledger: Ledger, settings: PaymentSettings) ->
         now = datetime.now(timezone.utc)
         upstream_addr = payload.upstream_addr
 
+        def parse_host(candidate: Any) -> Optional[str]:
+            if not isinstance(candidate, str) or not candidate:
+                return None
+            try:
+                from urllib.parse import urlparse
+
+                return urlparse(candidate).hostname
+            except Exception:
+                return None
+
+        def parse_iso(candidate: Any) -> Optional[datetime]:
+            if not isinstance(candidate, str) or not candidate:
+                return None
+            value = candidate
+            if value.endswith("Z"):
+                value = value[:-1] + "+00:00"
+            try:
+                return datetime.fromisoformat(value)
+            except Exception:
+                return None
+
+        records = registry.all_records()
         orch_id: Optional[str] = None
-        for candidate_id, record in registry.all_records().items():
+        for candidate_id, record in records.items():
             if not isinstance(record, dict):
                 continue
-            host_ip = record.get("host_public_ip")
-            if host_ip and str(host_ip) == upstream_addr:
+            for key in ("host_public_ip", "last_seen_ip", "last_session_upstream_addr"):
+                ip = record.get(key)
+                if isinstance(ip, str) and ip == upstream_addr:
+                    orch_id = candidate_id
+                    break
+            if orch_id:
+                break
+            host = parse_host(record.get("health_url"))
+            if host and host == upstream_addr:
                 orch_id = candidate_id
                 break
+            forwarder_health = record.get("forwarder_health")
+            if isinstance(forwarder_health, dict):
+                data = forwarder_health.get("data")
+                ip = data.get("ip") if isinstance(data, dict) else None
+                if isinstance(ip, str) and ip == upstream_addr:
+                    orch_id = candidate_id
+                    break
+
+        if orch_id is None:
+            best: Optional[str] = None
+            best_seen: Optional[datetime] = None
+            for _, session in session_store.iter_with_ids():
+                if session.get("upstream_addr") != upstream_addr:
+                    continue
+                candidate = session.get("orchestrator_id")
+                if not candidate or not isinstance(candidate, str):
+                    continue
+                if candidate not in records:
+                    continue
+                seen = parse_iso(session.get("last_seen_at") or session.get("updated_at") or session.get("started_at"))
+                if best_seen is None or (seen and seen > best_seen):
+                    best = candidate
+                    best_seen = seen or best_seen
+            orch_id = best
+
+        if orch_id:
+            try:
+                registry.record_session_upstream(orch_id, upstream_addr, edge_id=payload.edge_id)
+                registry.record_contact(orch_id, source="session", ip=upstream_addr)
+            except Exception:
+                pass
 
         credit_rate = Decimal(str(getattr(settings, "session_credit_eth_per_minute", "0") or "0"))
         stored = session_store.apply_event(
@@ -927,12 +1289,35 @@ def create_app(registry: Registry, ledger: Ledger, settings: PaymentSettings) ->
         limit: int = Query(default=200, ge=1, le=2000),
         _: Any = Depends(require_view_access),
     ) -> SessionListResponse:
+        def parse_session_timestamp(value: Any) -> Optional[datetime]:
+            if not isinstance(value, str) or not value:
+                return None
+            candidate = value
+            if candidate.endswith("Z"):
+                candidate = candidate[:-1] + "+00:00"
+            try:
+                parsed = datetime.fromisoformat(candidate)
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                return parsed.astimezone(timezone.utc)
+            except Exception:
+                return None
+
+        now = datetime.now(timezone.utc)
+        idle_timeout = int(getattr(settings, "session_idle_timeout_seconds", 120) or 120)
         sessions: List[SessionRecord] = []
         for _, record in session_store.iter_with_ids():
             if orchestrator_id and record.get("orchestrator_id") != orchestrator_id:
                 continue
-            if active_only and record.get("ended_at"):
-                continue
+            if active_only:
+                if record.get("ended_at"):
+                    continue
+                last_seen = record.get("last_seen_at") or record.get("updated_at") or record.get("started_at")
+                last_seen_dt = parse_session_timestamp(last_seen)
+                if not last_seen_dt:
+                    continue
+                if (now - last_seen_dt).total_seconds() > idle_timeout:
+                    continue
             try:
                 sessions.append(SessionRecord(**record))
             except Exception:
@@ -1004,7 +1389,11 @@ def create_app(registry: Registry, ledger: Ledger, settings: PaymentSettings) ->
         _: Any = Depends(require_admin),
     ) -> LicenseImageWithSecret:
         try:
-            record = license_images.upsert(payload.image_ref, secret_b64=payload.secret_b64)
+            record = license_images.upsert(
+                payload.image_ref,
+                secret_b64=payload.secret_b64,
+                artifact_s3_uri=payload.artifact_s3_uri,
+            )
         except ValueError as exc:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
         log_license_event(
@@ -1020,6 +1409,7 @@ def create_app(registry: Registry, ledger: Ledger, settings: PaymentSettings) ->
         images = [
             LicenseImageRecord(
                 image_ref=item.get("image_ref", ""),
+                artifact_s3_uri=item.get("artifact_s3_uri"),
                 created_at=item.get("created_at", ""),
                 rotated_at=item.get("rotated_at", ""),
                 revoked_at=item.get("revoked_at"),
@@ -1071,6 +1461,181 @@ def create_app(registry: Registry, ledger: Ledger, settings: PaymentSettings) ->
         )
         return LicenseAccessListResponse(access=license_access.list())
 
+    @app.post("/api/licenses/invites", response_model=LicenseInviteCreateResponse)
+    async def create_license_invite(
+        payload: LicenseInviteCreatePayload,
+        _: Any = Depends(require_admin),
+    ) -> LicenseInviteCreateResponse:
+        if license_images.get(payload.image_ref) is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Image not found")
+
+        expires_at: Optional[datetime] = None
+        if payload.expires_at:
+            try:
+                expires_at = parse_license_iso8601(payload.expires_at)
+            except ValueError:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid expires_at timestamp")
+        else:
+            ttl = payload.ttl_seconds if payload.ttl_seconds is not None else license_invite_default_ttl_seconds
+            expires_at = datetime.now(timezone.utc) + timedelta(seconds=ttl)
+
+        created = license_invites.create(
+            image_ref=payload.image_ref,
+            bound_address=payload.bound_address,
+            expires_at=expires_at,
+            note=payload.note,
+        )
+        log_license_event(
+            "invite_created",
+            {
+                "invite_id": created.get("invite_id"),
+                "image_ref": payload.image_ref,
+                "expires_at": created.get("expires_at"),
+            },
+        )
+        return LicenseInviteCreateResponse(
+            invite_id=str(created.get("invite_id", "")),
+            code=str(created.get("code", "")),
+            image_ref=str(created.get("image_ref", payload.image_ref)),
+            bound_address=str(created.get("bound_address", "")),
+            created_at=str(created.get("created_at", "")),
+            expires_at=created.get("expires_at"),
+        )
+
+    @app.get("/api/licenses/invites", response_model=LicenseInviteListResponse)
+    async def list_license_invites(_: Any = Depends(require_admin)) -> LicenseInviteListResponse:
+        invites: List[LicenseInviteRecord] = []
+        for item in license_invites.list():
+            if not isinstance(item, dict):
+                continue
+            invites.append(
+                LicenseInviteRecord(
+                    invite_id=str(item.get("invite_id", "")),
+                    image_ref=str(item.get("image_ref", "")),
+                    bound_address=item.get("bound_address"),
+                    created_at=str(item.get("created_at", "")),
+                    expires_at=item.get("expires_at"),
+                    note=item.get("note"),
+                    revoked_at=item.get("revoked_at"),
+                    redeeming_at=item.get("redeeming_at"),
+                    redeemed_at=item.get("redeemed_at"),
+                    redeemed_by=item.get("redeemed_by"),
+                    redeemed_ip=item.get("redeemed_ip"),
+                    redeemed_address=item.get("redeemed_address"),
+                    redeemed_token_id=item.get("redeemed_token_id"),
+                )
+            )
+        return LicenseInviteListResponse(invites=invites)
+
+    @app.post("/api/licenses/invites/revoke", response_model=Dict[str, Any])
+    async def revoke_license_invite(
+        payload: LicenseInviteRevokePayload,
+        _: Any = Depends(require_admin),
+    ) -> Dict[str, Any]:
+        ok = license_invites.revoke(payload.invite_id)
+        if not ok:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Invite not found")
+        log_license_event("invite_revoked", {"invite_id": payload.invite_id})
+        return {"ok": True}
+
+    invite_redeem_limiter = RateLimiter(max_calls=30, window_seconds=60)
+
+    @app.post("/api/licenses/invites/redeem", response_model=LicenseInviteRedeemResponse)
+    async def redeem_license_invite(payload: LicenseInviteRedeemPayload, request: Request) -> LicenseInviteRedeemResponse:
+        client = request_ip(request) or "unknown"
+        if not invite_redeem_limiter.allow(f"ip:{client}"):
+            raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Too many attempts; slow down")
+
+        try:
+            reserved = license_invites.reserve(payload.code, client_ip=request_ip(request))
+        except KeyError:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Invite not found")
+        except TimeoutError:
+            raise HTTPException(status_code=status.HTTP_410_GONE, detail="Invite expired")
+        except PermissionError:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invite revoked")
+        except FileExistsError:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Invite already redeemed")
+        except RuntimeError:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Invite redemption already in progress")
+
+        invite_id = str(reserved.get("invite_id", ""))
+        image_ref = str(reserved.get("image_ref", ""))
+        if not invite_id or not image_ref:
+            license_invites.release(invite_id)
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Invalid invite record")
+
+        bound_address = reserved.get("bound_address")
+        if not bound_address:
+            license_invites.release(invite_id)
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Invite is missing wallet binding; ask your admin for a new invite code",
+            )
+        try:
+            normalized_bound = normalize_eth_address(str(bound_address))
+            normalized_payload = normalize_eth_address(payload.address)
+        except ValueError:
+            license_invites.release(invite_id)
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Invalid wallet binding on invite")
+        if normalized_bound != normalized_payload:
+            license_invites.release(invite_id)
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Wallet address does not match this invite code",
+            )
+
+        try:
+            image = license_images.get(image_ref)
+            if image is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Image not found")
+            if image.get("revoked_at"):
+                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Image access revoked")
+
+            metadata = {
+                "capability": payload.capability,
+                "contact_email": payload.contact_email,
+                "request_ip": request_ip(request),
+                # Invite codes are admin-issued; treat as authorized for payouts.
+                "is_top_100": True,
+            }
+            registry.register(
+                orchestrator_id=payload.orchestrator_id,
+                address=payload.address,
+                metadata=metadata,
+                skip_rank_validation=True,
+            )
+
+            license_access.grant(payload.orchestrator_id, image_ref)
+            minted = license_tokens.mint(payload.orchestrator_id)
+            license_invites.commit(
+                invite_id=invite_id,
+                orchestrator_id=payload.orchestrator_id,
+                token_id=minted["token_id"],
+                address=payload.address,
+                client_ip=request_ip(request),
+            )
+        except Exception:
+            license_invites.release(invite_id)
+            raise
+
+        log_license_event(
+            "invite_redeemed",
+            {
+                "invite_id": invite_id,
+                "orchestrator_id": payload.orchestrator_id,
+                "image_ref": image_ref,
+                "token_id": minted.get("token_id"),
+                "request_ip": request_ip(request),
+            },
+        )
+        return LicenseInviteRedeemResponse(
+            orchestrator_id=payload.orchestrator_id,
+            image_ref=image_ref,
+            token_id=minted["token_id"],
+            token=minted["token"],
+        )
+
     @app.post("/api/licenses/lease", response_model=LicenseLeaseResponse)
     async def issue_license_lease(
         payload: LicenseLeaseRequest,
@@ -1115,6 +1680,7 @@ def create_app(registry: Registry, ledger: Ledger, settings: PaymentSettings) ->
             expires_at=lease["expires_at"],
             lease_seconds=license_lease_seconds,
             secret_b64=str(image.get("secret_b64", "")),
+            artifact_url=presign_artifact_url(payload.image_ref, image),
         )
 
     @app.post("/api/licenses/lease/{lease_id}/heartbeat", response_model=LicenseHeartbeatResponse)
