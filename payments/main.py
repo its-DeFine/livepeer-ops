@@ -13,8 +13,10 @@ from pydantic import ValidationError
 from .api import create_app, run_api
 from .config import BootstrapOrchestrator, settings
 from .ledger import Ledger
+from .livepeer_ticket_broker_client import LivepeerTicketBrokerPaymentClient
 from .payment_client import PaymentClient
 from .processor import PaymentProcessor
+from .payout_store import PendingPayoutStore
 from .registry import Registry, RegistryError
 from .service_monitor import ServiceMonitor
 
@@ -161,14 +163,26 @@ def main() -> None:
         settings.ledger.balances,
         journal_path=getattr(settings, "ledger_journal_path", None),
     )
-    payment_client = PaymentClient(
-        rpc_url=settings.eth_rpc_url,
-        chain_id=settings.chain_id,
-        private_key=settings.payment_private_key,
-        keystore_path=settings.payment_keystore_path,
-        keystore_password=settings.payment_keystore_password,
-        dry_run=settings.payment_dry_run,
-    )
+    payout_strategy = getattr(settings, "payout_strategy", "eth_transfer")
+    if payout_strategy == "livepeer_ticket":
+        payment_client = LivepeerTicketBrokerPaymentClient(
+            rpc_url=settings.eth_rpc_url,
+            chain_id=settings.chain_id,
+            ticket_broker_address=str(settings.livepeer_ticket_broker_address),
+            private_key=settings.payment_private_key,
+            keystore_path=settings.payment_keystore_path,
+            keystore_password=settings.payment_keystore_password,
+            dry_run=settings.payment_dry_run,
+        )
+    else:
+        payment_client = PaymentClient(
+            rpc_url=settings.eth_rpc_url,
+            chain_id=settings.chain_id,
+            private_key=settings.payment_private_key,
+            keystore_path=settings.payment_keystore_path,
+            keystore_password=settings.payment_keystore_password,
+            dry_run=settings.payment_dry_run,
+        )
 
     registry = Registry(
         path=settings.registry_paths.registry,
@@ -176,6 +190,7 @@ def main() -> None:
         ledger=ledger,
         web3=payment_client.web3,
     )
+    payout_store = PendingPayoutStore(settings.payouts_path)
 
     app = create_app(registry, ledger, settings)
     api_thread = threading.Thread(
@@ -223,7 +238,7 @@ def main() -> None:
     else:
         logger.debug("No bootstrap orchestrators configured")
 
-    processor = PaymentProcessor(settings, monitor, ledger, payment_client, registry)
+    processor = PaymentProcessor(settings, monitor, ledger, payment_client, registry, payout_store)
     processor.run_forever()
 
 

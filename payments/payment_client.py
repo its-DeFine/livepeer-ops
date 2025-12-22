@@ -5,7 +5,7 @@ import json
 import logging
 from decimal import Decimal
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from eth_account import Account
 from eth_account.signers.local import LocalAccount
@@ -53,46 +53,62 @@ class PaymentClient:
             return self._account.address
         return None
 
-    def send_payment(self, recipient: str, amount_eth: Decimal) -> Optional[str]:
-        wei_amount = int(amount_eth * WEI_PER_ETH)
-        if wei_amount <= 0:
-            logger.info("Skipping zero-value payment to %s", recipient)
+    def send_transaction(
+        self,
+        *,
+        to: str,
+        value_wei: int = 0,
+        data: Optional[str] = None,
+    ) -> Optional[str]:
+        if value_wei < 0:
+            raise ValueError("value_wei must be non-negative")
+        if value_wei == 0 and not data:
+            logger.info("Skipping zero-value transaction to %s", to)
             return None
 
         if not self._account or self.dry_run:
             logger.info(
-                "Dry-run payment: would send %s wei to %s (sender=%s)",
-                wei_amount,
-                recipient,
+                "Dry-run transaction: would send tx to %s (value=%s wei sender=%s data=%s)",
+                to,
+                value_wei,
                 self.sender,
+                "yes" if data else "no",
             )
             return None
 
         sender = self.sender
+        if not sender:
+            raise RuntimeError("Payment client missing sender address")
+
         try:
-            recipient_checksum = Web3.to_checksum_address(recipient)
+            to_checksum = Web3.to_checksum_address(to)
         except ValueError as exc:
-            raise RuntimeError(f"Invalid recipient address {recipient}") from exc
+            raise RuntimeError(f"Invalid recipient address {to}") from exc
 
         gas_price = self.web3.eth.gas_price
         nonce = self.web3.eth.get_transaction_count(sender, block_identifier="pending")
-        estimate_payload = {
+        estimate_payload: dict[str, Any] = {
             "from": sender,
-            "to": recipient_checksum,
-            "value": wei_amount,
+            "to": to_checksum,
+            "value": value_wei,
         }
+        if data:
+            estimate_payload["data"] = data
         try:
             gas_limit = int(self.web3.eth.estimate_gas(estimate_payload))
         except Exception:  # pragma: no cover - estimation failures fall back to base gas
-            gas_limit = 21_000
+            gas_limit = 21_000 if not data else 250_000
         gas_limit = max(21_000, gas_limit)
-        tx = {
+
+        tx: dict[str, Any] = {
             "chainId": self.chain_id,
             "nonce": nonce,
-            "to": recipient_checksum,
-            "value": wei_amount,
+            "to": to_checksum,
+            "value": value_wei,
             "gas": gas_limit,
         }
+        if data:
+            tx["data"] = data
 
         max_priority_fee = getattr(self.web3.eth, "max_priority_fee", None)
         if callable(max_priority_fee):
@@ -111,11 +127,17 @@ class PaymentClient:
             tx["gasPrice"] = gas_price * 2
 
         signed = self.web3.eth.account.sign_transaction(tx, self._account.key)
-        raw_tx = getattr(signed, "rawTransaction", None) or getattr(
-            signed, "raw_transaction", None
-        )
+        raw_tx = getattr(signed, "rawTransaction", None) or getattr(signed, "raw_transaction", None)
         if raw_tx is None:  # pragma: no cover - defensive, should not happen
             raise RuntimeError("Signed transaction missing raw data")
         tx_hash = self.web3.eth.send_raw_transaction(raw_tx)
-        logger.info("Submitted payment tx %s to %s (%s eth)", tx_hash.hex(), recipient_checksum, amount_eth)
+        logger.info("Submitted tx %s to %s (value=%s wei)", tx_hash.hex(), to_checksum, value_wei)
         return tx_hash.hex()
+
+    def send_payment(self, recipient: str, amount_eth: Decimal) -> Optional[str]:
+        wei_amount = int(amount_eth * WEI_PER_ETH)
+        if wei_amount <= 0:
+            logger.info("Skipping zero-value payment to %s", recipient)
+            return None
+
+        return self.send_transaction(to=recipient, value_wei=wei_amount)
