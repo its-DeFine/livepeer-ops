@@ -47,189 +47,210 @@ class BootstrapOrchestrator(BaseModel):
 
 
 class PaymentSettings(BaseSettings):
-    orchestrator_id: Optional[str] = Field(default=None, env="ORCHESTRATOR_ID")
-    orchestrator_address: Optional[str] = Field(default=None, env="ORCHESTRATOR_ADDRESS")
-    orchestrator_health_url: Optional[str] = Field(default=None, env="ORCHESTRATOR_HEALTH_URL")
-    orchestrator_health_timeout: Optional[float] = Field(default=None, env="ORCHESTRATOR_HEALTH_TIMEOUT")
+    orchestrator_id: Optional[str] = Field(default=None, validation_alias="ORCHESTRATOR_ID")
+    orchestrator_address: Optional[str] = Field(default=None, validation_alias="ORCHESTRATOR_ADDRESS")
+    orchestrator_health_url: Optional[str] = Field(
+        default=None, validation_alias="ORCHESTRATOR_HEALTH_URL"
+    )
+    orchestrator_health_timeout: Optional[float] = Field(
+        default=None, validation_alias="ORCHESTRATOR_HEALTH_TIMEOUT"
+    )
 
-    payment_interval_seconds: int = Field(default=60, env="PAYMENT_INTERVAL_SECONDS")
-    payment_increment_eth: Decimal = Field(default=Decimal("0.00001"), env="PAYMENT_INCREMENT_ETH")
-    payout_threshold_eth: Decimal = Field(default=Decimal("0.001"), env="PAYMENT_PAYOUT_THRESHOLD_ETH")
+    payment_interval_seconds: int = Field(default=60, validation_alias="PAYMENT_INTERVAL_SECONDS")
+    payment_increment_eth: Decimal = Field(
+        default=Decimal("0.00001"), validation_alias="PAYMENT_INCREMENT_ETH"
+    )
+    payout_threshold_eth: Decimal = Field(
+        default=Decimal("0.001"), validation_alias="PAYMENT_PAYOUT_THRESHOLD_ETH"
+    )
 
-    eth_rpc_url: str = Field(default="http://localhost:8545", env="ETH_RPC_URL")
-    chain_id: int = Field(default=42161, env="ETH_CHAIN_ID")
+    eth_rpc_url: str = Field(default="http://localhost:8545", validation_alias="ETH_RPC_URL")
+    chain_id: int = Field(default=42161, validation_alias="ETH_CHAIN_ID")
 
-    payment_private_key: Optional[str] = Field(default=None, env="PAYMENT_PRIVATE_KEY")
-    payment_keystore_path: Optional[Path] = Field(default=None, env="PAYMENT_KEYSTORE_PATH")
-    payment_keystore_password: Optional[str] = Field(default=None, env="PAYMENT_KEYSTORE_PASSWORD")
+    payment_private_key: Optional[str] = Field(default=None, validation_alias="PAYMENT_PRIVATE_KEY")
+    payment_keystore_path: Optional[Path] = Field(
+        default=None, validation_alias="PAYMENT_KEYSTORE_PATH"
+    )
+    payment_keystore_password: Optional[str] = Field(
+        default=None, validation_alias="PAYMENT_KEYSTORE_PASSWORD"
+    )
 
-    payment_dry_run: bool = Field(default=True, env="PAYMENT_DRY_RUN")
-    payout_strategy: str = Field(default="eth_transfer", env="PAYMENTS_PAYOUT_STRATEGY")
+    payment_dry_run: bool = Field(default=True, validation_alias="PAYMENT_DRY_RUN")
+    payout_strategy: str = Field(default="eth_transfer", validation_alias="PAYMENTS_PAYOUT_STRATEGY")
     livepeer_ticket_broker_address: Optional[str] = Field(
         default=None,
-        env="PAYMENTS_LIVEPEER_TICKET_BROKER_ADDRESS",
+        validation_alias="PAYMENTS_LIVEPEER_TICKET_BROKER_ADDRESS",
     )
-    payout_confirmations: int = Field(default=1, env="PAYMENTS_PAYOUT_CONFIRMATIONS")
+    payout_confirmations: int = Field(default=1, validation_alias="PAYMENTS_PAYOUT_CONFIRMATIONS")
     payout_receipt_timeout_seconds: int = Field(
         default=300,
-        env="PAYMENTS_PAYOUT_RECEIPT_TIMEOUT_SECONDS",
+        validation_alias="PAYMENTS_PAYOUT_RECEIPT_TIMEOUT_SECONDS",
     )
 
-    livepeer_deposit_autofund: bool = Field(default=True, env="PAYMENTS_LIVEPEER_DEPOSIT_AUTOFUND")
+    livepeer_deposit_autofund: bool = Field(
+        default=True, validation_alias="PAYMENTS_LIVEPEER_DEPOSIT_AUTOFUND"
+    )
     livepeer_deposit_target_eth: Decimal = Field(
         default=Decimal("0.02"),
-        env="PAYMENTS_LIVEPEER_DEPOSIT_TARGET_ETH",
+        validation_alias="PAYMENTS_LIVEPEER_DEPOSIT_TARGET_ETH",
     )
     livepeer_deposit_low_watermark_eth: Decimal = Field(
         default=Decimal("0.01"),
-        env="PAYMENTS_LIVEPEER_DEPOSIT_LOW_WATERMARK_ETH",
+        validation_alias="PAYMENTS_LIVEPEER_DEPOSIT_LOW_WATERMARK_ETH",
     )
-    livepeer_batch_payouts: bool = Field(default=True, env="PAYMENTS_LIVEPEER_BATCH_PAYOUTS")
-    livepeer_batch_max_tickets: int = Field(default=20, env="PAYMENTS_LIVEPEER_BATCH_MAX_TICKETS")
+    livepeer_batch_payouts: bool = Field(default=True, validation_alias="PAYMENTS_LIVEPEER_BATCH_PAYOUTS")
+    livepeer_batch_max_tickets: int = Field(
+        default=20, validation_alias="PAYMENTS_LIVEPEER_BATCH_MAX_TICKETS"
+    )
 
     ledger: LedgerPaths = Field(default_factory=LedgerPaths)
     registry_paths: RegistryPaths = Field(default_factory=RegistryPaths)
-    payouts_path: Path = Field(default=Path("/app/data/payouts.json"), env="PAYMENTS_PAYOUTS_PATH")
+    payouts_path: Path = Field(
+        default=Path("/app/data/payouts.json"), validation_alias="PAYMENTS_PAYOUTS_PATH"
+    )
 
     bootstrap_orchestrators_path: Optional[Path] = Field(
         default=Path("/app/data/orchestrators.json"),
-        env="PAYMENTS_BOOTSTRAP_ORCHESTRATORS_PATH",
+        validation_alias="PAYMENTS_BOOTSTRAP_ORCHESTRATORS_PATH",
     )
     bootstrap_orchestrators_inline: Optional[str] = Field(
         default=None,
-        env="PAYMENTS_BOOTSTRAP_ORCHESTRATORS",
+        validation_alias="PAYMENTS_BOOTSTRAP_ORCHESTRATORS",
     )
     bootstrap_skip_rank_validation: bool = Field(
         default=True,
-        env="PAYMENTS_BOOTSTRAP_SKIP_RANK_VALIDATION",
+        validation_alias="PAYMENTS_BOOTSTRAP_SKIP_RANK_VALIDATION",
     )
 
-    top_contract_address: Optional[str] = Field(default=None, env="TOP_CONTRACT_ADDRESS")
-    top_contract_function: str = Field(default="getTop", env="TOP_CONTRACT_FUNCTION")
-    top_contract_abi_path: Optional[Path] = Field(default=None, env="TOP_CONTRACT_ABI_PATH")
-    top_contract_abi_json: Optional[str] = Field(default=None, env="TOP_CONTRACT_ABI_JSON")
-    top_cache_ttl_seconds: int = Field(default=300, env="TOP_CACHE_TTL_SECONDS")
+    top_contract_address: Optional[str] = Field(default=None, validation_alias="TOP_CONTRACT_ADDRESS")
+    top_contract_function: str = Field(default="getTop", validation_alias="TOP_CONTRACT_FUNCTION")
+    top_contract_abi_path: Optional[Path] = Field(default=None, validation_alias="TOP_CONTRACT_ABI_PATH")
+    top_contract_abi_json: Optional[str] = Field(default=None, validation_alias="TOP_CONTRACT_ABI_JSON")
+    top_cache_ttl_seconds: int = Field(default=300, validation_alias="TOP_CACHE_TTL_SECONDS")
 
-    api_host: str = Field(default="0.0.0.0", env="PAYMENTS_API_HOST")
-    api_port: int = Field(default=8081, env="PAYMENTS_API_PORT")
-    api_root_path: str = Field(default="", env="PAYMENTS_API_ROOT_PATH")
-    api_admin_token: Optional[str] = Field(default=None, env="PAYMENTS_API_ADMIN_TOKEN")
+    api_host: str = Field(default="0.0.0.0", validation_alias="PAYMENTS_API_HOST")
+    api_port: int = Field(default=8081, validation_alias="PAYMENTS_API_PORT")
+    api_root_path: str = Field(default="", validation_alias="PAYMENTS_API_ROOT_PATH")
+    api_admin_token: Optional[str] = Field(default=None, validation_alias="PAYMENTS_API_ADMIN_TOKEN")
 
     registration_rate_limit_per_minute: int = Field(
-        default=5, env="PAYMENTS_REGISTRATION_PER_MINUTE"
+        default=5, validation_alias="PAYMENTS_REGISTRATION_PER_MINUTE"
     )
-    registration_rate_limit_burst: int = Field(
-        default=5, env="PAYMENTS_REGISTRATION_BURST"
-    )
+    registration_rate_limit_burst: int = Field(default=5, validation_alias="PAYMENTS_REGISTRATION_BURST")
 
     single_orchestrator_mode: bool = Field(
-        default=True, env="PAYMENTS_SINGLE_ORCHESTRATOR_MODE"
+        default=False, validation_alias="PAYMENTS_SINGLE_ORCHESTRATOR_MODE"
     )
-    payment_miss_threshold: int = Field(default=3, env="PAYMENTS_MISS_THRESHOLD")
-    payment_cooldown_seconds: int = Field(default=3600, env="PAYMENTS_COOLDOWN_SECONDS")
+    payment_miss_threshold: int = Field(default=3, validation_alias="PAYMENTS_MISS_THRESHOLD")
+    payment_cooldown_seconds: int = Field(default=3600, validation_alias="PAYMENTS_COOLDOWN_SECONDS")
 
-    default_health_timeout: float = Field(default=5.0, env="PAYMENTS_DEFAULT_HEALTH_TIMEOUT")
-    default_min_service_uptime: float = Field(default=80.0, env="PAYMENTS_DEFAULT_MIN_SERVICE_UPTIME")
-    audit_log_path: Path = Field(default=Path("/app/data/audit/registry.log"), env="PAYMENTS_AUDIT_LOG_PATH")
+    default_health_timeout: float = Field(default=5.0, validation_alias="PAYMENTS_DEFAULT_HEALTH_TIMEOUT")
+    default_min_service_uptime: float = Field(
+        default=80.0, validation_alias="PAYMENTS_DEFAULT_MIN_SERVICE_UPTIME"
+    )
+    audit_log_path: Path = Field(
+        default=Path("/app/data/audit/registry.log"), validation_alias="PAYMENTS_AUDIT_LOG_PATH"
+    )
     ledger_journal_path: Path = Field(
         default=Path("/app/data/audit/ledger-events.log"),
-        env="PAYMENTS_LEDGER_JOURNAL_PATH",
+        validation_alias="PAYMENTS_LEDGER_JOURNAL_PATH",
     )
-    address_denylist: List[str] = Field(default_factory=list, env="PAYMENTS_ADDRESS_DENYLIST")
+    address_denylist: List[str] = Field(default_factory=list, validation_alias="PAYMENTS_ADDRESS_DENYLIST")
     manager_ip_allowlist: List[str] = Field(
         default_factory=list,
-        env="PAYMENTS_MANAGER_IP_ALLOWLIST",
+        validation_alias="PAYMENTS_MANAGER_IP_ALLOWLIST",
     )
     viewer_tokens: List[str] = Field(
         default_factory=list,
-        env="PAYMENTS_VIEWER_TOKENS",
+        validation_alias="PAYMENTS_VIEWER_TOKENS",
     )
     workload_archive_base: Path = Field(
         default=Path("/app/recordings"),
-        env="PAYMENTS_WORKLOAD_ARCHIVE_BASE",
+        validation_alias="PAYMENTS_WORKLOAD_ARCHIVE_BASE",
     )
     workloads_path: Path = Field(
         default=Path("/app/data/workloads.json"),
-        env="PAYMENTS_WORKLOADS_PATH",
+        validation_alias="PAYMENTS_WORKLOADS_PATH",
     )
     sessions_path: Path = Field(
         default=Path("/app/data/sessions.json"),
-        env="PAYMENTS_SESSIONS_PATH",
+        validation_alias="PAYMENTS_SESSIONS_PATH",
     )
     activity_leases_path: Path = Field(
         default=Path("/app/data/activity_leases.json"),
-        env="PAYMENTS_ACTIVITY_LEASES_PATH",
+        validation_alias="PAYMENTS_ACTIVITY_LEASES_PATH",
     )
     activity_lease_seconds: int = Field(
         default=900,
-        env="PAYMENTS_ACTIVITY_LEASE_SECONDS",
+        validation_alias="PAYMENTS_ACTIVITY_LEASE_SECONDS",
     )
     activity_lease_max_seconds: int = Field(
         default=3600,
-        env="PAYMENTS_ACTIVITY_LEASE_MAX_SECONDS",
+        validation_alias="PAYMENTS_ACTIVITY_LEASE_MAX_SECONDS",
     )
     session_reporter_token: Optional[str] = Field(
         default=None,
-        env="PAYMENTS_SESSION_REPORTER_TOKEN",
+        validation_alias="PAYMENTS_SESSION_REPORTER_TOKEN",
     )
     session_credit_eth_per_minute: Decimal = Field(
         default=Decimal("0"),
-        env="PAYMENTS_SESSION_CREDIT_ETH_PER_MINUTE",
+        validation_alias="PAYMENTS_SESSION_CREDIT_ETH_PER_MINUTE",
     )
     session_idle_timeout_seconds: int = Field(
         default=120,
-        env="PAYMENTS_SESSION_IDLE_TIMEOUT_SECONDS",
+        validation_alias="PAYMENTS_SESSION_IDLE_TIMEOUT_SECONDS",
     )
 
     forwarder_health_ttl_seconds: int = Field(
         default=120,
-        env="PAYMENTS_FORWARDER_HEALTH_TTL_SECONDS",
+        validation_alias="PAYMENTS_FORWARDER_HEALTH_TTL_SECONDS",
     )
 
     license_tokens_path: Path = Field(
         default=Path("/app/data/license_tokens.json"),
-        env="PAYMENTS_LICENSE_TOKENS_PATH",
+        validation_alias="PAYMENTS_LICENSE_TOKENS_PATH",
     )
     license_images_path: Path = Field(
         default=Path("/app/data/license_images.json"),
-        env="PAYMENTS_LICENSE_IMAGES_PATH",
+        validation_alias="PAYMENTS_LICENSE_IMAGES_PATH",
     )
     license_access_path: Path = Field(
         default=Path("/app/data/license_access.json"),
-        env="PAYMENTS_LICENSE_ACCESS_PATH",
+        validation_alias="PAYMENTS_LICENSE_ACCESS_PATH",
     )
     license_leases_path: Path = Field(
         default=Path("/app/data/license_leases.json"),
-        env="PAYMENTS_LICENSE_LEASES_PATH",
+        validation_alias="PAYMENTS_LICENSE_LEASES_PATH",
     )
     license_invites_path: Path = Field(
         default=Path("/app/data/license_invites.json"),
-        env="PAYMENTS_LICENSE_INVITES_PATH",
+        validation_alias="PAYMENTS_LICENSE_INVITES_PATH",
     )
     license_lease_seconds: int = Field(
         default=900,
-        env="PAYMENTS_LICENSE_LEASE_SECONDS",
+        validation_alias="PAYMENTS_LICENSE_LEASE_SECONDS",
     )
     license_artifact_region: Optional[str] = Field(
         default=None,
-        env="PAYMENTS_LICENSE_ARTIFACT_REGION",
+        validation_alias="PAYMENTS_LICENSE_ARTIFACT_REGION",
     )
     license_artifact_presign_seconds: int = Field(
         default=900,
-        env="PAYMENTS_LICENSE_ARTIFACT_PRESIGN_SECONDS",
+        validation_alias="PAYMENTS_LICENSE_ARTIFACT_PRESIGN_SECONDS",
     )
     license_invite_default_ttl_seconds: int = Field(
         default=7 * 24 * 60 * 60,
-        env="PAYMENTS_LICENSE_INVITE_DEFAULT_TTL_SECONDS",
+        validation_alias="PAYMENTS_LICENSE_INVITE_DEFAULT_TTL_SECONDS",
     )
     license_audit_log_path: Path = Field(
         default=Path("/app/data/audit/license.log"),
-        env="PAYMENTS_LICENSE_AUDIT_LOG_PATH",
+        validation_alias="PAYMENTS_LICENSE_AUDIT_LOG_PATH",
     )
 
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
+        enable_decoding=False,
         extra="ignore",
     )
 
