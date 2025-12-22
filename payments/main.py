@@ -19,6 +19,7 @@ from .processor import PaymentProcessor
 from .payout_store import PendingPayoutStore
 from .registry import Registry, RegistryError
 from .service_monitor import ServiceMonitor
+from .signer import RemoteSocketSigner, SignerError
 
 
 def _normalize_bootstrap_payload(payload: Any) -> Iterable[Dict[str, Any]]:
@@ -158,6 +159,21 @@ def main() -> None:
 
     logger.info("Starting payments backend")
 
+    signer = None
+    signer_endpoint = getattr(settings, "signer_endpoint", None)
+    if signer_endpoint:
+        signer = RemoteSocketSigner(
+            endpoint=str(signer_endpoint),
+            timeout_seconds=float(getattr(settings, "signer_timeout_seconds", 5.0) or 5.0),
+            expected_address=getattr(settings, "signer_expected_address", None),
+        )
+        try:
+            logger.info("Configured remote signer endpoint=%s address=%s", signer_endpoint, signer.address)
+        except SignerError as exc:
+            if not settings.payment_dry_run:
+                raise
+            logger.warning("Remote signer unavailable (dry-run mode): %s", exc)
+
     monitor = ServiceMonitor()
     ledger = Ledger(
         settings.ledger.balances,
@@ -172,6 +188,7 @@ def main() -> None:
             private_key=settings.payment_private_key,
             keystore_path=settings.payment_keystore_path,
             keystore_password=settings.payment_keystore_password,
+            signer=signer,
             dry_run=settings.payment_dry_run,
         )
     else:
@@ -181,6 +198,7 @@ def main() -> None:
             private_key=settings.payment_private_key,
             keystore_path=settings.payment_keystore_path,
             keystore_password=settings.payment_keystore_password,
+            signer=signer,
             dry_run=settings.payment_dry_run,
         )
 
@@ -192,7 +210,7 @@ def main() -> None:
     )
     payout_store = PendingPayoutStore(settings.payouts_path)
 
-    app = create_app(registry, ledger, settings)
+    app = create_app(registry, ledger, settings, signer=payment_client.signer)
     api_thread = threading.Thread(
         target=run_api,
         name="payments-api",

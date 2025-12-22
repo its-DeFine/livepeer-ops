@@ -4,6 +4,7 @@ from __future__ import annotations
 import ipaddress
 import os
 import re
+from urllib.parse import urlparse
 from decimal import Decimal
 from pathlib import Path
 from typing import List, Optional
@@ -73,6 +74,12 @@ class PaymentSettings(BaseSettings):
     )
     payment_keystore_password: Optional[str] = Field(
         default=None, validation_alias="PAYMENT_KEYSTORE_PASSWORD"
+    )
+    signer_endpoint: Optional[str] = Field(default=None, validation_alias="PAYMENTS_SIGNER_ENDPOINT")
+    signer_timeout_seconds: float = Field(default=5.0, validation_alias="PAYMENTS_SIGNER_TIMEOUT_SECONDS")
+    signer_expected_address: Optional[str] = Field(
+        default=None,
+        validation_alias="PAYMENTS_SIGNER_EXPECTED_ADDRESS",
     )
 
     payment_dry_run: bool = Field(default=True, validation_alias="PAYMENT_DRY_RUN")
@@ -323,6 +330,47 @@ class PaymentSettings(BaseSettings):
         if value <= 0:
             raise ValueError("Value must be positive")
         return value
+
+    @field_validator("signer_timeout_seconds")
+    @classmethod
+    def validate_signer_timeout_seconds(cls, value: float) -> float:
+        if value <= 0:
+            raise ValueError("PAYMENTS_SIGNER_TIMEOUT_SECONDS must be > 0")
+        return value
+
+    @field_validator("signer_expected_address")
+    @classmethod
+    def validate_signer_expected_address(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return value
+        candidate = value.strip()
+        if not candidate:
+            return None
+        if not candidate.startswith("0x") or len(candidate) != 42:
+            raise ValueError("PAYMENTS_SIGNER_EXPECTED_ADDRESS must be a 42-character hex string")
+        return candidate
+
+    @field_validator("signer_endpoint")
+    @classmethod
+    def validate_signer_endpoint(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return value
+        candidate = value.strip()
+        if not candidate:
+            return None
+        parsed = urlparse(candidate)
+        if parsed.scheme not in {"tcp", "vsock"}:
+            raise ValueError("PAYMENTS_SIGNER_ENDPOINT must be tcp://host:port or vsock://cid:port")
+        if parsed.hostname is None or parsed.port is None:
+            raise ValueError("PAYMENTS_SIGNER_ENDPOINT must include hostname and port")
+        if parsed.scheme == "vsock":
+            try:
+                cid = int(parsed.hostname)
+            except ValueError as exc:
+                raise ValueError("PAYMENTS_SIGNER_ENDPOINT vsock:// CID must be an integer") from exc
+            if cid <= 0:
+                raise ValueError("PAYMENTS_SIGNER_ENDPOINT vsock:// CID must be > 0")
+        return candidate
 
     @field_validator("address_denylist", mode="before")
     @classmethod
