@@ -21,6 +21,7 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from .activity import ActivityLeaseStore, parse_iso8601 as parse_activity_iso8601
 from .config import PaymentSettings
 from .ledger import Ledger
 from .registry import Registry, RegistryError
@@ -486,12 +487,47 @@ class SessionListResponse(BaseModel):
     sessions: List[SessionRecord]
 
 
+class ActivityLeaseCreatePayload(BaseModel):
+    orchestrator_id: str = Field(min_length=1, max_length=128)
+    upstream_addr: str = Field(min_length=1, max_length=255)
+    kind: str = Field(default="workload", min_length=1, max_length=32)
+    lease_seconds: Optional[int] = Field(default=None, ge=30, le=86400)
+    metadata: Optional[Dict[str, Any]] = Field(default=None)
+
+
+class ActivityLeaseHeartbeatPayload(BaseModel):
+    orchestrator_id: str = Field(min_length=1, max_length=128)
+    lease_seconds: Optional[int] = Field(default=None, ge=30, le=86400)
+
+
+class ActivityLeaseRecord(BaseModel):
+    lease_id: str
+    orchestrator_id: str
+    upstream_addr: str
+    kind: str
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    issued_at: str
+    last_seen_at: str
+    last_seen_ip: Optional[str] = None
+    expires_at: str
+    revoked_at: Optional[str] = None
+
+
+class ActivityLeaseListResponse(BaseModel):
+    leases: List[ActivityLeaseRecord]
+
+
 def create_app(registry: Registry, ledger: Ledger, settings: PaymentSettings) -> FastAPI:
     app = FastAPI(title="Embody Payments", version="1.0.0")
 
     workload_store = WorkloadStore(settings.workloads_path)
     data_dir = Path(getattr(settings, "workloads_path", Path("/app/data/workloads.json"))).parent
     session_store = SessionStore(Path(getattr(settings, "sessions_path", data_dir / "sessions.json")))
+    activity_leases = ActivityLeaseStore(
+        Path(getattr(settings, "activity_leases_path", data_dir / "activity_leases.json"))
+    )
+    activity_lease_seconds = int(getattr(settings, "activity_lease_seconds", 900) or 900)
+    activity_lease_max_seconds = int(getattr(settings, "activity_lease_max_seconds", 3600) or 3600)
     license_tokens = OrchestratorTokenStore(
         Path(getattr(settings, "license_tokens_path", data_dir / "license_tokens.json"))
     )
@@ -1042,6 +1078,113 @@ def create_app(registry: Registry, ledger: Ledger, settings: PaymentSettings) ->
             range_end=until,
             orchestrators=summary,
         )
+
+    # ======================================================
+    # ACTIVITY LEASES (autosleep/autostop guard for content jobs)
+    # ======================================================
+
+    def _resolve_activity_lease_seconds(requested: Optional[int]) -> int:
+        try:
+            value = int(requested) if requested is not None else int(activity_lease_seconds)
+        except (TypeError, ValueError):
+            value = int(activity_lease_seconds)
+        value = max(30, value)
+        value = min(value, int(activity_lease_max_seconds))
+        return value
+
+    @app.post("/api/activity/leases", response_model=ActivityLeaseRecord)
+    async def create_activity_lease(
+        payload: ActivityLeaseCreatePayload,
+        request: Request,
+        _: Any = Depends(require_admin),
+    ) -> ActivityLeaseRecord:
+        _ensure_orchestrator_exists(payload.orchestrator_id)
+        seconds = _resolve_activity_lease_seconds(payload.lease_seconds)
+        record = activity_leases.issue(
+            orchestrator_id=payload.orchestrator_id,
+            upstream_addr=payload.upstream_addr,
+            kind=payload.kind,
+            client_ip=request_ip(request),
+            lease_seconds=seconds,
+            metadata=payload.metadata,
+        )
+        try:
+            registry.record_contact(
+                payload.orchestrator_id,
+                source="activity_lease",
+                ip=payload.upstream_addr,
+            )
+        except Exception:
+            pass
+        return ActivityLeaseRecord(**record)
+
+    @app.post("/api/activity/leases/{lease_id}/heartbeat", response_model=ActivityLeaseRecord)
+    async def heartbeat_activity_lease(
+        lease_id: str,
+        payload: ActivityLeaseHeartbeatPayload,
+        request: Request,
+        _: Any = Depends(require_admin),
+    ) -> ActivityLeaseRecord:
+        seconds = _resolve_activity_lease_seconds(payload.lease_seconds)
+        updated = activity_leases.heartbeat(
+            lease_id=lease_id,
+            orchestrator_id=payload.orchestrator_id,
+            client_ip=request_ip(request),
+            lease_seconds=seconds,
+        )
+        if updated is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Lease not found")
+        try:
+            upstream_addr = updated.get("upstream_addr")
+            registry.record_contact(
+                payload.orchestrator_id,
+                source="activity_lease",
+                ip=upstream_addr if isinstance(upstream_addr, str) else None,
+            )
+        except Exception:
+            pass
+        return ActivityLeaseRecord(**updated)
+
+    @app.delete("/api/activity/leases/{lease_id}")
+    async def revoke_activity_lease(
+        lease_id: str,
+        _: Any = Depends(require_admin),
+    ) -> Dict[str, Any]:
+        ok = activity_leases.revoke(lease_id)
+        if not ok:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Lease not found")
+        return {"ok": True, "lease_id": lease_id}
+
+    @app.get("/api/activity/leases", response_model=ActivityLeaseListResponse)
+    async def list_activity_leases(
+        orchestrator_id: Optional[str] = Query(default=None),
+        active_only: bool = Query(default=False),
+        limit: int = Query(default=200, ge=1, le=2000),
+        _: Any = Depends(require_view_access),
+    ) -> ActivityLeaseListResponse:
+        now = datetime.now(timezone.utc)
+        leases: List[ActivityLeaseRecord] = []
+        for _, record in activity_leases.iter_with_ids():
+            if orchestrator_id and record.get("orchestrator_id") != orchestrator_id:
+                continue
+            if active_only:
+                if record.get("revoked_at"):
+                    continue
+                expires_raw = record.get("expires_at")
+                if not isinstance(expires_raw, str) or not expires_raw:
+                    continue
+                try:
+                    expires = parse_activity_iso8601(expires_raw)
+                except Exception:
+                    continue
+                if expires <= now:
+                    continue
+            try:
+                leases.append(ActivityLeaseRecord(**record))
+            except Exception:
+                continue
+        leases.sort(key=lambda entry: entry.last_seen_at, reverse=True)
+        return ActivityLeaseListResponse(leases=leases[:limit])
 
     # ======================================================
     # SESSION METERING (Pixel Streaming usage)

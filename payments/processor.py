@@ -1,4 +1,4 @@
-"""Main payment loop that ties monitoring + ledger + Web3 payouts."""
+"""Payment loop that pays out ledger balances via Web3."""
 from __future__ import annotations
 
 import logging
@@ -379,75 +379,15 @@ class PaymentProcessor:
             logger.error("[%s] Missing payout address; skipping evaluation", orchestrator_id)
             return
 
-        summary = self._collect_health_summary(orchestrator_id, record)
-        if summary is None:
-            logger.debug(
-                "Health summary unavailable for %s; falling back to outstanding balance check",
-                orchestrator_id,
-            )
-            self._payout_outstanding_balance(orchestrator_id, payout_address)
+        if record.get("denylisted", False):
+            logger.warning("[%s] Orchestrator is denylisted; skipping payout", orchestrator_id)
             return
 
-        services_up = summary.get("services_up", 0)
-        total_services = summary.get("total_services", 0)
-        eligible = summary.get("eligible_for_payment", False)
-        status_message = summary.get("status_message", "unknown")
-
-        missing_all = total_services > 0 and services_up == 0
-        if missing_all:
-            self._handle_missing_services(orchestrator_id, record)
-            self._payout_outstanding_balance(orchestrator_id, payout_address)
+        # Payout-only mode: balances accrue via workloads + session metering (and manual admin credits).
+        balance = self.ledger.get_balance(orchestrator_id)
+        if balance <= 0:
             return
-
-        if services_up > 0:
-            self.registry.record_healthy_cycle(orchestrator_id)
-        self._missing_cycles.pop(orchestrator_id, None)
-
-        if self.registry.is_in_cooldown(orchestrator_id):
-            cooldown = self.registry.get_record(orchestrator_id) or {}
-            logger.info(
-                "Payments paused for %s during cooldown (expires %s)",
-                orchestrator_id,
-                cooldown.get("cooldown_expires_at"),
-            )
-            self._payout_outstanding_balance(orchestrator_id, payout_address)
-            return
-
-        if not self.registry.is_eligible(orchestrator_id):
-            logger.debug("Orchestrator %s not eligible for payments", orchestrator_id)
-            self._payout_outstanding_balance(orchestrator_id, payout_address)
-            return
-
-        logger.debug(
-            "Service summary for %s: up=%s total=%s eligible=%s",
-            orchestrator_id,
-            services_up,
-            total_services,
-            eligible,
-        )
-
-        if eligible and services_up == total_services and total_services > 0:
-            increment = self.settings.payment_increment_eth
-            new_balance = self.ledger.credit(
-                orchestrator_id,
-                increment,
-                reason="cycle",
-                metadata={
-                    "services_up": services_up,
-                    "total_services": total_services,
-                    "eligible": eligible,
-                },
-            )
-            logger.info(
-                "[%s] Eligible cycle → credited %s ETH. Balance=%s",
-                orchestrator_id,
-                increment,
-                new_balance,
-            )
-            self._maybe_payout(orchestrator_id, payout_address, new_balance)
-        else:
-            logger.info("[%s] Cycle not eligible for payout credit: %s", orchestrator_id, status_message)
-            self._payout_outstanding_balance(orchestrator_id, payout_address)
+        self._maybe_payout(orchestrator_id, payout_address, balance)
 
     def _payout_outstanding_balance(self, orchestrator_id: str, payout_address: str) -> None:
         """Force a payout attempt for any accrued balance even if current cycle is unhealthy."""
@@ -588,16 +528,6 @@ class PaymentProcessor:
     def _maybe_payout(
         self, orchestrator_id: str, payout_address: str, balance: Decimal
     ) -> None:
-        threshold = self.settings.payout_threshold_eth
-        if balance < threshold:
-            logger.debug(
-                "[%s] Balance %s below threshold %s; deferring payout",
-                orchestrator_id,
-                balance,
-                threshold,
-            )
-            return
-
         pending = self.payout_store.get(orchestrator_id) if self.payout_store else None
         if pending:
             tx_hash = str(pending.get("tx_hash") or "")
@@ -637,6 +567,16 @@ class PaymentProcessor:
             )
             self.payout_store.delete(orchestrator_id)
             logger.info("[%s] Pending payout confirmed; ledger updated (tx=%s)", orchestrator_id, tx_hash)
+            return
+
+        threshold = self.settings.payout_threshold_eth
+        if balance < threshold:
+            logger.debug(
+                "[%s] Balance %s below threshold %s; deferring payout",
+                orchestrator_id,
+                balance,
+                threshold,
+            )
             return
 
         amount = balance

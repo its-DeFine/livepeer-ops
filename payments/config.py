@@ -156,6 +156,18 @@ class PaymentSettings(BaseSettings):
         default=Path("/app/data/sessions.json"),
         env="PAYMENTS_SESSIONS_PATH",
     )
+    activity_leases_path: Path = Field(
+        default=Path("/app/data/activity_leases.json"),
+        env="PAYMENTS_ACTIVITY_LEASES_PATH",
+    )
+    activity_lease_seconds: int = Field(
+        default=900,
+        env="PAYMENTS_ACTIVITY_LEASE_SECONDS",
+    )
+    activity_lease_max_seconds: int = Field(
+        default=3600,
+        env="PAYMENTS_ACTIVITY_LEASE_MAX_SECONDS",
+    )
     session_reporter_token: Optional[str] = Field(
         default=None,
         env="PAYMENTS_SESSION_REPORTER_TOKEN",
