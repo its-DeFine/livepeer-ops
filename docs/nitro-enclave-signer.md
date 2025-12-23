@@ -58,6 +58,9 @@ nitro-cli describe-enclaves
 
 Grab the `EnclaveCID` (often `16`).
 
+Note: do **not** use `--debug-mode` when you plan to unseal via KMS recipient attestation. AWS KMS rejects
+recipient-attested requests from debug enclaves.
+
 If you see `[E26] Insufficient memory requested`, increase `/etc/nitro_enclaves/allocator.yaml` `memory_mib` and restart the allocator:
 
 ```bash
@@ -152,7 +155,18 @@ PAYMENTS_SIGNER_EXPECTED_ADDRESS=0x...
 
 Then restart Payments.
 
-Note: Docker containers often can open `AF_VSOCK` sockets, but if this fails you may need to run Payments with host networking or add a small host-side tcp↔vsock bridge.
+Note: Docker’s default seccomp profile may block `AF_VSOCK` sockets, which breaks direct `vsock://...` usage inside
+the Payments container. If you see `PermissionError: [Errno 1] Operation not permitted`, run a small host-side bridge:
+
+```bash
+python3 scripts/vsock_tcp_bridge.py --listen-host 172.17.0.1 --listen-port 5001 --vsock-cid <ENCLAVE_CID>
+```
+
+and set:
+
+```bash
+PAYMENTS_SIGNER_ENDPOINT=tcp://172.17.0.1:5001
+```
 
 ## KMS key policy sketch (least privilege)
 
