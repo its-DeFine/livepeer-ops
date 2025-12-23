@@ -10,6 +10,7 @@ import sys
 import urllib.request
 from typing import Any, Optional
 from urllib.parse import urlparse
+from decimal import Decimal
 
 
 def _recv_exact(sock: socket.socket, size: int) -> bytes:
@@ -113,6 +114,35 @@ def main() -> int:
     ap.add_argument("--ciphertext-b64", required=True, help="Base64 CiphertextBlob from aws kms encrypt")
     ap.add_argument("--proxy-port", type=int, default=8000, help="KMS vsock-proxy port on the parent (default 8000)")
     ap.add_argument("--expected-address", default="", help="Optional 0x address safety check")
+    ap.add_argument("--chain-id", type=int, default=None, help="Optional chain ID policy (ex: 42161)")
+    ap.add_argument("--ticket-broker", default="", help="Optional TicketBroker address policy (0x...)")
+    ap.add_argument(
+        "--allowed-recipient",
+        action="append",
+        default=[],
+        help="Optional allowed recipient address (repeatable)",
+    )
+    ap.add_argument(
+        "--allowed-recipients-file",
+        default="",
+        help="Optional file with allowed recipient addresses (one per line)",
+    )
+    ap.add_argument(
+        "--require-allowlist",
+        action="store_true",
+        default=False,
+        help="Reject redeem txs unless allowlist is configured",
+    )
+    ap.add_argument(
+        "--max-face-value-eth",
+        default="",
+        help="Optional per-ticket max faceValue (ETH, decimal string)",
+    )
+    ap.add_argument(
+        "--max-total-face-value-eth",
+        default="",
+        help="Optional per-batch max total faceValue (ETH, decimal string)",
+    )
     args = ap.parse_args()
 
     creds = _load_aws_creds_from_env() or _load_aws_creds_from_imds()
@@ -125,6 +155,30 @@ def main() -> int:
     if args.expected_address.strip():
         params["expected_address"] = args.expected_address.strip()
 
+    if args.chain_id is not None:
+        params["chain_id"] = args.chain_id
+    if args.ticket_broker.strip():
+        params["ticket_broker"] = args.ticket_broker.strip()
+
+    recipients: list[str] = []
+    recipients.extend([str(r).strip() for r in (args.allowed_recipient or []) if str(r).strip()])
+    if args.allowed_recipients_file.strip():
+        with open(args.allowed_recipients_file.strip(), "r", encoding="utf-8") as handle:
+            for line in handle:
+                addr = line.strip()
+                if addr and not addr.startswith("#"):
+                    recipients.append(addr)
+    if recipients:
+        params["allowed_recipients"] = recipients
+    if args.require_allowlist:
+        params["require_allowlist"] = True
+    if args.max_face_value_eth.strip():
+        params["max_face_value_wei"] = int(Decimal(args.max_face_value_eth.strip()) * (Decimal(10) ** 18))
+    if args.max_total_face_value_eth.strip():
+        params["max_total_face_value_wei"] = int(
+            Decimal(args.max_total_face_value_eth.strip()) * (Decimal(10) ** 18)
+        )
+
     result = _rpc(args.endpoint, "provision", params)
     sys.stdout.write(json.dumps(result, indent=2, sort_keys=True))
     sys.stdout.write("\n")
@@ -133,4 +187,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

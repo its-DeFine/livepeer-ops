@@ -12,12 +12,17 @@ import subprocess
 from typing import Any, Optional
 from urllib.parse import urlparse
 
+from eth_abi import decode
 from eth_account import Account
 from eth_account.messages import encode_defunct
 
 
 NSM_ERROR_SUCCESS = 0
 NSM_ERROR_BUFFER_TOO_SMALL = 6
+
+FUND_DEPOSIT_SELECTOR = bytes.fromhex("6caa736b")
+REDEEM_WINNING_TICKET_SELECTOR = bytes.fromhex("ec8b3cb6")
+BATCH_REDEEM_WINNING_TICKETS_SELECTOR = bytes.fromhex("d01b808e")
 
 
 def recv_exact(sock: socket.socket, size: int) -> bytes:
@@ -204,6 +209,179 @@ def _normalize_private_key(plaintext: bytes) -> str:
     raise RuntimeError("decrypted value is not a valid ethereum private key")
 
 
+def _parse_int(value: object, *, field: str) -> int:
+    if value is None:
+        return 0
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return 0
+        try:
+            return int(raw, 16) if raw.startswith("0x") else int(raw, 10)
+        except ValueError as exc:
+            raise RuntimeError(f"{field} must be an int") from exc
+    raise RuntimeError(f"{field} must be an int")
+
+
+def _parse_bool(value: object, *, field: str) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value != 0
+    if isinstance(value, str):
+        raw = value.strip().lower()
+        if raw in {"1", "true", "yes", "y"}:
+            return True
+        if raw in {"0", "false", "no", "n", ""}:
+            return False
+    raise RuntimeError(f"{field} must be a bool")
+
+
+def _normalize_address(addr: object, *, field: str) -> str:
+    if not isinstance(addr, str) or not addr.strip():
+        raise RuntimeError(f"{field} must be a 0x address")
+    raw = addr.strip()
+    if not raw.startswith("0x") or len(raw) != 42:
+        raise RuntimeError(f"{field} must be a 0x address")
+    return raw.lower()
+
+
+def _parse_allowed_recipients(value: object) -> set[str]:
+    if value is None:
+        return set()
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return set()
+        parts = [p.strip() for p in raw.split(",") if p.strip()]
+        return {_normalize_address(p, field="allowed_recipients") for p in parts}
+    if isinstance(value, list):
+        out: set[str] = set()
+        for item in value:
+            out.add(_normalize_address(item, field="allowed_recipients"))
+        return out
+    raise RuntimeError("allowed_recipients must be a list or comma-separated string")
+
+
+def _hex_bytes(value: object, *, field: str) -> bytes:
+    if value is None:
+        return b""
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value)
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return b""
+        if raw.startswith("0x"):
+            raw = raw[2:]
+        try:
+            return bytes.fromhex(raw)
+        except ValueError as exc:
+            raise RuntimeError(f"{field} must be 0x hex") from exc
+    raise RuntimeError(f"{field} must be 0x hex")
+
+
+def _enforce_tx_policy(*, tx: dict[str, Any], policy: dict[str, Any], sender_address: str) -> None:
+    chain_id = policy.get("chain_id")
+    if chain_id is not None:
+        tx_chain_id = _parse_int(tx.get("chainId"), field="tx.chainId")
+        if int(tx_chain_id) != int(chain_id):
+            raise RuntimeError(f"chainId mismatch (got {tx_chain_id}, expected {chain_id})")
+
+    required_to = policy.get("ticket_broker")
+    if required_to:
+        to_addr = tx.get("to")
+        to_norm = _normalize_address(to_addr, field="tx.to")
+        if to_norm != str(required_to).lower():
+            raise RuntimeError(f"tx.to not allowed (got {to_norm}, expected {required_to})")
+
+    data = _hex_bytes(tx.get("data") or tx.get("input"), field="tx.data")
+    if len(data) < 4:
+        raise RuntimeError("tx.data missing selector")
+    selector = data[:4]
+
+    value_wei = _parse_int(tx.get("value"), field="tx.value")
+
+    allow_fund = _parse_bool(policy.get("allow_fund_deposit", True), field="policy.allow_fund_deposit")
+    max_fund_wei = policy.get("max_fund_deposit_wei")
+
+    allowed_recipients: set[str] = policy.get("allowed_recipients") or set()
+    require_allowlist = _parse_bool(policy.get("require_allowlist", False), field="policy.require_allowlist")
+    max_face_value_wei = policy.get("max_face_value_wei")
+    max_total_face_value_wei = policy.get("max_total_face_value_wei")
+
+    sender_norm = _normalize_address(sender_address, field="sender_address")
+
+    if selector == FUND_DEPOSIT_SELECTOR:
+        if not allow_fund:
+            raise RuntimeError("fundDeposit not allowed by policy")
+        if value_wei <= 0:
+            raise RuntimeError("fundDeposit tx.value must be > 0")
+        if max_fund_wei is not None and value_wei > int(max_fund_wei):
+            raise RuntimeError("fundDeposit tx.value exceeds policy max")
+        return
+
+    if selector == REDEEM_WINNING_TICKET_SELECTOR:
+        if value_wei != 0:
+            raise RuntimeError("redeem tx.value must be 0")
+        try:
+            ticket, _sig, _rand = decode(
+                ["(address,address,uint256,uint256,uint256,bytes32,bytes)", "bytes", "uint256"],
+                data[4:],
+            )
+        except Exception as exc:
+            raise RuntimeError(f"failed to decode redeemWinningTicket calldata: {exc}") from exc
+        recipient, ticket_sender, face_value_wei, *_rest = ticket
+        recipient_norm = _normalize_address(recipient, field="ticket.recipient")
+        ticket_sender_norm = _normalize_address(ticket_sender, field="ticket.sender")
+        if ticket_sender_norm != sender_norm:
+            raise RuntimeError("ticket.sender mismatch")
+        if require_allowlist and not allowed_recipients:
+            raise RuntimeError("policy requires allowlist but none configured")
+        if allowed_recipients and recipient_norm not in allowed_recipients:
+            raise RuntimeError("ticket.recipient not in allowlist")
+        if max_face_value_wei is not None and int(face_value_wei) > int(max_face_value_wei):
+            raise RuntimeError("ticket.faceValue exceeds policy max")
+        return
+
+    if selector == BATCH_REDEEM_WINNING_TICKETS_SELECTOR:
+        if value_wei != 0:
+            raise RuntimeError("batch redeem tx.value must be 0")
+        try:
+            tickets, _sigs, _rands = decode(
+                ["(address,address,uint256,uint256,uint256,bytes32,bytes)[]", "bytes[]", "uint256[]"],
+                data[4:],
+            )
+        except Exception as exc:
+            raise RuntimeError(f"failed to decode batchRedeemWinningTickets calldata: {exc}") from exc
+        total_face_value = 0
+        for ticket in tickets:
+            recipient, ticket_sender, face_value_wei, *_rest = ticket
+            recipient_norm = _normalize_address(recipient, field="ticket.recipient")
+            ticket_sender_norm = _normalize_address(ticket_sender, field="ticket.sender")
+            if ticket_sender_norm != sender_norm:
+                raise RuntimeError("ticket.sender mismatch")
+            if require_allowlist and not allowed_recipients:
+                raise RuntimeError("policy requires allowlist but none configured")
+            if allowed_recipients and recipient_norm not in allowed_recipients:
+                raise RuntimeError("ticket.recipient not in allowlist")
+            if max_face_value_wei is not None and int(face_value_wei) > int(max_face_value_wei):
+                raise RuntimeError("ticket.faceValue exceeds policy max")
+            total_face_value += int(face_value_wei)
+
+        if max_total_face_value_wei is not None and total_face_value > int(max_total_face_value_wei):
+            raise RuntimeError("batch faceValue sum exceeds policy max")
+        return
+
+    raise RuntimeError("tx.data selector not allowed by policy")
+
+
 def handle_request(
     request: dict[str, Any],
     *,
@@ -257,6 +435,39 @@ def handle_request(
             )
 
         state["account"] = account
+
+        policy: dict[str, Any] = {}
+        if "chain_id" in params and params.get("chain_id") is not None:
+            policy["chain_id"] = _parse_int(params.get("chain_id"), field="policy.chain_id")
+        if "ticket_broker" in params and params.get("ticket_broker") is not None:
+            policy["ticket_broker"] = _normalize_address(params.get("ticket_broker"), field="policy.ticket_broker")
+        if "allowed_recipients" in params and params.get("allowed_recipients") is not None:
+            policy["allowed_recipients"] = _parse_allowed_recipients(params.get("allowed_recipients"))
+        if "require_allowlist" in params and params.get("require_allowlist") is not None:
+            policy["require_allowlist"] = _parse_bool(params.get("require_allowlist"), field="policy.require_allowlist")
+        if "allow_fund_deposit" in params and params.get("allow_fund_deposit") is not None:
+            policy["allow_fund_deposit"] = _parse_bool(
+                params.get("allow_fund_deposit"),
+                field="policy.allow_fund_deposit",
+            )
+        if "max_fund_deposit_wei" in params and params.get("max_fund_deposit_wei") is not None:
+            policy["max_fund_deposit_wei"] = _parse_int(
+                params.get("max_fund_deposit_wei"),
+                field="policy.max_fund_deposit_wei",
+            )
+        if "max_face_value_wei" in params and params.get("max_face_value_wei") is not None:
+            policy["max_face_value_wei"] = _parse_int(
+                params.get("max_face_value_wei"),
+                field="policy.max_face_value_wei",
+            )
+        if "max_total_face_value_wei" in params and params.get("max_total_face_value_wei") is not None:
+            policy["max_total_face_value_wei"] = _parse_int(
+                params.get("max_total_face_value_wei"),
+                field="policy.max_total_face_value_wei",
+            )
+        if policy:
+            state["policy"] = policy
+
         return {"result": {"address": account.address}}
 
     if method == "address":
@@ -283,6 +494,12 @@ def handle_request(
         tx = params.get("tx")
         if not isinstance(tx, dict):
             return error("tx must be an object")
+        policy = state.get("policy")
+        if isinstance(policy, dict) and policy:
+            try:
+                _enforce_tx_policy(tx=tx, policy=policy, sender_address=account.address)
+            except Exception as exc:
+                return error(str(exc))
         try:
             signed = Account.sign_transaction(tx, account.key)
         except Exception as exc:

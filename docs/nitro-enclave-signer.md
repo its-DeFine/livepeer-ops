@@ -86,6 +86,27 @@ python3 ./scripts/provision_enclave_signer.py \
 
 It returns the signer `address`.
 
+### Optional: signer policy (recommended)
+
+To reduce blast radius if the HTTP backend is compromised, you can provision a policy so the enclave will **only sign**:
+- `TicketBroker.fundDeposit()` (optional)
+- `TicketBroker.redeemWinningTicket(...)`
+- `TicketBroker.batchRedeemWinningTickets(...)`
+
+Example (Arbitrum mainnet):
+
+```bash
+python3 ./scripts/provision_enclave_signer.py \
+  --endpoint vsock://<ENCLAVE_CID>:5000 \
+  --region us-east-2 \
+  --ciphertext-b64 '<CiphertextBlob base64>' \
+  --chain-id 42161 \
+  --ticket-broker 0xa8bb618b1520e284046f3dfc448851a1ff26e41b \
+  --allowed-recipient 0x... \
+  --require-allowlist \
+  --max-face-value-eth 0.05
+```
+
 ## 7) Point Payments backend at the signer
 
 Set in Payments `.env`:
@@ -110,4 +131,3 @@ Minimal shape:
 - optionally require an `kms:EncryptionContext:*` pair (ex: `service=payments-signer`)
 
 Do not grant plaintext decrypt to other principals.
-
