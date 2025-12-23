@@ -279,6 +279,11 @@ class LivepeerTicketBrokerPaymentClient(PaymentClient):
             raise RuntimeError("auxData encoding produced unexpected length")
         return creation_round, aux_data
 
+    def current_round_aux_data(self) -> bytes:
+        """Return the 64-byte auxData required for TicketBroker ticket redemption."""
+        _, aux_data = self._current_round_aux_data()
+        return aux_data
+
     @staticmethod
     def _recipient_rand_hash(recipient_rand: int) -> bytes:
         packed = encode_packed(["uint256"], [recipient_rand])

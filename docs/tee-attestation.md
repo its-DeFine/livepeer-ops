@@ -41,6 +41,10 @@ When `PAYMENTS_SIGNER_ENDPOINT` is set, the backend will **ignore**:
   - returns `{ mode: remote|local|none, address, attestation_available }`
 - `GET /api/tee/attestation?nonce=0x...` (viewer token allowed)
   - returns `{ address, document_b64, nonce_hex }`
+- `GET /api/tee/core/status` (viewer token allowed)
+  - returns `{ provisioned, address, attestation_available, balances, pending }`
+- `GET /api/tee/core/attestation?nonce=0x...` (viewer token allowed)
+  - returns `{ address, document_b64, nonce_hex }`
 
 ## Remote signer protocol (length-prefixed JSON)
 

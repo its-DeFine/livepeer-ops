@@ -2,6 +2,8 @@
 
 This document describes how to run the **Payments remote signer** inside an **AWS Nitro Enclave**, with the Ethereum key **unsealed from AWS KMS** (so the parent instance IAM role cannot decrypt it in plaintext).
 
+For the “TEE core” (enclave-authoritative balances + payout construction), see `docs/tee-core.md` and build from `enclave-core/` instead of `enclave/`.
+
 ## What runs where
 
 - **Parent instance (untrusted)**: Payments backend (FastAPI, Docker) + `vsock-proxy` to AWS KMS.

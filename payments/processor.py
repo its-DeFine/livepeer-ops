@@ -1,14 +1,21 @@
 """Payment loop that pays out ledger balances via Web3."""
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import time
 from collections import defaultdict
 from datetime import datetime, timezone
 from decimal import Decimal
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 import requests
+from eth_abi.packed import encode_packed
+from eth_account import Account
+from eth_account.messages import encode_defunct
+from eth_utils import keccak, to_checksum_address
 
 from .config import PaymentSettings
 from .ledger import Ledger
@@ -16,6 +23,7 @@ from .payment_client import PaymentClient, WEI_PER_ETH
 from .payout_store import PendingPayoutStore
 from .registry import Registry
 from .service_monitor import ServiceMonitor
+from .tee_core_client import TeeCoreClient, TeeCoreError
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +37,7 @@ class PaymentProcessor:
         payment_client: PaymentClient,
         registry: Registry,
         payout_store: Optional[PendingPayoutStore] = None,
+        tee_core: Optional[TeeCoreClient] = None,
     ) -> None:
         self.settings = settings
         self.monitor = monitor
@@ -36,15 +45,32 @@ class PaymentProcessor:
         self.payment_client = payment_client
         self.registry = registry
         self.payout_store = payout_store
+        self.tee_core = tee_core
         self._batch_payout_queue: list[tuple[str, str, Decimal]] = []
 
         self._missing_cycles: Dict[str, int] = defaultdict(int)
         self._monitors: Dict[str, ServiceMonitor] = {}
         self._http = requests.Session()
 
+        self._tee_core_cursor_path = Path(getattr(settings, "tee_core_sync_cursor_path", "/app/data/tee_core_sync.cursor"))
+        self._tee_core_state_path = Path(getattr(settings, "tee_core_state_path", "/app/data/tee_core_state.b64"))
+        self._tee_core_cursor = 0
+        self._tee_core_credit_signer = None
+        raw_signer = str(getattr(settings, "tee_core_credit_signer_private_key", "") or "").strip()
+        if raw_signer:
+            try:
+                self._tee_core_credit_signer = Account.from_key(raw_signer)
+            except Exception:
+                self._tee_core_credit_signer = None
+
+        if self.tee_core is not None:
+            self._tee_core_cursor = self._load_tee_core_cursor()
+            self._maybe_load_tee_core_state()
+
     def evaluate_once(self) -> None:
         """Run a single monitoring + payment evaluation cycle over all orchestrators."""
         self._batch_payout_queue = []
+        self._sync_tee_core_credits()
         self._maybe_autofund_livepeer_deposit()
         records = self.registry.all_records()
         if not records:
@@ -59,7 +85,163 @@ class PaymentProcessor:
 
         self._flush_batch_payouts()
 
+    def _load_tee_core_cursor(self) -> int:
+        try:
+            if not self._tee_core_cursor_path.exists():
+                return 0
+            raw = self._tee_core_cursor_path.read_text(encoding="utf-8").strip()
+            return int(raw) if raw else 0
+        except Exception:
+            return 0
+
+    def _persist_tee_core_cursor(self, value: int) -> None:
+        try:
+            self._tee_core_cursor_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._tee_core_cursor_path.with_suffix(".tmp")
+            tmp.write_text(str(int(value)), encoding="utf-8")
+            tmp.replace(self._tee_core_cursor_path)
+        except Exception:
+            return
+
+    def _maybe_load_tee_core_state(self) -> None:
+        if self.tee_core is None:
+            return
+        try:
+            if not self._tee_core_state_path.exists():
+                return
+            blob = self._tee_core_state_path.read_text(encoding="utf-8").strip()
+            if not blob:
+                return
+            self.tee_core.load_state(blob_b64=blob)
+            logger.info("Loaded TEE core state from %s", self._tee_core_state_path)
+        except TeeCoreError as exc:
+            logger.warning("Failed to load TEE core state (continuing): %s", exc)
+        except Exception:
+            return
+
+    def _persist_tee_core_state(self) -> None:
+        if self.tee_core is None:
+            return
+        try:
+            result = self.tee_core.export_state()
+            blob = str(result.get("blob_b64") or "").strip()
+            if not blob:
+                return
+            self._tee_core_state_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._tee_core_state_path.with_suffix(".tmp")
+            tmp.write_text(blob, encoding="utf-8")
+            tmp.replace(self._tee_core_state_path)
+        except TeeCoreError as exc:
+            logger.warning("Failed to persist TEE core state: %s", exc)
+        except Exception:
+            return
+
+    def _maybe_sign_credit(
+        self,
+        *,
+        orchestrator_id: str,
+        recipient: str,
+        amount_wei: int,
+        event_id: str,
+    ) -> Optional[str]:
+        signer = self._tee_core_credit_signer
+        if signer is None:
+            return None
+        orch_hash = keccak(text=orchestrator_id)
+        event_hash = keccak(text=event_id)
+        packed = encode_packed(
+            ["string", "bytes32", "address", "uint256", "bytes32"],
+            ["payments-tee-core:credit:v1", orch_hash, to_checksum_address(recipient), int(amount_wei), event_hash],
+        )
+        msg_hash = keccak(packed)
+        signed = signer.sign_message(encode_defunct(primitive=msg_hash))
+        return "0x" + bytes(signed.signature).hex()
+
+    def _sync_tee_core_credits(self) -> None:
+        """Forward ledger credit events to the TEE core (best-effort).
+
+        This lets the enclave maintain its own view of balances based on the host's append-only ledger journal.
+        """
+
+        if self.tee_core is None:
+            return
+
+        journal_path = getattr(self.ledger, "journal_path", None)
+        if not journal_path:
+            return
+        path = Path(journal_path)
+        if not path.exists():
+            return
+
+        progressed = False
+        try:
+            with path.open("rb") as handle:
+                handle.seek(max(int(self._tee_core_cursor), 0))
+                while True:
+                    line = handle.readline()
+                    if not line:
+                        break
+                    next_offset = handle.tell()
+                    self._tee_core_cursor = next_offset
+
+                    try:
+                        entry = json.loads(line)
+                    except Exception:
+                        continue
+                    if not isinstance(entry, dict):
+                        continue
+                    if entry.get("event") != "credit":
+                        continue
+
+                    orchestrator_id = entry.get("orchestrator_id")
+                    if not isinstance(orchestrator_id, str) or not orchestrator_id:
+                        continue
+                    amount_raw = entry.get("amount")
+                    try:
+                        amount_eth = Decimal(str(amount_raw))
+                    except Exception:
+                        continue
+                    amount_wei = int(amount_eth * WEI_PER_ETH)
+                    if amount_wei <= 0:
+                        continue
+
+                    record = self.registry.get_record(orchestrator_id) or {}
+                    recipient = record.get("address") or record.get("payout_address")
+                    if not isinstance(recipient, str) or not recipient.startswith("0x") or len(recipient) != 42:
+                        continue
+
+                    event_id = "ledger:" + hashlib.sha256(line).hexdigest()
+                    signature = self._maybe_sign_credit(
+                        orchestrator_id=orchestrator_id,
+                        recipient=recipient,
+                        amount_wei=amount_wei,
+                        event_id=event_id,
+                    )
+                    metadata = entry.get("metadata") if isinstance(entry.get("metadata"), dict) else None
+
+                    try:
+                        self.tee_core.credit(
+                            orchestrator_id=orchestrator_id,
+                            recipient=recipient,
+                            amount_wei=amount_wei,
+                            event_id=event_id,
+                            signature=signature,
+                            metadata=metadata,
+                        )
+                        progressed = True
+                    except TeeCoreError as exc:
+                        logger.warning("TEE core credit sync failed (will retry): %s", exc)
+                        self._tee_core_cursor = max(int(self._tee_core_cursor) - len(line), 0)
+                        break
+
+        finally:
+            if progressed:
+                self._persist_tee_core_cursor(self._tee_core_cursor)
+                self._persist_tee_core_state()
+
     def _batch_payouts_enabled(self) -> bool:
+        if self.tee_core is not None:
+            return False
         if not getattr(self.settings, "livepeer_batch_payouts", False):
             return False
         if getattr(self.settings, "payout_strategy", None) != "livepeer_ticket":
@@ -385,6 +567,13 @@ class PaymentProcessor:
 
         # Payout-only mode: balances accrue via workloads + session metering (and manual admin credits).
         balance = self.ledger.get_balance(orchestrator_id)
+        if self.tee_core is not None:
+            try:
+                tee_balance = self.tee_core.balance(orchestrator_id)
+                balance_wei = int(tee_balance.get("balance_wei", 0))
+                balance = Decimal(balance_wei) / WEI_PER_ETH
+            except TeeCoreError:
+                pass
         if balance <= 0:
             return
         self._maybe_payout(orchestrator_id, payout_address, balance)
@@ -392,6 +581,13 @@ class PaymentProcessor:
     def _payout_outstanding_balance(self, orchestrator_id: str, payout_address: str) -> None:
         """Force a payout attempt for any accrued balance even if current cycle is unhealthy."""
         balance = self.ledger.get_balance(orchestrator_id)
+        if self.tee_core is not None:
+            try:
+                tee_balance = self.tee_core.balance(orchestrator_id)
+                balance_wei = int(tee_balance.get("balance_wei", 0))
+                balance = Decimal(balance_wei) / WEI_PER_ETH
+            except TeeCoreError:
+                pass
         if balance <= 0:
             return
         logger.info(
@@ -542,8 +738,21 @@ class PaymentProcessor:
             status = 1 if raw_status is None else int(raw_status)
             if status != 1:
                 logger.error("[%s] Pending payout reverted; clearing pending (tx=%s status=%s)", orchestrator_id, tx_hash, status)
+                if self.tee_core is not None:
+                    try:
+                        self.tee_core.confirm_payout(tx_hash=tx_hash, status=status)
+                        self._persist_tee_core_state()
+                    except TeeCoreError as exc:
+                        logger.warning("[%s] Failed to clear TEE core pending payout (tx=%s): %s", orchestrator_id, tx_hash, exc)
                 self.payout_store.delete(orchestrator_id)
                 return
+
+            if self.tee_core is not None:
+                try:
+                    self.tee_core.confirm_payout(tx_hash=tx_hash, status=status)
+                    self._persist_tee_core_state()
+                except TeeCoreError as exc:
+                    logger.warning("[%s] Failed to confirm TEE core payout (tx=%s): %s", orchestrator_id, tx_hash, exc)
 
             try:
                 paid_amount = Decimal(str(pending.get("amount_eth") or "0"))
@@ -588,6 +797,164 @@ class PaymentProcessor:
                 payout_address,
             )
             self._batch_payout_queue.append((orchestrator_id, payout_address, amount))
+            return
+
+        payout_strategy = getattr(self.settings, "payout_strategy", "eth_transfer")
+        if self.tee_core is not None and payout_strategy == "livepeer_ticket":
+            sender = self.payment_client.sender
+            if not sender:
+                logger.warning("[%s] Cannot redeem TicketBroker ticket without a configured sender", orchestrator_id)
+                return
+            try:
+                core_address = self.tee_core.address
+                if core_address.lower() != sender.lower():
+                    logger.error(
+                        "[%s] TEE core address mismatch: payment_sender=%s tee_core=%s",
+                        orchestrator_id,
+                        sender,
+                        core_address,
+                    )
+                    return
+            except TeeCoreError as exc:
+                logger.warning("[%s] TEE core unavailable: %s", orchestrator_id, exc)
+                return
+
+            face_value_wei = int(amount * WEI_PER_ETH)
+            if face_value_wei <= 0:
+                return
+
+            if not self._ensure_livepeer_deposit(face_value_wei):
+                logger.error("[%s] Skipping payout due to insufficient TicketBroker deposit", orchestrator_id)
+                return
+
+            aux_fn = getattr(self.payment_client, "current_round_aux_data", None)
+            if not callable(aux_fn):
+                logger.error("[%s] TicketBroker client missing current_round_aux_data()", orchestrator_id)
+                return
+            try:
+                aux_data = aux_fn()
+            except Exception as exc:
+                logger.error("[%s] Failed to fetch TicketBroker auxData: %s", orchestrator_id, exc)
+                return
+
+            nonce = self.payment_client.web3.eth.get_transaction_count(sender, block_identifier="pending")
+            gas_price = self.payment_client.web3.eth.gas_price
+            tx_template: dict[str, Any] = {
+                "chainId": int(self.payment_client.chain_id),
+                "nonce": int(nonce),
+                "gas": int(getattr(self.settings, "livepeer_redeem_gas_limit", 350_000) or 350_000),
+            }
+            max_priority_fee = getattr(self.payment_client.web3.eth, "max_priority_fee", None)
+            if callable(max_priority_fee):
+                try:
+                    priority_fee = max_priority_fee()
+                except Exception:
+                    priority_fee = gas_price
+                max_fee = max(gas_price, priority_fee) * 2
+                tx_template.update({"maxPriorityFeePerGas": priority_fee, "maxFeePerGas": max_fee})
+            else:
+                tx_template["gasPrice"] = gas_price * 2
+
+            try:
+                result = self.tee_core.livepeer_prepare_redeem_tx(
+                    orchestrator_id=orchestrator_id,
+                    ticket_broker=str(self.settings.livepeer_ticket_broker_address),
+                    aux_data="0x" + bytes(aux_data).hex(),
+                    tx=tx_template,
+                    max_face_value_wei=face_value_wei,
+                )
+            except TeeCoreError as exc:
+                logger.error("[%s] TEE core refused payout: %s", orchestrator_id, exc)
+                return
+
+            raw_tx_hex = str(result.get("raw_tx") or "").strip()
+            if not raw_tx_hex.startswith("0x") or len(raw_tx_hex) < 4:
+                logger.error("[%s] TEE core returned invalid raw_tx", orchestrator_id)
+                return
+            try:
+                raw_tx_bytes = bytes.fromhex(raw_tx_hex[2:])
+            except ValueError:
+                logger.error("[%s] TEE core returned non-hex raw_tx", orchestrator_id)
+                return
+
+            claimed_tx_hash = str(result.get("tx_hash") or "").strip()
+            actual_hash = self.payment_client.web3.eth.send_raw_transaction(raw_tx_bytes).hex()
+            tx_hash = actual_hash
+            if claimed_tx_hash and claimed_tx_hash.lower() != actual_hash.lower():
+                logger.warning(
+                    "[%s] TEE core tx_hash mismatch: claimed=%s actual=%s",
+                    orchestrator_id,
+                    claimed_tx_hash,
+                    actual_hash,
+                )
+
+            paid_wei = int(result.get("face_value_wei") or face_value_wei)
+            paid_amount = Decimal(paid_wei) / WEI_PER_ETH
+            recipient = str(result.get("recipient") or payout_address)
+
+            if self.payout_store is not None:
+                self.payout_store.upsert(
+                    orchestrator_id,
+                    {
+                        "tx_hash": tx_hash,
+                        "recipient": recipient,
+                        "amount_eth": str(paid_amount),
+                        "strategy": payout_strategy,
+                    },
+                )
+
+            receipt = self._wait_for_receipt(tx_hash)
+            if receipt is None:
+                logger.error(
+                    "[%s] Payout tx failed or timed out; leaving ledger balance unchanged (tx=%s)",
+                    orchestrator_id,
+                    tx_hash,
+                )
+                return
+
+            raw_status = getattr(receipt, "status", 1)
+            status = 1 if raw_status is None else int(raw_status)
+            if status != 1:
+                logger.error(
+                    "[%s] Payout tx reverted; leaving ledger balance unchanged (tx=%s status=%s)",
+                    orchestrator_id,
+                    tx_hash,
+                    status,
+                )
+                try:
+                    self.tee_core.confirm_payout(tx_hash=tx_hash, status=status)
+                    self._persist_tee_core_state()
+                except TeeCoreError as exc:
+                    logger.warning("[%s] Failed to clear TEE core pending payout (tx=%s): %s", orchestrator_id, tx_hash, exc)
+                if self.payout_store is not None:
+                    self.payout_store.delete(orchestrator_id)
+                return
+
+            try:
+                self.tee_core.confirm_payout(tx_hash=tx_hash, status=status)
+                self._persist_tee_core_state()
+            except TeeCoreError as exc:
+                logger.warning("[%s] Failed to confirm TEE core payout (tx=%s): %s", orchestrator_id, tx_hash, exc)
+
+            current_balance = self.ledger.get_balance(orchestrator_id)
+            new_balance = current_balance - paid_amount
+            if new_balance < 0:
+                new_balance = Decimal("0")
+            self.ledger.set_balance(
+                orchestrator_id,
+                new_balance,
+                reason="payout",
+                metadata={
+                    "recipient": recipient,
+                    "tx_hash": tx_hash,
+                    "amount_eth": str(paid_amount),
+                    "block_number": getattr(receipt, "blockNumber", None),
+                    "tee_core": True,
+                },
+            )
+            if self.payout_store is not None:
+                self.payout_store.delete(orchestrator_id)
+            logger.info("[%s] Ledger updated after TEE core payout (tx=%s)", orchestrator_id, tx_hash)
             return
 
         logger.info("[%s] Triggering payout of %s ETH to %s", orchestrator_id, amount, payout_address)

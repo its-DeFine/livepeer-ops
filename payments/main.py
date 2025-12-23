@@ -20,6 +20,7 @@ from .payout_store import PendingPayoutStore
 from .registry import Registry, RegistryError
 from .service_monitor import ServiceMonitor
 from .signer import RemoteSocketSigner, SignerError
+from .tee_core_client import TeeCoreClient, TeeCoreError
 
 
 def _normalize_bootstrap_payload(payload: Any) -> Iterable[Dict[str, Any]]:
@@ -174,6 +175,21 @@ def main() -> None:
                 raise
             logger.warning("Remote signer unavailable (dry-run mode): %s", exc)
 
+    tee_core = None
+    tee_core_endpoint = getattr(settings, "tee_core_endpoint", None)
+    if tee_core_endpoint:
+        tee_core = TeeCoreClient(
+            endpoint=str(tee_core_endpoint),
+            timeout_seconds=float(getattr(settings, "tee_core_timeout_seconds", 5.0) or 5.0),
+            expected_address=getattr(settings, "tee_core_expected_address", None),
+        )
+        try:
+            logger.info("Configured TEE core endpoint=%s address=%s", tee_core_endpoint, tee_core.address)
+        except TeeCoreError as exc:
+            if not settings.payment_dry_run:
+                raise
+            logger.warning("TEE core unavailable (dry-run mode): %s", exc)
+
     monitor = ServiceMonitor()
     ledger = Ledger(
         settings.ledger.balances,
@@ -210,7 +226,7 @@ def main() -> None:
     )
     payout_store = PendingPayoutStore(settings.payouts_path)
 
-    app = create_app(registry, ledger, settings, signer=payment_client.signer)
+    app = create_app(registry, ledger, settings, signer=payment_client.signer, tee_core=tee_core)
     api_thread = threading.Thread(
         target=run_api,
         name="payments-api",
@@ -256,7 +272,7 @@ def main() -> None:
     else:
         logger.debug("No bootstrap orchestrators configured")
 
-    processor = PaymentProcessor(settings, monitor, ledger, payment_client, registry, payout_store)
+    processor = PaymentProcessor(settings, monitor, ledger, payment_client, registry, payout_store, tee_core=tee_core)
     processor.run_forever()
 
 

@@ -81,6 +81,24 @@ class PaymentSettings(BaseSettings):
         default=None,
         validation_alias="PAYMENTS_SIGNER_EXPECTED_ADDRESS",
     )
+    tee_core_endpoint: Optional[str] = Field(default=None, validation_alias="PAYMENTS_TEE_CORE_ENDPOINT")
+    tee_core_timeout_seconds: float = Field(default=5.0, validation_alias="PAYMENTS_TEE_CORE_TIMEOUT_SECONDS")
+    tee_core_expected_address: Optional[str] = Field(
+        default=None,
+        validation_alias="PAYMENTS_TEE_CORE_EXPECTED_ADDRESS",
+    )
+    tee_core_state_path: Path = Field(
+        default=Path("/app/data/tee_core_state.b64"),
+        validation_alias="PAYMENTS_TEE_CORE_STATE_PATH",
+    )
+    tee_core_sync_cursor_path: Path = Field(
+        default=Path("/app/data/tee_core_sync.cursor"),
+        validation_alias="PAYMENTS_TEE_CORE_SYNC_CURSOR_PATH",
+    )
+    tee_core_credit_signer_private_key: Optional[str] = Field(
+        default=None,
+        validation_alias="PAYMENTS_TEE_CORE_CREDIT_SIGNER_PRIVATE_KEY",
+    )
 
     payment_dry_run: bool = Field(default=True, validation_alias="PAYMENT_DRY_RUN")
     payout_strategy: str = Field(default="eth_transfer", validation_alias="PAYMENTS_PAYOUT_STRATEGY")
@@ -338,6 +356,13 @@ class PaymentSettings(BaseSettings):
             raise ValueError("PAYMENTS_SIGNER_TIMEOUT_SECONDS must be > 0")
         return value
 
+    @field_validator("tee_core_timeout_seconds")
+    @classmethod
+    def validate_tee_core_timeout_seconds(cls, value: float) -> float:
+        if value <= 0:
+            raise ValueError("PAYMENTS_TEE_CORE_TIMEOUT_SECONDS must be > 0")
+        return value
+
     @field_validator("signer_expected_address")
     @classmethod
     def validate_signer_expected_address(cls, value: Optional[str]) -> Optional[str]:
@@ -348,6 +373,18 @@ class PaymentSettings(BaseSettings):
             return None
         if not candidate.startswith("0x") or len(candidate) != 42:
             raise ValueError("PAYMENTS_SIGNER_EXPECTED_ADDRESS must be a 42-character hex string")
+        return candidate
+
+    @field_validator("tee_core_expected_address")
+    @classmethod
+    def validate_tee_core_expected_address(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return value
+        candidate = value.strip()
+        if not candidate:
+            return None
+        if not candidate.startswith("0x") or len(candidate) != 42:
+            raise ValueError("PAYMENTS_TEE_CORE_EXPECTED_ADDRESS must be a 42-character hex string")
         return candidate
 
     @field_validator("signer_endpoint")
@@ -370,6 +407,28 @@ class PaymentSettings(BaseSettings):
                 raise ValueError("PAYMENTS_SIGNER_ENDPOINT vsock:// CID must be an integer") from exc
             if cid <= 0:
                 raise ValueError("PAYMENTS_SIGNER_ENDPOINT vsock:// CID must be > 0")
+        return candidate
+
+    @field_validator("tee_core_endpoint")
+    @classmethod
+    def validate_tee_core_endpoint(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return value
+        candidate = value.strip()
+        if not candidate:
+            return None
+        parsed = urlparse(candidate)
+        if parsed.scheme not in {"tcp", "vsock"}:
+            raise ValueError("PAYMENTS_TEE_CORE_ENDPOINT must be tcp://host:port or vsock://cid:port")
+        if parsed.hostname is None or parsed.port is None:
+            raise ValueError("PAYMENTS_TEE_CORE_ENDPOINT must include hostname and port")
+        if parsed.scheme == "vsock":
+            try:
+                cid = int(parsed.hostname)
+            except ValueError as exc:
+                raise ValueError("PAYMENTS_TEE_CORE_ENDPOINT vsock:// CID must be an integer") from exc
+            if cid <= 0:
+                raise ValueError("PAYMENTS_TEE_CORE_ENDPOINT vsock:// CID must be > 0")
         return candidate
 
     @field_validator("address_denylist", mode="before")

@@ -72,3 +72,40 @@ Core methods (draft):
    - host forwards credits + asks for payouts
 3) Add state sealing and restart safety (idempotency + rollback mitigation).
 
+## Current implementation notes
+
+This repo now includes a first-pass implementation of a “TEE core” service:
+
+- Enclave app: `enclave-core/tee_core_server.py`
+- Host client: `payments/tee_core_client.py`
+- Host payment loop integration: `payments/processor.py`
+  - forwards ledger `credit` journal events into the enclave
+  - uses the enclave to construct + sign TicketBroker redemption txs
+  - persists enclave state blobs to disk for restart continuity
+
+### Host configuration
+
+Set:
+- `PAYMENTS_TEE_CORE_ENDPOINT=tcp://...` or `vsock://...`
+- `PAYMENTS_TEE_CORE_STATE_PATH=/app/data/tee_core_state.b64`
+- `PAYMENTS_TEE_CORE_SYNC_CURSOR_PATH=/app/data/tee_core_sync.cursor`
+
+Optional (only if the enclave is configured to require signed credits):
+- `PAYMENTS_TEE_CORE_CREDIT_SIGNER_PRIVATE_KEY=0x...`
+
+### Nitro build/run (TEE core EIF)
+
+On an enclave-capable EC2 instance:
+
+```bash
+cd /home/ubuntu/payments/backend
+DEST_DIR=enclave-core ./scripts/fetch_kmstool_enclave_cli.sh
+nitro-cli build-enclave --docker-dir enclave-core --output-file tee-core.eif
+nitro-cli run-enclave --cpu-count 2 --memory 2048 --eif-path tee-core.eif --enclave-cid 16
+```
+
+Then provision the enclave using `scripts/provision_enclave_signer.py` (the TEE core supports the same `generate`/`provision` RPCs):
+
+```bash
+python3 scripts/provision_enclave_signer.py --endpoint vsock://16:5000 --region us-east-2 --generate --kms-key-id "$KMS_KEY_ARN"
+```
