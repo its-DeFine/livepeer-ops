@@ -58,6 +58,15 @@ nitro-cli describe-enclaves
 
 Grab the `EnclaveCID` (often `16`).
 
+If you see `[E26] Insufficient memory requested`, increase `/etc/nitro_enclaves/allocator.yaml` `memory_mib` and restart the allocator:
+
+```bash
+sudo sed -i -E 's/^memory_mib: .*/memory_mib: 2048/' /etc/nitro_enclaves/allocator.yaml
+sudo systemctl restart nitro-enclaves-allocator.service
+```
+
+Then rerun `nitro-cli run-enclave` with `--memory` >= the reported minimum.
+
 ## 5) Encrypt the ETH key (outside enclave)
 
 You can either:
