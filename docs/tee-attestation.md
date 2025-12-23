@@ -88,3 +88,7 @@ For real TEE attestation, the enclave app must generate a genuine attestation do
 ## Nitro Enclaves runbook
 
 See `docs/nitro-enclave-signer.md` for a practical EC2 build/run flow (KMS-unseal + `vsock-proxy` + provisioning).
+
+## Next: full TEE core
+
+See `docs/tee-core.md` for the roadmap to make the enclave the final authority for ledger + payouts (not just key custody).
