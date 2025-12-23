@@ -169,6 +169,20 @@ class TeeCoreClient:
             params["max_face_value_wei"] = int(max_face_value_wei)
         return self._rpc("livepeer_prepare_redeem_tx", params)
 
+    def livepeer_prepare_fund_deposit_tx(
+        self,
+        *,
+        ticket_broker: str,
+        amount_wei: int,
+        tx: dict[str, Any],
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {
+            "ticket_broker": ticket_broker,
+            "amount_wei": int(amount_wei),
+            "tx": tx,
+        }
+        return self._rpc("livepeer_prepare_fund_deposit_tx", params)
+
     def confirm_payout(self, *, tx_hash: str, status: int) -> dict[str, Any]:
         return self._rpc("confirm_payout", {"tx_hash": tx_hash, "status": int(status)})
 

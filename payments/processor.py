@@ -281,6 +281,13 @@ class PaymentProcessor:
 
         configured_sender = self.payment_client.sender
         if not configured_sender or configured_sender.lower() != sender.lower():
+            if self.tee_core is not None:
+                try:
+                    core_address = self.tee_core.address
+                except TeeCoreError:
+                    core_address = None
+                if core_address and core_address.lower() == sender.lower():
+                    return self._fund_livepeer_deposit_via_tee_core(sender=sender, deposit_wei=deposit_wei, required_wei=required_wei)
             logger.error(
                 "Insufficient TicketBroker deposit for payout: deposit=%s wei needed=%s wei; autofund requires local key for %s",
                 deposit_wei,
@@ -320,6 +327,87 @@ class PaymentProcessor:
         logger.info(
             "TicketBroker deposit top-up confirmed (tx=%s block=%s)",
             tx_hash,
+            getattr(receipt, "blockNumber", None),
+        )
+        return True
+
+    def _fund_livepeer_deposit_via_tee_core(self, *, sender: str, deposit_wei: int, required_wei: int) -> bool:
+        if self.tee_core is None:
+            return False
+        ticket_broker = getattr(self.settings, "livepeer_ticket_broker_address", None)
+        if not ticket_broker:
+            logger.error("TicketBroker address missing; cannot auto-fund deposit via TEE core")
+            return False
+
+        target_wei = int(self.settings.livepeer_deposit_target_eth * WEI_PER_ETH)
+        desired_wei = max(target_wei, required_wei)
+        topup_wei = desired_wei - int(deposit_wei)
+        if topup_wei <= 0:
+            return True
+
+        nonce = self.payment_client.web3.eth.get_transaction_count(sender, block_identifier="pending")
+        gas_price = self.payment_client.web3.eth.gas_price
+        tx_template: dict[str, Any] = {
+            "chainId": int(self.payment_client.chain_id),
+            "nonce": int(nonce),
+            "gas": int(getattr(self.settings, "livepeer_fund_deposit_gas_limit", 150_000) or 150_000),
+        }
+        max_priority_fee = getattr(self.payment_client.web3.eth, "max_priority_fee", None)
+        if callable(max_priority_fee):
+            try:
+                priority_fee = max_priority_fee()
+            except Exception:
+                priority_fee = gas_price
+            max_fee = max(gas_price, priority_fee) * 2
+            tx_template.update({"maxPriorityFeePerGas": priority_fee, "maxFeePerGas": max_fee})
+        else:
+            tx_template["gasPrice"] = gas_price * 2
+
+        topup_eth = Decimal(topup_wei) / WEI_PER_ETH
+        logger.info(
+            "Funding TicketBroker deposit via TEE core: deposit=%s wei needed=%s wei; adding %s ETH",
+            deposit_wei,
+            required_wei,
+            topup_eth,
+        )
+        try:
+            result = self.tee_core.livepeer_prepare_fund_deposit_tx(
+                ticket_broker=str(ticket_broker),
+                amount_wei=int(topup_wei),
+                tx=tx_template,
+            )
+        except TeeCoreError as exc:
+            logger.error("TEE core refused deposit top-up: %s", exc)
+            return False
+
+        raw_tx_hex = str(result.get("raw_tx") or "").strip()
+        if not raw_tx_hex.startswith("0x") or len(raw_tx_hex) < 4:
+            logger.error("TEE core returned invalid raw_tx for deposit top-up")
+            return False
+        try:
+            raw_tx_bytes = bytes.fromhex(raw_tx_hex[2:])
+        except ValueError:
+            logger.error("TEE core returned non-hex raw_tx for deposit top-up")
+            return False
+
+        claimed_tx_hash = str(result.get("tx_hash") or "").strip()
+        actual_hash = self.payment_client.web3.eth.send_raw_transaction(raw_tx_bytes).hex()
+        if claimed_tx_hash and claimed_tx_hash.lower() != actual_hash.lower():
+            logger.warning("TEE core deposit tx_hash mismatch: claimed=%s actual=%s", claimed_tx_hash, actual_hash)
+
+        receipt = self._wait_for_receipt(actual_hash)
+        if receipt is None:
+            logger.error("TicketBroker deposit top-up timed out or failed: %s", actual_hash)
+            return False
+        raw_status = getattr(receipt, "status", 1)
+        status = 1 if raw_status is None else int(raw_status)
+        if status != 1:
+            logger.error("TicketBroker deposit top-up reverted (tx=%s status=%s)", actual_hash, status)
+            return False
+
+        logger.info(
+            "TicketBroker deposit top-up confirmed (tx=%s block=%s)",
+            actual_hash,
             getattr(receipt, "blockNumber", None),
         )
         return True

@@ -745,6 +745,31 @@ def handle_request(request: dict[str, Any], *, state: dict[str, Any]) -> dict[st
             }
         }
 
+    if method == "livepeer_prepare_fund_deposit_tx":
+        if core is None:
+            return error("TEE core not provisioned")
+        ticket_broker = _normalize_address(params.get("ticket_broker"), field="ticket_broker")
+        amount_wei = int(params.get("amount_wei") or 0)
+        if amount_wei <= 0:
+            return error("amount_wei must be > 0")
+        tx = params.get("tx")
+        if not isinstance(tx, dict):
+            return error("tx must be an object")
+
+        tx_signed = dict(tx)
+        tx_signed["to"] = to_checksum_address(ticket_broker)
+        tx_signed["value"] = int(amount_wei)
+        tx_signed["data"] = "0x" + FUND_DEPOSIT_SELECTOR.hex()
+
+        signed = Account.sign_transaction(tx_signed, core.account.key)
+        raw = getattr(signed, "rawTransaction", None) or getattr(signed, "raw_transaction", None)
+        if raw is None:
+            return error("signed tx missing raw bytes")
+        raw_bytes = bytes(raw)
+        tx_hash = "0x" + keccak(raw_bytes).hex()
+
+        return {"result": {"tx_hash": tx_hash, "raw_tx": "0x" + raw_bytes.hex(), "amount_wei": int(amount_wei)}}
+
     if method == "confirm_payout":
         if core is None:
             return error("TEE core not provisioned")
