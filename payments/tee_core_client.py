@@ -1,10 +1,7 @@
-"""Client for a future enclave-backed 'TEE core' service.
+"""Client for a payments TEE-core RPC service (vsock/tcp framed JSON).
 
-The long-term goal is to make an enclave the final authority for:
-- ledger state (balances + pending payouts)
-- payout construction and transaction signing
-
-This client reuses the same length-prefixed JSON framing as payments/signer.py.
+The TEE core is the authority for balances + payout construction. The host
+backend forwards credit events and broadcasts enclave-signed raw transactions.
 """
 
 from __future__ import annotations
@@ -55,22 +52,31 @@ def _send_framed_json(sock: socket.socket, payload: dict[str, Any]) -> dict[str,
 class TeeCoreClient:
     endpoint: str
     timeout_seconds: float = 5.0
+    expected_address: Optional[str] = None
+    _address: Optional[str] = None
 
     def _connect(self) -> socket.socket:
         parsed = urlparse(self.endpoint)
         if parsed.hostname is None or parsed.port is None:
             raise TeeCoreError("TEE core endpoint missing host/port")
         if parsed.scheme == "tcp":
-            return socket.create_connection(
-                (parsed.hostname, parsed.port),
-                timeout=self.timeout_seconds,
-            )
+            return socket.create_connection((parsed.hostname, parsed.port), timeout=self.timeout_seconds)
         if parsed.scheme == "vsock":
             if not hasattr(socket, "AF_VSOCK"):
                 raise TeeCoreError("AF_VSOCK not supported in this environment")
-            sock = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
+            try:
+                sock = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
+            except PermissionError as exc:
+                raise TeeCoreError(
+                    "AF_VSOCK is not permitted in this environment (common inside Docker due to seccomp); "
+                    "use a tcp↔vsock bridge or relax the container seccomp profile"
+                ) from exc
             sock.settimeout(self.timeout_seconds)
-            sock.connect((int(parsed.hostname), parsed.port))
+            try:
+                cid = int(parsed.hostname)
+            except ValueError as exc:  # pragma: no cover - config validation should catch this
+                raise TeeCoreError("TEE core vsock:// CID must be an integer") from exc
+            sock.connect((cid, parsed.port))
             return sock
         raise TeeCoreError("TEE core endpoint must use tcp:// or vsock://")
 
@@ -86,6 +92,20 @@ class TeeCoreClient:
         if not isinstance(result, dict):
             raise TeeCoreError("TEE core returned invalid result")
         return result
+
+    @property
+    def address(self) -> str:
+        if self._address is None:
+            result = self._rpc("address")
+            address = str(result.get("address") or "").strip()
+            if not address:
+                raise TeeCoreError("TEE core missing address")
+            self._address = address
+
+            expected = (self.expected_address or "").strip()
+            if expected and address.lower() != expected.lower():
+                raise TeeCoreError(f"TEE core address mismatch: got {address}, expected {expected}")
+        return self._address
 
     def status(self) -> dict[str, Any]:
         return self._rpc("status")
@@ -105,15 +125,69 @@ class TeeCoreClient:
         except Exception as exc:
             raise TeeCoreError("TEE core returned invalid document_b64") from exc
 
-    def credit(self, orchestrator_id: str, amount_wei: int) -> dict[str, Any]:
-        return self._rpc("credit", {"orchestrator_id": orchestrator_id, "amount_wei": int(amount_wei)})
+    def credit(
+        self,
+        *,
+        orchestrator_id: str,
+        recipient: str,
+        amount_wei: int,
+        event_id: str,
+        signature: Optional[str] = None,
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {
+            "orchestrator_id": orchestrator_id,
+            "recipient": recipient,
+            "amount_wei": int(amount_wei),
+            "event_id": event_id,
+        }
+        if signature:
+            params["signature"] = signature
+        if metadata:
+            params["metadata"] = metadata
+        return self._rpc("credit", params)
 
     def balance(self, orchestrator_id: str) -> dict[str, Any]:
         return self._rpc("balance", {"orchestrator_id": orchestrator_id})
 
-    def livepeer_prepare_redeem_tx(self, *, payload: dict[str, Any]) -> dict[str, Any]:
-        return self._rpc("livepeer_prepare_redeem_tx", payload)
+    def livepeer_prepare_redeem_tx(
+        self,
+        *,
+        orchestrator_id: str,
+        ticket_broker: str,
+        aux_data: str,
+        tx: dict[str, Any],
+        max_face_value_wei: Optional[int] = None,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {
+            "orchestrator_id": orchestrator_id,
+            "ticket_broker": ticket_broker,
+            "aux_data": aux_data,
+            "tx": tx,
+        }
+        if max_face_value_wei is not None:
+            params["max_face_value_wei"] = int(max_face_value_wei)
+        return self._rpc("livepeer_prepare_redeem_tx", params)
 
-    def confirm_payout(self, tx_hash: str, status: int) -> dict[str, Any]:
+    def livepeer_prepare_fund_deposit_tx(
+        self,
+        *,
+        ticket_broker: str,
+        amount_wei: int,
+        tx: dict[str, Any],
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {
+            "ticket_broker": ticket_broker,
+            "amount_wei": int(amount_wei),
+            "tx": tx,
+        }
+        return self._rpc("livepeer_prepare_fund_deposit_tx", params)
+
+    def confirm_payout(self, *, tx_hash: str, status: int) -> dict[str, Any]:
         return self._rpc("confirm_payout", {"tx_hash": tx_hash, "status": int(status)})
 
+    def load_state(self, *, blob_b64: str) -> dict[str, Any]:
+        return self._rpc("load_state", {"blob_b64": blob_b64})
+
+    def export_state(self) -> dict[str, Any]:
+        return self._rpc("export_state")

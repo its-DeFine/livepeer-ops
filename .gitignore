@@ -20,3 +20,6 @@ __pycache__/
 enclave/kmstool_enclave_cli
 enclave/libnsm.so
 enclave/*.eif
+enclave-core/kmstool_enclave_cli
+enclave-core/libnsm.so
+enclave-core/*.eif

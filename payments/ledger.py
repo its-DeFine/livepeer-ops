@@ -10,9 +10,16 @@ import threading
 
 
 class Ledger:
-    def __init__(self, path: Path, journal_path: Optional[Path] = None) -> None:
+    def __init__(
+        self,
+        path: Path,
+        journal_path: Optional[Path] = None,
+        *,
+        default_metadata: Optional[Dict[str, object]] = None,
+    ) -> None:
         self.path = path
         self.journal_path = journal_path
+        self.default_metadata = dict(default_metadata) if default_metadata else None
         self._lock = threading.RLock()
         self.balances: Dict[str, Decimal] = {}
         self._load()
@@ -59,8 +66,13 @@ class Ledger:
                 entry["delta"] = str(delta)
             if reason:
                 entry["reason"] = reason
+            merged_metadata: Dict[str, object] = {}
+            if self.default_metadata:
+                merged_metadata.update(self.default_metadata)
             if metadata:
-                entry["metadata"] = metadata
+                merged_metadata.update(metadata)
+            if merged_metadata:
+                entry["metadata"] = merged_metadata
             with self.journal_path.open("a", encoding="utf-8") as handle:
                 json.dump(entry, handle, separators=(",", ":"))
                 handle.write("\n")

@@ -38,6 +38,7 @@ from .licenses import (
 )
 from .sessions import SessionStore
 from .signer import Signer, SignerError
+from .tee_core_client import TeeCoreClient, TeeCoreError
 from .workloads import WorkloadStore
 
 
@@ -127,6 +128,20 @@ class TeeStatusResponse(BaseModel):
 
 
 class TeeAttestationResponse(BaseModel):
+    address: str
+    document_b64: str
+    nonce_hex: Optional[str] = None
+
+
+class TeeCoreStatusResponse(BaseModel):
+    provisioned: bool
+    address: Optional[str] = None
+    attestation_available: bool = False
+    balances: Optional[int] = None
+    pending: Optional[int] = None
+
+
+class TeeCoreAttestationResponse(BaseModel):
     address: str
     document_b64: str
     nonce_hex: Optional[str] = None
@@ -535,6 +550,7 @@ def create_app(
     ledger: Ledger,
     settings: PaymentSettings,
     signer: Optional[Signer] = None,
+    tee_core: Optional[TeeCoreClient] = None,
 ) -> FastAPI:
     app = FastAPI(title="Embody Payments", version="1.0.0")
 
@@ -752,6 +768,18 @@ def create_app(
     async def registry_error_handler(_: Request, exc: RegistryError) -> JSONResponse:
         return JSONResponse(status_code=exc.status_code, content={"detail": str(exc)})
 
+    WEI_PER_ETH = Decimal(10) ** 18
+
+    def orchestrator_balance(orchestrator_id: str) -> Decimal:
+        if tee_core is not None:
+            try:
+                result = tee_core.balance(orchestrator_id)
+                balance_wei = int(result.get("balance_wei", 0))
+                return Decimal(balance_wei) / WEI_PER_ETH
+            except TeeCoreError:
+                pass
+        return ledger.get_balance(orchestrator_id)
+
     @app.get("/api/tee/status", response_model=TeeStatusResponse)
     async def tee_status(_: Any = Depends(require_view_access)) -> TeeStatusResponse:
         signer_endpoint = getattr(settings, "signer_endpoint", None)
@@ -810,6 +838,60 @@ def create_app(
             nonce_hex=nonce_hex,
         )
 
+    @app.get("/api/tee/core/status", response_model=TeeCoreStatusResponse)
+    async def tee_core_status(_: Any = Depends(require_view_access)) -> TeeCoreStatusResponse:
+        if tee_core is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="TEE core unavailable")
+        try:
+            result = tee_core.status()
+        except TeeCoreError as exc:
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc))
+        return TeeCoreStatusResponse(
+            provisioned=bool(result.get("provisioned", False)),
+            address=result.get("address"),
+            attestation_available=bool(result.get("attestation_available", False)),
+            balances=result.get("balances"),
+            pending=result.get("pending"),
+        )
+
+    @app.get("/api/tee/core/attestation", response_model=TeeCoreAttestationResponse)
+    async def tee_core_attestation(
+        nonce: Optional[str] = Query(default=None),
+        _: Any = Depends(require_view_access),
+    ) -> TeeCoreAttestationResponse:
+        if tee_core is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="TEE core unavailable")
+
+        nonce_bytes: Optional[bytes] = None
+        nonce_hex: Optional[str] = None
+        if nonce is not None:
+            candidate = nonce.strip()
+            if candidate:
+                if candidate.startswith("0x"):
+                    candidate = candidate[2:]
+                if len(candidate) % 2 != 0:
+                    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="nonce must be hex")
+                try:
+                    nonce_bytes = bytes.fromhex(candidate)
+                except ValueError:
+                    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="nonce must be hex")
+                nonce_hex = "0x" + candidate.lower()
+
+        try:
+            address = tee_core.address
+            doc = tee_core.attestation_document(nonce_bytes)
+        except TeeCoreError as exc:
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc))
+
+        if doc is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="TEE core attestation unavailable")
+
+        return TeeCoreAttestationResponse(
+            address=address,
+            document_b64=base64.b64encode(doc).decode("utf-8"),
+            nonce_hex=nonce_hex,
+        )
+
     @app.post("/api/orchestrators/register", response_model=RegistrationResponse)
     async def register(payload: RegistrationPayload, request: Request) -> RegistrationResponse:
         client_ip = request.client.host if request.client else None
@@ -846,7 +928,7 @@ def create_app(
             address=payload.address,
             metadata=metadata,
         )
-        balance = ledger.get_balance(payload.orchestrator_id)
+        balance = orchestrator_balance(payload.orchestrator_id)
 
         return RegistrationResponse(
             orchestrator_id=result.orchestrator_id,
@@ -869,7 +951,7 @@ def create_app(
         now = datetime.now(timezone.utc)
         sensitive_allowed = include_sensitive_fields(request)
         for orchestrator_id, record in records.items():
-            balance = ledger.get_balance(orchestrator_id)
+            balance = orchestrator_balance(orchestrator_id)
             cooldown_expires_at = record.get("cooldown_expires_at")
             cooldown_active = False
             if isinstance(cooldown_expires_at, str):
@@ -919,7 +1001,7 @@ def create_app(
         record = registry.get_record(orchestrator_id)
         if not record:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
-        balance = ledger.get_balance(orchestrator_id)
+        balance = orchestrator_balance(orchestrator_id)
         cooldown_expires_at = record.get("cooldown_expires_at")
         cooldown_active = False
         if isinstance(cooldown_expires_at, str):
