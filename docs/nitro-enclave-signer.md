@@ -131,3 +131,77 @@ Minimal shape:
 - optionally require an `kms:EncryptionContext:*` pair (ex: `service=payments-signer`)
 
 Do not grant plaintext decrypt to other principals.
+
+### Concrete KMS policy template
+
+Save the PCR0 from `nitro-cli build-enclave ...` and create a CMK with a key policy like:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowKmsAdmin",
+      "Effect": "Allow",
+      "Principal": { "AWS": "KMS_ADMIN_ROLE_ARN" },
+      "Action": [
+        "kms:Create*",
+        "kms:Describe*",
+        "kms:Enable*",
+        "kms:List*",
+        "kms:Put*",
+        "kms:Update*",
+        "kms:Revoke*",
+        "kms:Disable*",
+        "kms:Get*",
+        "kms:Delete*",
+        "kms:TagResource",
+        "kms:UntagResource",
+        "kms:ScheduleKeyDeletion",
+        "kms:CancelKeyDeletion"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "AllowEncryptFromInstanceRole",
+      "Effect": "Allow",
+      "Principal": { "AWS": "INSTANCE_ROLE_ARN" },
+      "Action": ["kms:Encrypt"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "AllowDecryptOnlyFromEnclaveMeasurement",
+      "Effect": "Allow",
+      "Principal": { "AWS": "INSTANCE_ROLE_ARN" },
+      "Action": ["kms:Decrypt"],
+      "Resource": "*",
+      "Condition": {
+        "StringEqualsIgnoreCase": {
+          "kms:RecipientAttestation:PCR0": "PCR0_HEX_FROM_EIF_BUILD"
+        }
+      }
+    }
+  ]
+}
+```
+
+Notes:
+- In production, prefer `kms:RecipientAttestation:ImageSha384` if you’re pinning on that value instead of PCR0.
+- For production, you typically **don’t** grant `kms:Encrypt` to the instance role; you encrypt the secret out-of-band.
+
+### Instance role IAM permissions
+
+The instance role still needs IAM permissions to call KMS APIs. Keep this tight to the key ARN:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["kms:Decrypt", "kms:Encrypt"],
+      "Resource": "KMS_KEY_ARN"
+    }
+  ]
+}
+```
