@@ -66,6 +66,7 @@ Supported methods:
 - `sign_message_defunct` with `{ message_hash: "0x..." }` → `{ signature: "0x..." }`
 - `sign_transaction` with `{ tx: { ... } }` → `{ raw_tx: "0x..." }`
 - `attestation` with optional `{ nonce: "0x..." }` → `{ document_b64: "..." }` (if available)
+- `provision` (enclave bootstrap only) with KMS ciphertext + AWS session credentials → `{ address: "0x..." }`
 
 ## Local (non-TEE) signer demo server
 
@@ -84,3 +85,6 @@ PAYMENTS_SIGNER_ENDPOINT=tcp://127.0.0.1:5000
 
 For real TEE attestation, the enclave app must generate a genuine attestation document (AWS NSM) and return it as `document_b64`.
 
+## Nitro Enclaves runbook
+
+See `docs/nitro-enclave-signer.md` for a practical EC2 build/run flow (KMS-unseal + `vsock-proxy` + provisioning).
