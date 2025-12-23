@@ -66,6 +66,7 @@ Supported methods:
 - `sign_message_defunct` with `{ message_hash: "0x..." }` → `{ signature: "0x..." }`
 - `sign_transaction` with `{ tx: { ... } }` → `{ raw_tx: "0x..." }`
 - `attestation` with optional `{ nonce: "0x..." }` → `{ document_b64: "..." }` (if available)
+- `provision` (enclave bootstrap only) with KMS ciphertext + AWS session credentials → `{ address: "0x..." }`
 
 ## Local (non-TEE) signer demo server
 
@@ -84,3 +85,28 @@ PAYMENTS_SIGNER_ENDPOINT=tcp://127.0.0.1:5000
 
 For real TEE attestation, the enclave app must generate a genuine attestation document (AWS NSM) and return it as `document_b64`.
 
+## Docker note (vsock often blocked)
+
+Many Docker installs block `AF_VSOCK` socket creation under the default seccomp profile. If your Payments container
+crashes with `PermissionError: [Errno 1] Operation not permitted` when using `PAYMENTS_SIGNER_ENDPOINT=vsock://...`,
+run a host-side TCP↔vsock bridge and point Payments at `tcp://...` instead.
+
+Example (host):
+
+```bash
+python3 scripts/vsock_tcp_bridge.py --listen-host 172.17.0.1 --listen-port 5001 --vsock-cid <cid>
+```
+
+Payments `.env`:
+
+```bash
+PAYMENTS_SIGNER_ENDPOINT=tcp://172.17.0.1:5001
+```
+
+## Nitro Enclaves runbook
+
+See `docs/nitro-enclave-signer.md` for a practical EC2 build/run flow (KMS-unseal + `vsock-proxy` + provisioning).
+
+## Next: full TEE core
+
+See `docs/tee-core.md` for the roadmap to make the enclave the final authority for ledger + payouts (not just key custody).

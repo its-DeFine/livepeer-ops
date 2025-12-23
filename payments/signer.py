@@ -99,9 +99,18 @@ class RemoteSocketSigner:
         if parsed.scheme == "vsock":
             if not hasattr(socket, "AF_VSOCK"):
                 raise SignerError("AF_VSOCK not supported in this environment")
-            sock = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
+            try:
+                sock = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
+            except PermissionError as exc:
+                raise SignerError(
+                    "AF_VSOCK is not permitted in this environment (common inside Docker due to seccomp); "
+                    "use a tcp↔vsock bridge or relax the container seccomp profile"
+                ) from exc
             sock.settimeout(self.timeout_seconds)
-            cid = int(parsed.hostname)
+            try:
+                cid = int(parsed.hostname)
+            except ValueError as exc:  # pragma: no cover - config validation should catch this
+                raise SignerError("Remote signer vsock:// CID must be an integer") from exc
             sock.connect((cid, parsed.port))
             return sock
         raise SignerError("Remote signer endpoint must use tcp:// or vsock://")
@@ -171,4 +180,3 @@ class RemoteSocketSigner:
             return base64.b64decode(doc_b64)
         except Exception as exc:
             raise SignerError("Remote signer returned invalid document_b64") from exc
-

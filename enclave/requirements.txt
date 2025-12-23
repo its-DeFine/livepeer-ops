@@ -1,0 +1,2 @@
+eth-account>=0.10.0
+eth-abi>=4.0.0,<5
