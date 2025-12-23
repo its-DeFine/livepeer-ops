@@ -111,7 +111,27 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--endpoint", required=True, help="vsock://<cid>:5000 or tcp://host:port")
     ap.add_argument("--region", required=True, help="AWS region for KMS (ex: us-east-2)")
-    ap.add_argument("--ciphertext-b64", required=True, help="Base64 CiphertextBlob from aws kms encrypt")
+    ap.add_argument(
+        "--ciphertext-b64",
+        default="",
+        help="Base64 CiphertextBlob to decrypt inside enclave (required unless --generate)",
+    )
+    ap.add_argument(
+        "--generate",
+        action="store_true",
+        default=False,
+        help="Generate a new Ethereum key inside the enclave using KMS GenerateDataKey (returns ciphertext_b64)",
+    )
+    ap.add_argument(
+        "--kms-key-id",
+        default="",
+        help="KMS key ID/ARN (required with --generate)",
+    )
+    ap.add_argument(
+        "--key-spec",
+        default="AES-256",
+        help="KMS data key spec for --generate (AES-256 only)",
+    )
     ap.add_argument("--proxy-port", type=int, default=8000, help="KMS vsock-proxy port on the parent (default 8000)")
     ap.add_argument("--expected-address", default="", help="Optional 0x address safety check")
     ap.add_argument("--chain-id", type=int, default=None, help="Optional chain ID policy (ex: 42161)")
@@ -148,10 +168,26 @@ def main() -> int:
     creds = _load_aws_creds_from_env() or _load_aws_creds_from_imds()
     params: dict[str, Any] = {
         "region": args.region,
-        "ciphertext_b64": args.ciphertext_b64,
         "proxy_port": args.proxy_port,
         **creds,
     }
+
+    method = "provision"
+    if args.generate:
+        if args.ciphertext_b64.strip():
+            ap.error("--ciphertext-b64 cannot be used with --generate")
+        if not args.kms_key_id.strip():
+            ap.error("--kms-key-id is required with --generate")
+        if args.key_spec.strip() != "AES-256":
+            ap.error("--key-spec must be AES-256")
+        params["key_id"] = args.kms_key_id.strip()
+        params["key_spec"] = "AES-256"
+        method = "generate"
+    else:
+        if not args.ciphertext_b64.strip():
+            ap.error("--ciphertext-b64 is required unless --generate")
+        params["ciphertext_b64"] = args.ciphertext_b64.strip()
+
     if args.expected_address.strip():
         params["expected_address"] = args.expected_address.strip()
 
@@ -179,7 +215,7 @@ def main() -> int:
             Decimal(args.max_total_face_value_eth.strip()) * (Decimal(10) ** 18)
         )
 
-    result = _rpc(args.endpoint, "provision", params)
+    result = _rpc(args.endpoint, method, params)
     sys.stdout.write(json.dumps(result, indent=2, sort_keys=True))
     sys.stdout.write("\n")
     return 0

@@ -4,6 +4,8 @@ FROM ${BASE_IMAGE}
 
 RUN yum install -y \
     python3 \
+    python3-devel \
+    gcc \
     ca-certificates \
   && yum clean all \
   && rm -rf /var/cache/yum
@@ -24,4 +26,3 @@ ENV LD_LIBRARY_PATH=/usr/lib64:${LD_LIBRARY_PATH}
 ENV KMSTOOL_ENCLAVE_CLI=/kmstool_enclave_cli
 
 CMD ["python3", "/opt/enclave-signer/signer_server.py", "--listen", "vsock://0:5000"]
-

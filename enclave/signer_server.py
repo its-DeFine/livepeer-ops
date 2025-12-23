@@ -197,6 +197,63 @@ def _kms_decrypt_via_kmstool(
     return base64.b64decode(plaintext_b64)
 
 
+def _kms_genkey_via_kmstool(
+    *,
+    region: str,
+    proxy_port: int,
+    aws_access_key_id: str,
+    aws_secret_access_key: str,
+    aws_session_token: str,
+    key_id: str,
+    key_spec: str,
+) -> tuple[str, bytes]:
+    kmstool_path = os.environ.get("KMSTOOL_ENCLAVE_CLI", "/kmstool_enclave_cli").strip()
+    if not kmstool_path:
+        kmstool_path = "/kmstool_enclave_cli"
+
+    cmd = [
+        kmstool_path,
+        "genkey",
+        "--region",
+        region,
+        "--proxy-port",
+        str(proxy_port),
+        "--aws-access-key-id",
+        aws_access_key_id,
+        "--aws-secret-access-key",
+        aws_secret_access_key,
+        "--aws-session-token",
+        aws_session_token,
+        "--key-id",
+        key_id,
+        "--key-spec",
+        key_spec,
+    ]
+
+    proc = subprocess.run(
+        cmd,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        stderr = (proc.stderr or "").strip()
+        stdout = (proc.stdout or "").strip()
+        raise RuntimeError(f"kmstool genkey failed: {stderr or stdout or proc.returncode}")
+
+    ciphertext_b64: Optional[str] = None
+    plaintext_b64: Optional[str] = None
+    for line in (proc.stdout or "").splitlines():
+        if line.startswith("CIPHERTEXT:"):
+            ciphertext_b64 = line.split(":", 1)[1].strip()
+        elif line.startswith("PLAINTEXT:"):
+            plaintext_b64 = line.split(":", 1)[1].strip()
+    if not ciphertext_b64 or not plaintext_b64:
+        raise RuntimeError("kmstool genkey did not return CIPHERTEXT and PLAINTEXT")
+
+    return ciphertext_b64, base64.b64decode(plaintext_b64)
+
+
 def _normalize_private_key(plaintext: bytes) -> str:
     try:
         decoded = plaintext.decode("utf-8").strip()
@@ -469,6 +526,87 @@ def handle_request(
             state["policy"] = policy
 
         return {"result": {"address": account.address}}
+
+    if method == "generate":
+        if account is not None and not os.environ.get("SIGNER_ALLOW_REPROVISION", "").strip():
+            return error("signer already provisioned")
+
+        required = [
+            "region",
+            "key_id",
+            "aws_access_key_id",
+            "aws_secret_access_key",
+            "aws_session_token",
+        ]
+        missing = [key for key in required if not str(params.get(key) or "").strip()]
+        if missing:
+            return error("missing params: " + ",".join(missing))
+
+        region = str(params["region"]).strip()
+        proxy_port = int(params.get("proxy_port") or 8000)
+        aws_access_key_id = str(params["aws_access_key_id"]).strip()
+        aws_secret_access_key = str(params["aws_secret_access_key"]).strip()
+        aws_session_token = str(params["aws_session_token"]).strip()
+        key_id = str(params["key_id"]).strip()
+        key_spec = str(params.get("key_spec") or "AES-256").strip()
+        if key_spec not in {"AES-256", "AES-128"}:
+            return error("key_spec must be AES-256 or AES-128")
+        if key_spec != "AES-256":
+            return error("key_spec must be AES-256 for ethereum keys")
+
+        ciphertext_b64, plaintext = _kms_genkey_via_kmstool(
+            region=region,
+            proxy_port=proxy_port,
+            aws_access_key_id=aws_access_key_id,
+            aws_secret_access_key=aws_secret_access_key,
+            aws_session_token=aws_session_token,
+            key_id=key_id,
+            key_spec=key_spec,
+        )
+        private_key = _normalize_private_key(plaintext)
+        account = Account.from_key(private_key)
+        state["account"] = account
+
+        policy: dict[str, Any] = {}
+        if "chain_id" in params and params.get("chain_id") is not None:
+            policy["chain_id"] = _parse_int(params.get("chain_id"), field="policy.chain_id")
+        if "ticket_broker" in params and params.get("ticket_broker") is not None:
+            policy["ticket_broker"] = _normalize_address(params.get("ticket_broker"), field="policy.ticket_broker")
+        if "allowed_recipients" in params and params.get("allowed_recipients") is not None:
+            policy["allowed_recipients"] = _parse_allowed_recipients(params.get("allowed_recipients"))
+        if "require_allowlist" in params and params.get("require_allowlist") is not None:
+            policy["require_allowlist"] = _parse_bool(params.get("require_allowlist"), field="policy.require_allowlist")
+        if "allow_fund_deposit" in params and params.get("allow_fund_deposit") is not None:
+            policy["allow_fund_deposit"] = _parse_bool(
+                params.get("allow_fund_deposit"),
+                field="policy.allow_fund_deposit",
+            )
+        if "max_fund_deposit_wei" in params and params.get("max_fund_deposit_wei") is not None:
+            policy["max_fund_deposit_wei"] = _parse_int(
+                params.get("max_fund_deposit_wei"),
+                field="policy.max_fund_deposit_wei",
+            )
+        if "max_face_value_wei" in params and params.get("max_face_value_wei") is not None:
+            policy["max_face_value_wei"] = _parse_int(
+                params.get("max_face_value_wei"),
+                field="policy.max_face_value_wei",
+            )
+        if "max_total_face_value_wei" in params and params.get("max_total_face_value_wei") is not None:
+            policy["max_total_face_value_wei"] = _parse_int(
+                params.get("max_total_face_value_wei"),
+                field="policy.max_total_face_value_wei",
+            )
+        if policy:
+            state["policy"] = policy
+
+        return {
+            "result": {
+                "address": account.address,
+                "ciphertext_b64": ciphertext_b64,
+                "key_id": key_id,
+                "key_spec": key_spec,
+            }
+        }
 
     if method == "address":
         if account is None:

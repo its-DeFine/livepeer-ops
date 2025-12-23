@@ -60,7 +60,14 @@ Grab the `EnclaveCID` (often `16`).
 
 ## 5) Encrypt the ETH key (outside enclave)
 
-Encrypt a 0x-prefixed 32-byte private key string with KMS:
+You can either:
+
+- **A) Encrypt a known private key outside the enclave** (simple if you already have a key)
+- **B) Generate the private key inside the enclave** (recommended for demos; the key never exists in plaintext on the parent)
+
+### A) Encrypt a known private key outside the enclave
+
+Encrypt a 0x-prefixed 32-byte private key string with KMS (out-of-band):
 
 ```bash
 PLAINTEXT="0x0123...<64 hex>..."
@@ -68,6 +75,22 @@ aws kms encrypt --key-id "$KMS_KEY_ARN" --plaintext "$PLAINTEXT" --query Ciphert
 ```
 
 The output is a base64 `CiphertextBlob` (safe to store on the parent).
+
+### B) Generate the private key inside the enclave (recommended)
+
+This uses **KMS GenerateDataKey** from inside the enclave, treats the returned 32 bytes as the Ethereum private key, and returns only the **KMS ciphertext blob** to the parent.
+
+Run:
+
+```bash
+python3 ./scripts/provision_enclave_signer.py \
+  --endpoint vsock://<ENCLAVE_CID>:5000 \
+  --region us-east-2 \
+  --generate \
+  --kms-key-id "$KMS_KEY_ARN"
+```
+
+Save the returned `ciphertext_b64` somewhere durable (this is what you use to restore the key after reboot).
 
 ## 6) Provision the enclave signer (parent)
 
@@ -85,6 +108,8 @@ python3 ./scripts/provision_enclave_signer.py \
 ```
 
 It returns the signer `address`.
+
+Note: if you used `--generate`, the enclave is already provisioned in that running process. You only need `--ciphertext-b64` on the next boot.
 
 ### Optional: signer policy (recommended)
 
@@ -173,7 +198,7 @@ Save the PCR0 from `nitro-cli build-enclave ...` and create a CMK with a key pol
       "Sid": "AllowDecryptOnlyFromEnclaveMeasurement",
       "Effect": "Allow",
       "Principal": { "AWS": "INSTANCE_ROLE_ARN" },
-      "Action": ["kms:Decrypt"],
+      "Action": ["kms:Decrypt", "kms:GenerateDataKey"],
       "Resource": "*",
       "Condition": {
         "StringEqualsIgnoreCase": {
@@ -199,7 +224,7 @@ The instance role still needs IAM permissions to call KMS APIs. Keep this tight 
   "Statement": [
     {
       "Effect": "Allow",
-      "Action": ["kms:Decrypt", "kms:Encrypt"],
+      "Action": ["kms:Decrypt", "kms:GenerateDataKey", "kms:Encrypt"],
       "Resource": "KMS_KEY_ARN"
     }
   ]
