@@ -180,6 +180,7 @@ class PaymentSettings(BaseSettings):
         default=Path("/app/data/audit/ledger-events.log"),
         validation_alias="PAYMENTS_LEDGER_JOURNAL_PATH",
     )
+    test_run_id: Optional[str] = Field(default=None, validation_alias="PAYMENTS_TEST_RUN_ID")
     address_denylist: List[str] = Field(default_factory=list, validation_alias="PAYMENTS_ADDRESS_DENYLIST")
     manager_ip_allowlist: List[str] = Field(
         default_factory=list,

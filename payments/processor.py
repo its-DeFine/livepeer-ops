@@ -249,7 +249,7 @@ class PaymentProcessor:
         batch_send = getattr(self.payment_client, "batch_send_payments", None)
         return callable(batch_send)
 
-    def _ensure_livepeer_deposit(self, required_wei: int) -> bool:
+    def _ensure_livepeer_deposit(self, required_wei: int, *, sender_override: Optional[str] = None) -> bool:
         get_sender_info = getattr(self.payment_client, "get_sender_info", None)
         fund_deposit = getattr(self.payment_client, "fund_deposit", None)
         if not callable(get_sender_info) or not callable(fund_deposit):
@@ -261,7 +261,7 @@ class PaymentProcessor:
         if self.payment_client.dry_run:
             return True
 
-        sender = self.payment_client.sender
+        sender = sender_override or self.payment_client.sender
         if not sender:
             logger.warning("Cannot auto-fund TicketBroker deposit without a configured sender key")
             return False
@@ -276,6 +276,16 @@ class PaymentProcessor:
                 "Insufficient TicketBroker deposit for payout: deposit=%s wei needed=%s wei (autofund disabled)",
                 deposit_wei,
                 required_wei,
+            )
+            return False
+
+        configured_sender = self.payment_client.sender
+        if not configured_sender or configured_sender.lower() != sender.lower():
+            logger.error(
+                "Insufficient TicketBroker deposit for payout: deposit=%s wei needed=%s wei; autofund requires local key for %s",
+                deposit_wei,
+                required_wei,
+                sender,
             )
             return False
 
@@ -801,20 +811,8 @@ class PaymentProcessor:
 
         payout_strategy = getattr(self.settings, "payout_strategy", "eth_transfer")
         if self.tee_core is not None and payout_strategy == "livepeer_ticket":
-            sender = self.payment_client.sender
-            if not sender:
-                logger.warning("[%s] Cannot redeem TicketBroker ticket without a configured sender", orchestrator_id)
-                return
             try:
-                core_address = self.tee_core.address
-                if core_address.lower() != sender.lower():
-                    logger.error(
-                        "[%s] TEE core address mismatch: payment_sender=%s tee_core=%s",
-                        orchestrator_id,
-                        sender,
-                        core_address,
-                    )
-                    return
+                sender = self.tee_core.address
             except TeeCoreError as exc:
                 logger.warning("[%s] TEE core unavailable: %s", orchestrator_id, exc)
                 return
@@ -823,7 +821,7 @@ class PaymentProcessor:
             if face_value_wei <= 0:
                 return
 
-            if not self._ensure_livepeer_deposit(face_value_wei):
+            if not self._ensure_livepeer_deposit(face_value_wei, sender_override=sender):
                 logger.error("[%s] Skipping payout due to insufficient TicketBroker deposit", orchestrator_id)
                 return
 

@@ -191,9 +191,13 @@ def main() -> None:
             logger.warning("TEE core unavailable (dry-run mode): %s", exc)
 
     monitor = ServiceMonitor()
+    ledger_default_metadata = None
+    if getattr(settings, "test_run_id", None):
+        ledger_default_metadata = {"test": True, "test_run_id": str(settings.test_run_id)}
     ledger = Ledger(
         settings.ledger.balances,
         journal_path=getattr(settings, "ledger_journal_path", None),
+        default_metadata=ledger_default_metadata,
     )
     payout_strategy = getattr(settings, "payout_strategy", "eth_transfer")
     if payout_strategy == "livepeer_ticket":
