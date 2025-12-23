@@ -134,6 +134,17 @@ def main() -> int:
     )
     ap.add_argument("--proxy-port", type=int, default=8000, help="KMS vsock-proxy port on the parent (default 8000)")
     ap.add_argument("--expected-address", default="", help="Optional 0x address safety check")
+    ap.add_argument(
+        "--credit-reporter",
+        default="",
+        help="Optional 0x address allowed to sign credit events (TEE core only)",
+    )
+    ap.add_argument(
+        "--require-credit-signature",
+        action="store_true",
+        default=False,
+        help="Require credit events to include a reporter signature (TEE core only)",
+    )
     ap.add_argument("--chain-id", type=int, default=None, help="Optional chain ID policy (ex: 42161)")
     ap.add_argument("--ticket-broker", default="", help="Optional TicketBroker address policy (0x...)")
     ap.add_argument(
@@ -190,6 +201,11 @@ def main() -> int:
 
     if args.expected_address.strip():
         params["expected_address"] = args.expected_address.strip()
+
+    if args.credit_reporter.strip():
+        params["credit_reporter"] = args.credit_reporter.strip()
+    if args.require_credit_signature:
+        params["require_credit_signature"] = True
 
     if args.chain_id is not None:
         params["chain_id"] = args.chain_id
