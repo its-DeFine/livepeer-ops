@@ -392,6 +392,8 @@ class PaymentProcessor:
 
         claimed_tx_hash = str(result.get("tx_hash") or "").strip()
         actual_hash = self.payment_client.web3.eth.send_raw_transaction(raw_tx_bytes).hex()
+        if not actual_hash.startswith("0x"):
+            actual_hash = "0x" + actual_hash
         if claimed_tx_hash and claimed_tx_hash.lower() != actual_hash.lower():
             logger.warning("TEE core deposit tx_hash mismatch: claimed=%s actual=%s", claimed_tx_hash, actual_hash)
 
@@ -965,6 +967,8 @@ class PaymentProcessor:
 
             claimed_tx_hash = str(result.get("tx_hash") or "").strip()
             actual_hash = self.payment_client.web3.eth.send_raw_transaction(raw_tx_bytes).hex()
+            if not actual_hash.startswith("0x"):
+                actual_hash = "0x" + actual_hash
             tx_hash = actual_hash
             if claimed_tx_hash and claimed_tx_hash.lower() != actual_hash.lower():
                 logger.warning(
