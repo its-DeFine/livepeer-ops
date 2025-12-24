@@ -224,7 +224,12 @@ async def test_license_access_revocation_blocks_heartbeat(temp_paths):
 @pytest.mark.anyio("asyncio")
 async def test_license_invite_redeem_mints_token_and_grants_access(temp_paths):
     registry, ledger = build_registry(temp_paths)
-    app_settings = build_settings(temp_paths, license_lease_seconds=30)
+    app_settings = build_settings(
+        temp_paths,
+        license_lease_seconds=30,
+        edge_config_url="https://example.com/orchestrator-edge",
+        edge_config_token="edge-config-read-token",
+    )
     app = create_app(registry, ledger, app_settings)
 
     image_ref = "ghcr.io/its-define/unreal_vtuber/embody-ue-ps:enc-v1"
@@ -272,6 +277,8 @@ async def test_license_invite_redeem_mints_token_and_grants_access(temp_paths):
         assert token
         assert redeemed_body["token_id"]
         assert redeemed_body["image_ref"] == image_ref
+        assert redeemed_body["edge_config_url"] == "https://example.com/orchestrator-edge"
+        assert redeemed_body["edge_config_token"] == "edge-config-read-token"
 
         # Orchestrator: lease now works (invite redeem granted access)
         lease = await client.post(
