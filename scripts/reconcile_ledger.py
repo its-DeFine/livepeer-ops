@@ -13,6 +13,7 @@ from typing import Any, Iterable, Optional
 
 WEI_PER_ETH = Decimal(10) ** 18
 VIDEO_EXTENSIONS = (".webm", ".mkv", ".mp4", ".mov")
+ETH_ADDRESS_LEN = 42
 
 
 def _parse_decimal(value: object) -> Optional[Decimal]:
@@ -62,6 +63,7 @@ class OrchSummary:
     payout_txs: list[str] = field(default_factory=list)
     test_delta: Decimal = Decimal("0")
     test_run_ids: dict[str, Decimal] = field(default_factory=dict)
+    source_ids: set[str] = field(default_factory=set)
 
 
 def _is_payout_event(entry: dict[str, Any]) -> bool:
@@ -110,6 +112,53 @@ def _load_json(path: Path) -> Any:
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return None
+
+
+def _looks_like_eth_address(value: str) -> bool:
+    candidate = (value or "").strip()
+    if len(candidate) != ETH_ADDRESS_LEN:
+        return False
+    if not candidate.startswith("0x"):
+        return False
+    for ch in candidate[2:]:
+        if ch not in "0123456789abcdefABCDEF":
+            return False
+    return True
+
+
+def _load_registry_maps(registry_path: Path) -> tuple[dict[str, str], dict[str, str]]:
+    payload = _load_json(registry_path)
+    id_to_address: dict[str, str] = {}
+    address_to_id: dict[str, str] = {}
+    if not isinstance(payload, dict):
+        return id_to_address, address_to_id
+
+    # First pass: id -> address
+    for orchestrator_id, record in payload.items():
+        if not isinstance(orchestrator_id, str) or not orchestrator_id:
+            continue
+        if not isinstance(record, dict):
+            continue
+        address = record.get("address")
+        if not isinstance(address, str):
+            continue
+        addr = address.strip()
+        if not _looks_like_eth_address(addr):
+            continue
+        id_to_address[orchestrator_id] = addr
+
+    # Second pass: address -> id, only if unambiguous
+    collisions: set[str] = set()
+    for orchestrator_id, addr in id_to_address.items():
+        lower = addr.lower()
+        if lower in address_to_id and address_to_id[lower] != orchestrator_id:
+            collisions.add(lower)
+        else:
+            address_to_id[lower] = orchestrator_id
+    for lower in collisions:
+        address_to_id.pop(lower, None)
+
+    return id_to_address, address_to_id
 
 
 def _has_workload_artifact(record: dict[str, Any]) -> bool:
@@ -186,6 +235,16 @@ def main() -> int:
         default="",
         help="Optional path to write a markdown table of duplicate artifact_hash values (verified/paid only)",
     )
+    ap.add_argument(
+        "--registry",
+        default="",
+        help="Optional path to registry.json (used to merge orchestrator IDs that are raw ETH addresses into canonical orchestrator IDs)",
+    )
+    ap.add_argument(
+        "--no-registry-canonicalize",
+        action="store_true",
+        help="Disable canonicalization even if a registry.json is present",
+    )
     ap.add_argument("--top", type=int, default=25, help="Top N balances to include (default 25)")
     args = ap.parse_args()
 
@@ -193,6 +252,13 @@ def main() -> int:
     balances_path = data_dir / "balances.json"
     journal_path = data_dir / "audit" / "ledger-events.log"
     workloads_path = data_dir / "workloads.json"
+    registry_path = None
+    if args.registry:
+        registry_path = Path(args.registry).expanduser().resolve()
+    else:
+        candidate = data_dir / "registry.json"
+        if candidate.exists():
+            registry_path = candidate
 
     if not balances_path.exists():
         raise SystemExit(f"missing {balances_path}")
@@ -207,7 +273,7 @@ def main() -> int:
             if dec is not None:
                 balances[str(k)] = dec
 
-    summaries: dict[str, OrchSummary] = defaultdict(OrchSummary)
+    raw_summaries: dict[str, OrchSummary] = defaultdict(OrchSummary)
     total_events = 0
     total_test_events = 0
     first_ts: Optional[str] = None
@@ -226,18 +292,30 @@ def main() -> int:
     credit_reason_totals: dict[str, Decimal] = defaultdict(lambda: Decimal("0"))
     credit_reason_events: dict[str, int] = defaultdict(int)
 
+    id_to_address: dict[str, str] = {}
+    address_to_id: dict[str, str] = {}
+    canonicalize_registry = False
+    remapped_events = 0
+    if registry_path and registry_path.exists() and not args.no_registry_canonicalize:
+        id_to_address, address_to_id = _load_registry_maps(registry_path)
+        canonicalize_registry = bool(address_to_id)
+
     for entry in _read_json_lines(journal_path):
         total_events += 1
-        orch_id = entry.get("orchestrator_id")
-        if not isinstance(orch_id, str) or not orch_id:
+        raw_orch_id = entry.get("orchestrator_id")
+        if not isinstance(raw_orch_id, str) or not raw_orch_id:
             continue
+        orch_id = raw_orch_id
+        if canonicalize_registry and _looks_like_eth_address(raw_orch_id):
+            if address_to_id.get(raw_orch_id.lower()):
+                remapped_events += 1
 
         ts = entry.get("timestamp")
         if isinstance(ts, str):
             if first_ts is None:
                 first_ts = ts
             last_ts = ts
-            summaries[orch_id].last_event_ts = ts
+            raw_summaries[orch_id].last_event_ts = ts
 
         event = entry.get("event")
         reason = entry.get("reason")
@@ -246,26 +324,27 @@ def main() -> int:
         balance = _parse_decimal(entry.get("balance"))
 
         if balance is not None:
-            summaries[orch_id].last_balance = balance
+            raw_summaries[orch_id].last_balance = balance
+        raw_summaries[orch_id].source_ids.add(raw_orch_id)
 
         if delta is not None:
-            summaries[orch_id].total_delta += delta
+            raw_summaries[orch_id].total_delta += delta
             total_delta += delta
 
             if _entry_is_test(entry):
-                summaries[orch_id].test_delta += delta
+                raw_summaries[orch_id].test_delta += delta
                 total_test_delta += delta
                 total_test_events += 1
                 run_id = _entry_test_run_id(entry) or "unknown"
-                summaries[orch_id].test_run_ids[run_id] = summaries[orch_id].test_run_ids.get(run_id, Decimal("0")) + delta
+                raw_summaries[orch_id].test_run_ids[run_id] = raw_summaries[orch_id].test_run_ids.get(run_id, Decimal("0")) + delta
                 test_run_ids[run_id]["events"] += 1
                 test_run_ids[run_id]["delta"] += delta
 
             if isinstance(event, str) and event == "credit":
                 if delta >= 0:
-                    summaries[orch_id].credit_pos += delta
+                    raw_summaries[orch_id].credit_pos += delta
                 else:
-                    summaries[orch_id].credit_neg += (-delta)
+                    raw_summaries[orch_id].credit_neg += (-delta)
 
                 reason_key = reason_norm or "(none)"
                 credit_reason_totals[reason_key] += delta
@@ -278,52 +357,92 @@ def main() -> int:
                     workload_id = None
 
                 if reason_norm.startswith("workload"):
-                    summaries[orch_id].credit_workload += delta
-                    summaries[orch_id].credit_workload_events += 1
+                    raw_summaries[orch_id].credit_workload += delta
+                    raw_summaries[orch_id].credit_workload_events += 1
                     total_credit_workload += delta
                     if reason_norm == "workload":
-                        summaries[orch_id].credit_workload_records += delta
+                        raw_summaries[orch_id].credit_workload_records += delta
                         total_credit_workload_records += delta
                     else:
-                        summaries[orch_id].credit_workload_other += delta
+                        raw_summaries[orch_id].credit_workload_other += delta
                         total_credit_workload_other += delta
                     if isinstance(workload_id, str) and workload_id:
-                        if workload_id in summaries[orch_id].credited_workload_ids:
-                            summaries[orch_id].duplicate_workload_credits += 1
+                        if workload_id in raw_summaries[orch_id].credited_workload_ids:
+                            raw_summaries[orch_id].duplicate_workload_credits += 1
                         else:
-                            summaries[orch_id].credited_workload_ids.add(workload_id)
+                            raw_summaries[orch_id].credited_workload_ids.add(workload_id)
                 elif reason_norm == "session_time":
-                    summaries[orch_id].credit_session += delta
-                    summaries[orch_id].credit_session_events += 1
+                    raw_summaries[orch_id].credit_session += delta
+                    raw_summaries[orch_id].credit_session_events += 1
                     total_credit_session += delta
                 elif reason_norm == "adjustment":
-                    summaries[orch_id].credit_adjustment += delta
-                    summaries[orch_id].credit_adjustment_events += 1
+                    raw_summaries[orch_id].credit_adjustment += delta
+                    raw_summaries[orch_id].credit_adjustment_events += 1
                     total_credit_adjustment += delta
                 else:
-                    summaries[orch_id].credit_other += delta
-                    summaries[orch_id].credit_other_events += 1
+                    raw_summaries[orch_id].credit_other += delta
+                    raw_summaries[orch_id].credit_other_events += 1
                     total_credit_other += delta
             elif _is_payout_event(entry) and delta < 0:
-                summaries[orch_id].payout_eth += (-delta)
+                raw_summaries[orch_id].payout_eth += (-delta)
                 total_payouts += (-delta)
             else:
-                summaries[orch_id].other_delta += delta
+                raw_summaries[orch_id].other_delta += delta
 
         if _is_payout_event(entry) and delta is not None and delta < 0:
             md = entry.get("metadata")
             if isinstance(md, dict):
                 tx_hash = md.get("tx_hash")
                 if isinstance(tx_hash, str) and tx_hash:
-                    summaries[orch_id].payout_txs.append(tx_hash)
+                    raw_summaries[orch_id].payout_txs.append(tx_hash)
 
-    # Compute reconstructed balances: credits - payouts, but prefer last_balance observed in journal if present.
+    summaries: dict[str, OrchSummary]
     reconstructed: dict[str, Decimal] = {}
-    for orch_id, summary in summaries.items():
-        if summary.last_balance is not None:
-            reconstructed[orch_id] = summary.last_balance
-        else:
-            reconstructed[orch_id] = summary.total_delta
+    remapped_ids: set[str] = set()
+    if canonicalize_registry:
+        summaries = defaultdict(OrchSummary)
+        for raw_id, summary in raw_summaries.items():
+            canon_id = raw_id
+            if _looks_like_eth_address(raw_id):
+                mapped = address_to_id.get(raw_id.lower())
+                if mapped:
+                    canon_id = mapped
+                    remapped_ids.add(raw_id)
+            merged = summaries[canon_id]
+            merged.credit_pos += summary.credit_pos
+            merged.credit_neg += summary.credit_neg
+            merged.credit_workload += summary.credit_workload
+            merged.credit_workload_records += summary.credit_workload_records
+            merged.credit_workload_other += summary.credit_workload_other
+            merged.credit_session += summary.credit_session
+            merged.credit_adjustment += summary.credit_adjustment
+            merged.credit_other += summary.credit_other
+            merged.credit_workload_events += summary.credit_workload_events
+            merged.credit_session_events += summary.credit_session_events
+            merged.credit_adjustment_events += summary.credit_adjustment_events
+            merged.credit_other_events += summary.credit_other_events
+            merged.duplicate_workload_credits += summary.duplicate_workload_credits
+            merged.payout_eth += summary.payout_eth
+            merged.other_delta += summary.other_delta
+            merged.total_delta += summary.total_delta
+            merged.last_event_ts = max(filter(None, [merged.last_event_ts, summary.last_event_ts]), default=None)
+            merged.payout_txs.extend(summary.payout_txs)
+            merged.test_delta += summary.test_delta
+            for run_id, delta in summary.test_run_ids.items():
+                merged.test_run_ids[run_id] = merged.test_run_ids.get(run_id, Decimal("0")) + delta
+            merged.credited_workload_ids |= summary.credited_workload_ids
+            merged.source_ids |= summary.source_ids
+
+            final_balance = summary.last_balance if summary.last_balance is not None else summary.total_delta
+            reconstructed[canon_id] = reconstructed.get(canon_id, Decimal("0")) + final_balance
+    else:
+        summaries = raw_summaries
+        # Compute reconstructed balances: credits - payouts, but prefer last_balance observed in journal if present.
+        for orch_id, summary in summaries.items():
+            if summary.last_balance is not None:
+                reconstructed[orch_id] = summary.last_balance
+            else:
+                reconstructed[orch_id] = summary.total_delta
 
     # Compare with balances.json
     all_ids = sorted(set(balances.keys()) | set(reconstructed.keys()))
@@ -369,6 +488,12 @@ def main() -> int:
     lines.append(f"- Data dir: `{data_dir}`")
     lines.append(f"- Journal: `{journal_path}`")
     lines.append(f"- balances.json: `{balances_path}`")
+    if registry_path and registry_path.exists():
+        lines.append(f"- registry.json: `{registry_path}`")
+    lines.append(f"- Registry canonicalization: `{canonicalize_registry}`")
+    if canonicalize_registry:
+        lines.append(f"- Remapped orchestrator IDs: `{len(remapped_ids)}`")
+        lines.append(f"- Remapped journal events: `{remapped_events}`")
     lines.append(f"- Total journal events parsed: `{total_events}`")
     if first_ts or last_ts:
         lines.append(f"- Journal window: `{first_ts or ''}` → `{last_ts or ''}`")
