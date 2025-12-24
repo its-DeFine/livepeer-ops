@@ -160,6 +160,11 @@ def main() -> int:
         default="",
         help="Optional path to write mismatches as JSON (balances_json vs reconstructed)",
     )
+    ap.add_argument(
+        "--write-workload-hash-index-json",
+        default="",
+        help="Optional path to write a JSON index of artifact_hash → workloads (verified/paid only)",
+    )
     ap.add_argument("--top", type=int, default=25, help="Top N balances to include (default 25)")
     args = ap.parse_args()
 
@@ -556,6 +561,39 @@ def main() -> int:
                     )
                     + " |"
                 )
+
+        if args.write_workload_hash_index_json:
+            out_path = Path(args.write_workload_hash_index_json).expanduser()
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            payload = []
+            for artifact_hash, items in sorted(
+                artifact_hash_index.items(),
+                key=lambda item: (len(item[1]), item[0]),
+                reverse=True,
+            ):
+                workload_entries = []
+                for workload_id, record in items:
+                    workload_entries.append(
+                        {
+                            "workload_id": workload_id,
+                            "orchestrator_id": record.get("orchestrator_id"),
+                            "status": record.get("status"),
+                            "credited": bool(record.get("credited")),
+                            "payout_amount_eth": record.get("payout_amount_eth"),
+                            "artifact_uri": record.get("artifact_uri"),
+                            "artifact_hash": record.get("artifact_hash"),
+                            "plan_id": record.get("plan_id"),
+                            "run_id": record.get("run_id"),
+                        }
+                    )
+                payload.append(
+                    {
+                        "artifact_hash": artifact_hash,
+                        "count": len(items),
+                        "workloads": workload_entries,
+                    }
+                )
+            out_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
     report = "\n".join(lines).strip() + "\n"
     if args.out:
