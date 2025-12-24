@@ -192,6 +192,12 @@ class OrchestratorsResponse(BaseModel):
     orchestrators: List[OrchestratorRecord]
 
 
+class OrchestratorBootstrapResponse(BaseModel):
+    orchestrator_id: str
+    edge_config_url: Optional[str] = None
+    edge_config_token: Optional[str] = None
+
+
 WORKLOAD_STATUSES = {"pending", "verified", "paid", "rejected"}
 
 
@@ -993,6 +999,21 @@ def create_app(
             registration_count=result.registration_count,
             cooldown_expires_at=result.cooldown_expires_at,
             message=result.message,
+        )
+
+    @app.get("/api/orchestrators/bootstrap", response_model=OrchestratorBootstrapResponse)
+    async def orchestrator_bootstrap(
+        auth: Dict[str, str] = Depends(require_orchestrator_token),
+    ) -> OrchestratorBootstrapResponse:
+        orchestrator_id = auth.get("orchestrator_id", "")
+        if not orchestrator_id:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Orchestrator token required")
+        edge_config_url = getattr(settings, "edge_config_url", None)
+        edge_config_token = getattr(settings, "edge_config_token", None)
+        return OrchestratorBootstrapResponse(
+            orchestrator_id=orchestrator_id,
+            edge_config_url=edge_config_url,
+            edge_config_token=edge_config_token,
         )
 
     def _parse_timestamp(value: Any) -> Optional[datetime]:

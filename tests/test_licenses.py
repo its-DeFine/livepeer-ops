@@ -318,3 +318,39 @@ async def test_license_invite_redeem_mints_token_and_grants_access(temp_paths):
             json={"code": expired_code, "orchestrator_id": "orch-expired", "address": address},
         )
         assert expired_redeem.status_code == 410
+
+
+@pytest.mark.anyio("asyncio")
+async def test_orchestrator_bootstrap_returns_edge_config(temp_paths):
+    registry, ledger = build_registry(temp_paths)
+    app_settings = build_settings(
+        temp_paths,
+        edge_config_url="https://example.com/orchestrator-edge",
+        edge_config_token="edge-config-read-token",
+    )
+    app = create_app(registry, ledger, app_settings)
+
+    orchestrator_id = "orch-bootstrap"
+    address = "0xEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE"
+    with patch.object(Registry, "_resolve_top_set", return_value={address.lower()}):
+        registry.register(orchestrator_id=orchestrator_id, address=address)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        minted = await client.post(
+            f"/api/licenses/orchestrators/{orchestrator_id}/tokens",
+            headers={"X-Admin-Token": "secret"},
+        )
+        assert minted.status_code == 200
+        token = minted.json()["token"]
+
+        bootstrap = await client.get(
+            "/api/orchestrators/bootstrap",
+            headers={"X-Orchestrator-Token": token},
+        )
+
+    assert bootstrap.status_code == 200
+    data = bootstrap.json()
+    assert data["orchestrator_id"] == orchestrator_id
+    assert data["edge_config_url"] == "https://example.com/orchestrator-edge"
+    assert data["edge_config_token"] == "edge-config-read-token"
