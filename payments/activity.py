@@ -90,6 +90,73 @@ class ActivityLeaseStore:
             self._persist()
         return record
 
+    def upsert(
+        self,
+        *,
+        lease_id: str,
+        orchestrator_id: str,
+        upstream_addr: str,
+        kind: str,
+        client_ip: Optional[str],
+        lease_seconds: int,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Create or refresh a lease with a caller-supplied lease_id.
+
+        Used for idempotent sources like session IDs where we want to heartbeat without storing
+        a separate randomly-issued lease_id.
+        """
+
+        now = utcnow()
+        expires = now + timedelta(seconds=lease_seconds)
+
+        with self._lock:
+            existing = self._leases.get(lease_id)
+            if isinstance(existing, dict):
+                if existing.get("orchestrator_id") != orchestrator_id:
+                    return None
+                if existing.get("revoked_at"):
+                    existing = None
+
+            if isinstance(existing, dict):
+                issued_at = existing.get("issued_at")
+                if not isinstance(issued_at, str) or not issued_at:
+                    issued_at = isoformat(now)
+                updated: Dict[str, Any] = dict(existing)
+                updated.update(
+                    {
+                        "lease_id": lease_id,
+                        "orchestrator_id": orchestrator_id,
+                        "upstream_addr": upstream_addr,
+                        "kind": kind,
+                        "metadata": metadata if metadata is not None else existing.get("metadata") or {},
+                        "issued_at": issued_at,
+                        "last_seen_at": isoformat(now),
+                        "last_seen_ip": client_ip,
+                        "expires_at": isoformat(expires),
+                        "revoked_at": None,
+                    }
+                )
+                self._leases[lease_id] = updated
+                self._persist()
+                return dict(updated)
+
+            record = {
+                "lease_id": lease_id,
+                "orchestrator_id": orchestrator_id,
+                "upstream_addr": upstream_addr,
+                "kind": kind,
+                "metadata": metadata or {},
+                "issued_at": isoformat(now),
+                "last_seen_at": isoformat(now),
+                "last_seen_ip": client_ip,
+                "expires_at": isoformat(expires),
+                "revoked_at": None,
+            }
+            self._leases[lease_id] = record
+            self._persist()
+            return dict(record)
+
     def heartbeat(
         self,
         *,
@@ -146,4 +213,3 @@ class ActivityLeaseStore:
     def iter_with_ids(self) -> Iterable[Tuple[str, Dict[str, Any]]]:
         with self._lock:
             return [(lid, dict(rec)) for lid, rec in self._leases.items() if isinstance(rec, dict)]
-

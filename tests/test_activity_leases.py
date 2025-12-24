@@ -140,3 +140,70 @@ async def test_activity_lease_create_heartbeat_revoke_flow(temp_paths):
         assert active_after_revoke.status_code == 200
         assert not any(item["lease_id"] == lease_id for item in active_after_revoke.json()["leases"])
 
+
+@pytest.mark.anyio("asyncio")
+async def test_session_events_create_activity_leases(temp_paths):
+    registry, ledger = build_registry(temp_paths)
+    app_settings = build_settings(
+        temp_paths,
+        session_reporter_token="sess-token",
+        session_idle_timeout_seconds=60,
+    )
+    app = create_app(registry, ledger, app_settings)
+
+    orchestrator_id = "orch-session"
+    upstream_addr = "203.0.113.55"
+    address = "0xBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+    with patch.object(Registry, "_resolve_top_set", return_value={address.lower()}):
+        registry.register(
+            orchestrator_id=orchestrator_id,
+            address=address,
+            metadata={
+                "host_public_ip": upstream_addr,
+                "request_ip": upstream_addr,
+            },
+        )
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        session_id = "sess-123"
+        start = await client.post(
+            "/api/sessions/events",
+            json={
+                "session_id": session_id,
+                "upstream_addr": upstream_addr,
+                "upstream_port": 8888,
+                "edge_id": "edge-1",
+                "event": "start",
+            },
+            headers={"X-Session-Token": "sess-token"},
+        )
+        assert start.status_code == 200
+
+        active = await client.get(
+            "/api/activity/leases?active_only=true",
+            headers={"X-Admin-Token": "secret"},
+        )
+        assert active.status_code == 200
+        lease_id = f"session:{session_id}"
+        assert any(item["lease_id"] == lease_id for item in active.json()["leases"])
+
+        ended = await client.post(
+            "/api/sessions/events",
+            json={
+                "session_id": session_id,
+                "upstream_addr": upstream_addr,
+                "upstream_port": 8888,
+                "edge_id": "edge-1",
+                "event": "end",
+            },
+            headers={"X-Session-Token": "sess-token"},
+        )
+        assert ended.status_code == 200
+
+        active_after = await client.get(
+            "/api/activity/leases?active_only=true",
+            headers={"X-Admin-Token": "secret"},
+        )
+        assert active_after.status_code == 200
+        assert not any(item["lease_id"] == lease_id for item in active_after.json()["leases"])

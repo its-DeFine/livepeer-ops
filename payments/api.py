@@ -1606,7 +1606,7 @@ def create_app(
     @app.post("/api/sessions/events", response_model=SessionRecord)
     async def record_session_event(
         payload: SessionEventPayload,
-        _: Request,
+        request: Request,
         __: Any = Depends(require_session_reporter),
     ) -> SessionRecord:
         now = datetime.now(timezone.utc)
@@ -1693,6 +1693,31 @@ def create_app(
             credit_eth_per_minute=credit_rate,
             ledger=ledger,
         )
+
+        # Tie session activity into activity leases so autosleep watchers can avoid stopping an orchestrator mid-session.
+        if orch_id:
+            try:
+                lease_id = f"session:{payload.session_id}"
+                seconds = _resolve_activity_lease_seconds(None)
+                if payload.event == "end":
+                    activity_leases.revoke(lease_id)
+                else:
+                    activity_leases.upsert(
+                        lease_id=lease_id,
+                        orchestrator_id=orch_id,
+                        upstream_addr=payload.upstream_addr,
+                        kind="session",
+                        client_ip=request_ip(request),
+                        lease_seconds=seconds,
+                        metadata={
+                            "session_id": payload.session_id,
+                            "edge_id": payload.edge_id,
+                            "upstream_addr": payload.upstream_addr,
+                            "upstream_port": payload.upstream_port,
+                        },
+                    )
+            except Exception:
+                pass
         return SessionRecord(**stored)
 
     @app.get("/api/sessions", response_model=SessionListResponse)
