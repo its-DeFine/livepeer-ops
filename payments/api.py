@@ -7,7 +7,7 @@ import json
 import logging
 import threading
 import time
-from collections import deque
+from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -175,6 +175,11 @@ class OrchestratorRecord(BaseModel):
     last_session_upstream_addr: Optional[str] = None
     last_session_seen_at: Optional[str] = None
     last_session_edge_id: Optional[str] = None
+    active: bool = False
+    active_reason: Optional[str] = None
+    in_use: bool = False
+    active_sessions: int = 0
+    active_activity_leases: int = 0
 
 class ForwarderHealthReportPayload(BaseModel):
     """Allows a trusted watcher (typically running on the forwarder) to report health."""
@@ -203,6 +208,24 @@ class WorkloadCreatePayload(BaseModel):
     @model_validator(mode="after")
     def ensure_artifact(cls, values):  # type: ignore[override]
         # At least one artifact reference should be provided
+        if not values.artifact_hash and not values.artifact_uri:
+            raise ValueError("artifact_hash or artifact_uri required")
+        return values
+
+
+class WorkloadTimeCreditPayload(BaseModel):
+    workload_id: str = Field(min_length=1, max_length=255)
+    orchestrator_id: str = Field(min_length=1, max_length=128)
+    duration_ms: int = Field(gt=0, le=24 * 60 * 60 * 1000)
+    plan_id: Optional[str] = Field(default=None, max_length=128)
+    run_id: Optional[str] = Field(default=None, max_length=256)
+    artifact_hash: Optional[str] = Field(default=None, max_length=256)
+    artifact_uri: Optional[str] = Field(default=None, max_length=512)
+    notes: Optional[str] = Field(default=None, max_length=1024)
+    status: str = Field(default="verified", max_length=32)
+
+    @model_validator(mode="after")
+    def ensure_artifact(cls, values):  # type: ignore[override]
         if not values.artifact_hash and not values.artifact_uri:
             raise ValueError("artifact_hash or artifact_uri required")
         return values
@@ -547,6 +570,32 @@ class ActivityLeaseRecord(BaseModel):
 
 class ActivityLeaseListResponse(BaseModel):
     leases: List[ActivityLeaseRecord]
+
+
+class OrchestratorDailyStats(BaseModel):
+    date: str
+    credits_eth: str
+    payouts_eth: str
+    session_eth: str
+    workload_eth: str
+    adjustments_eth: str
+    net_delta_eth: str
+
+
+class OrchestratorStatsResponse(BaseModel):
+    orchestrator_id: str
+    balance_eth: str
+    days: int
+    total_credits_eth: str
+    total_payouts_eth: str
+    total_session_eth: str
+    total_workload_eth: str
+    total_adjustments_eth: str
+    total_net_delta_eth: str
+    daily: List[OrchestratorDailyStats]
+    session_credit_eth_per_minute: str
+    passive_credit_eth_per_minute: str
+    payout_strategy: str
 
 
 def create_app(
@@ -946,75 +995,121 @@ def create_app(
             message=result.message,
         )
 
-    @app.get("/api/orchestrators", response_model=OrchestratorsResponse)
-    async def list_orchestrators(
-        request: Request, _: Any = Depends(require_view_access)
-    ) -> OrchestratorsResponse:
-        records = registry.all_records()
-        response: List[OrchestratorRecord] = []
+    def _parse_timestamp(value: Any) -> Optional[datetime]:
+        if not isinstance(value, str) or not value:
+            return None
+        candidate = value
+        if candidate.endswith("Z"):
+            candidate = candidate[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(candidate)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc)
+        except Exception:
+            return None
+
+    def _active_session_count(orchestrator_id: str) -> int:
         now = datetime.now(timezone.utc)
-        sensitive_allowed = include_sensitive_fields(request)
-        for orchestrator_id, record in records.items():
-            balance = orchestrator_balance(orchestrator_id)
-            cooldown_expires_at = record.get("cooldown_expires_at")
-            cooldown_active = False
-            if isinstance(cooldown_expires_at, str):
-                try:
-                    expires = datetime.fromisoformat(cooldown_expires_at)
-                    cooldown_active = expires > now
-                except ValueError:
-                    cooldown_active = False
-            entry = OrchestratorRecord(
-                orchestrator_id=orchestrator_id,
-                address=record.get("address", ""),
-                balance_eth=str(balance),
-                eligible_for_payments=bool(record.get("eligible_for_payments", False)),
-                is_top_100=bool(record.get("is_top_100", False)),
-                denylisted=bool(record.get("denylisted", False)),
-                cooldown_expires_at=cooldown_expires_at,
-                cooldown_active=cooldown_active,
-                first_seen=record.get("first_seen"),
-                last_seen=record.get("last_seen"),
-                registration_count=int(record.get("registration_count", 0)),
-                contact_email=record.get("contact_email"),
-                capability=record.get("capability"),
-                host_public_ip=record.get("host_public_ip"),
-                host_name=record.get("host_name"),
-                last_seen_ip=record.get("last_seen_ip"),
-                last_missed_all_services=record.get("last_missed_all_services"),
-                last_healthy_at=record.get("last_healthy_at"),
-                last_cooldown_started_at=record.get("last_cooldown_started_at"),
-                last_cooldown_cleared_at=record.get("last_cooldown_cleared_at"),
-                health_url=record.get("health_url"),
-                health_timeout=record.get("health_timeout"),
-                monitored_services=record.get("monitored_services"),
-                min_service_uptime=record.get("min_service_uptime"),
-                last_contact_source=record.get("last_contact_source"),
-                last_session_upstream_addr=record.get("last_session_upstream_addr"),
-                last_session_seen_at=record.get("last_session_seen_at"),
-                last_session_edge_id=record.get("last_session_edge_id"),
-            )
-            response.append(redact_record(entry, sensitive_allowed))
+        idle_timeout = int(getattr(settings, "session_idle_timeout_seconds", 120) or 120)
+        count = 0
+        for _, session in session_store.iter_with_ids():
+            if session.get("orchestrator_id") != orchestrator_id:
+                continue
+            if session.get("ended_at"):
+                continue
+            last_seen = session.get("last_seen_at") or session.get("updated_at") or session.get("started_at")
+            last_seen_dt = _parse_timestamp(last_seen)
+            if not last_seen_dt:
+                continue
+            if (now - last_seen_dt).total_seconds() > idle_timeout:
+                continue
+            count += 1
+        return count
 
-        return OrchestratorsResponse(orchestrators=response)
+    def _active_activity_lease_count(orchestrator_id: str) -> int:
+        now = datetime.now(timezone.utc)
+        count = 0
+        for _, lease in activity_leases.iter_with_ids():
+            if lease.get("orchestrator_id") != orchestrator_id:
+                continue
+            if lease.get("revoked_at"):
+                continue
+            expires_raw = lease.get("expires_at")
+            if not isinstance(expires_raw, str) or not expires_raw:
+                continue
+            try:
+                expires = parse_activity_iso8601(expires_raw)
+            except Exception:
+                continue
+            if expires <= now:
+                continue
+            count += 1
+        return count
 
-    @app.get("/api/orchestrators/{orchestrator_id}", response_model=OrchestratorRecord)
-    async def get_orchestrator(
-        orchestrator_id: str, request: Request, _: Any = Depends(require_view_access)
+    def _compute_activity_fields(orchestrator_id: str, record: Dict[str, Any]) -> Dict[str, Any]:
+        active_sessions = _active_session_count(orchestrator_id)
+        active_activity_leases = _active_activity_lease_count(orchestrator_id)
+        in_use = bool(active_sessions > 0 or active_activity_leases > 0)
+
+        now = datetime.now(timezone.utc)
+        ttl_seconds = int(getattr(settings, "forwarder_health_ttl_seconds", 120) or 120)
+        active = False
+        active_reason: Optional[str] = None
+
+        if active_sessions > 0:
+            active = True
+            active_reason = "session"
+        elif active_activity_leases > 0:
+            active = True
+            active_reason = "activity_lease"
+        else:
+            forwarder_health = record.get("forwarder_health")
+            if isinstance(forwarder_health, dict):
+                reported_at = forwarder_health.get("reported_at")
+                data = forwarder_health.get("data")
+                summary = data.get("summary") if isinstance(data, dict) else None
+                reported_dt = _parse_timestamp(reported_at)
+                if reported_dt is not None and (now - reported_dt).total_seconds() <= ttl_seconds:
+                    services_up = summary.get("services_up") if isinstance(summary, dict) else None
+                    if isinstance(services_up, int) and services_up > 0:
+                        active = True
+                    active_reason = "forwarder_health"
+
+            if active_reason is None:
+                last_seen_dt = _parse_timestamp(record.get("last_seen"))
+                if last_seen_dt is not None and (now - last_seen_dt).total_seconds() <= max(ttl_seconds, 300):
+                    active = True
+                    active_reason = "recent_contact"
+
+        return {
+            "active": active,
+            "active_reason": active_reason,
+            "in_use": in_use,
+            "active_sessions": int(active_sessions),
+            "active_activity_leases": int(active_activity_leases),
+        }
+
+    def _build_orchestrator_record(
+        orchestrator_id: str,
+        record: Dict[str, Any],
+        *,
+        now: datetime,
     ) -> OrchestratorRecord:
-        record = registry.get_record(orchestrator_id)
-        if not record:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
         balance = orchestrator_balance(orchestrator_id)
         cooldown_expires_at = record.get("cooldown_expires_at")
         cooldown_active = False
         if isinstance(cooldown_expires_at, str):
             try:
                 expires = datetime.fromisoformat(cooldown_expires_at)
-                cooldown_active = expires > datetime.now(timezone.utc)
+                if expires.tzinfo is None:
+                    expires = expires.replace(tzinfo=timezone.utc)
+                cooldown_active = expires.astimezone(timezone.utc) > now
             except ValueError:
                 cooldown_active = False
-        entry = OrchestratorRecord(
+
+        fields = _compute_activity_fields(orchestrator_id, record)
+        return OrchestratorRecord(
             orchestrator_id=orchestrator_id,
             address=record.get("address", ""),
             balance_eth=str(balance),
@@ -1043,8 +1138,186 @@ def create_app(
             last_session_upstream_addr=record.get("last_session_upstream_addr"),
             last_session_seen_at=record.get("last_session_seen_at"),
             last_session_edge_id=record.get("last_session_edge_id"),
+            **fields,
         )
+
+    def _compute_orchestrator_stats(orchestrator_id: str, *, days: int) -> OrchestratorStatsResponse:
+        days = max(1, min(int(days or 1), 365))
+        now = datetime.now(timezone.utc)
+        start_date = (now - timedelta(days=days - 1)).date()
+
+        def dec(value: Any) -> Optional[Decimal]:
+            try:
+                return Decimal(str(value))
+            except Exception:
+                return None
+
+        journal_path = getattr(ledger, "journal_path", None)
+        totals = {
+            "credits": Decimal("0"),
+            "payouts": Decimal("0"),
+            "session": Decimal("0"),
+            "workload": Decimal("0"),
+            "adjustments": Decimal("0"),
+            "net_delta": Decimal("0"),
+        }
+        daily: Dict[str, Dict[str, Decimal]] = defaultdict(
+            lambda: {
+                "credits": Decimal("0"),
+                "payouts": Decimal("0"),
+                "session": Decimal("0"),
+                "workload": Decimal("0"),
+                "adjustments": Decimal("0"),
+                "net_delta": Decimal("0"),
+            }
+        )
+
+        if journal_path and Path(journal_path).exists():
+            try:
+                with Path(journal_path).open("r", encoding="utf-8") as handle:
+                    for line in handle:
+                        try:
+                            entry = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if not isinstance(entry, dict):
+                            continue
+                        if entry.get("orchestrator_id") != orchestrator_id:
+                            continue
+                        ts = _parse_timestamp(entry.get("timestamp"))
+                        if ts is None or ts.date() < start_date:
+                            continue
+                        date_key = ts.date().isoformat()
+
+                        delta = dec(entry.get("delta"))
+                        if delta is None and entry.get("event") == "credit":
+                            delta = dec(entry.get("amount"))
+                        if delta is None:
+                            continue
+
+                        reason = entry.get("reason")
+                        is_payout = isinstance(reason, str) and reason == "payout" and delta < 0
+
+                        daily[date_key]["net_delta"] += delta
+                        totals["net_delta"] += delta
+
+                        if entry.get("event") == "credit" and delta > 0:
+                            daily[date_key]["credits"] += delta
+                            totals["credits"] += delta
+                            if reason == "session_time":
+                                daily[date_key]["session"] += delta
+                                totals["session"] += delta
+                            elif reason == "workload":
+                                daily[date_key]["workload"] += delta
+                                totals["workload"] += delta
+                            elif reason == "adjustment":
+                                daily[date_key]["adjustments"] += delta
+                                totals["adjustments"] += delta
+                        elif entry.get("event") == "credit" and reason == "adjustment":
+                            daily[date_key]["adjustments"] += delta
+                            totals["adjustments"] += delta
+                        elif is_payout:
+                            daily[date_key]["payouts"] += (-delta)
+                            totals["payouts"] += (-delta)
+            except Exception:
+                pass
+
+        # Emit a dense time series window (including 0 days) to simplify dashboards.
+        daily_models: List[OrchestratorDailyStats] = []
+        cursor = start_date
+        while cursor <= now.date():
+            key = cursor.isoformat()
+            values = daily.get(key) or {}
+            daily_models.append(
+                OrchestratorDailyStats(
+                    date=key,
+                    credits_eth=str(values.get("credits", Decimal("0"))),
+                    payouts_eth=str(values.get("payouts", Decimal("0"))),
+                    session_eth=str(values.get("session", Decimal("0"))),
+                    workload_eth=str(values.get("workload", Decimal("0"))),
+                    adjustments_eth=str(values.get("adjustments", Decimal("0"))),
+                    net_delta_eth=str(values.get("net_delta", Decimal("0"))),
+                )
+            )
+            cursor += timedelta(days=1)
+
+        session_credit = getattr(settings, "session_credit_eth_per_minute", Decimal("0")) or Decimal("0")
+        payout_strategy = str(getattr(settings, "payout_strategy", "eth_transfer") or "eth_transfer")
+
+        return OrchestratorStatsResponse(
+            orchestrator_id=orchestrator_id,
+            balance_eth=str(orchestrator_balance(orchestrator_id)),
+            days=days,
+            total_credits_eth=str(totals["credits"]),
+            total_payouts_eth=str(totals["payouts"]),
+            total_session_eth=str(totals["session"]),
+            total_workload_eth=str(totals["workload"]),
+            total_adjustments_eth=str(totals["adjustments"]),
+            total_net_delta_eth=str(totals["net_delta"]),
+            daily=daily_models,
+            session_credit_eth_per_minute=str(session_credit),
+            passive_credit_eth_per_minute="0",
+            payout_strategy=payout_strategy,
+        )
+
+    @app.get("/api/orchestrators", response_model=OrchestratorsResponse)
+    async def list_orchestrators(
+        request: Request, _: Any = Depends(require_view_access)
+    ) -> OrchestratorsResponse:
+        records = registry.all_records()
+        response: List[OrchestratorRecord] = []
+        now = datetime.now(timezone.utc)
+        sensitive_allowed = include_sensitive_fields(request)
+        for orchestrator_id, record in records.items():
+            entry = _build_orchestrator_record(orchestrator_id, record, now=now)
+            response.append(redact_record(entry, sensitive_allowed))
+
+        return OrchestratorsResponse(orchestrators=response)
+
+    @app.get("/api/orchestrators/me", response_model=OrchestratorRecord)
+    async def get_orchestrator_me(
+        request: Request,
+        auth: Dict[str, str] = Depends(require_orchestrator_token),
+    ) -> OrchestratorRecord:
+        orchestrator_id = auth["orchestrator_id"]
+        record = registry.get_record(orchestrator_id)
+        if not record:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+        entry = _build_orchestrator_record(orchestrator_id, record, now=datetime.now(timezone.utc))
+        # Orchestrators can always see their own metadata.
+        return redact_record(entry, include_sensitive=True)
+
+    @app.get("/api/orchestrators/me/stats", response_model=OrchestratorStatsResponse)
+    async def get_orchestrator_me_stats(
+        days: int = Query(default=30, ge=1, le=365),
+        auth: Dict[str, str] = Depends(require_orchestrator_token),
+    ) -> OrchestratorStatsResponse:
+        orchestrator_id = auth["orchestrator_id"]
+        record = registry.get_record(orchestrator_id)
+        if not record:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+        return _compute_orchestrator_stats(orchestrator_id, days=days)
+
+    @app.get("/api/orchestrators/{orchestrator_id}", response_model=OrchestratorRecord)
+    async def get_orchestrator(
+        orchestrator_id: str, request: Request, _: Any = Depends(require_view_access)
+    ) -> OrchestratorRecord:
+        record = registry.get_record(orchestrator_id)
+        if not record:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+        entry = _build_orchestrator_record(orchestrator_id, record, now=datetime.now(timezone.utc))
         return redact_record(entry, include_sensitive_fields(request))
+
+    @app.get("/api/orchestrators/{orchestrator_id}/stats", response_model=OrchestratorStatsResponse)
+    async def get_orchestrator_stats(
+        orchestrator_id: str,
+        days: int = Query(default=30, ge=1, le=365),
+        _: Any = Depends(require_view_access),
+    ) -> OrchestratorStatsResponse:
+        record = registry.get_record(orchestrator_id)
+        if not record:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+        return _compute_orchestrator_stats(orchestrator_id, days=days)
 
     @app.post("/api/orchestrators/{orchestrator_id}/health")
     async def report_forwarder_health(
@@ -1078,7 +1351,7 @@ def create_app(
 
     def _has_artifact(record: Dict[str, Any]) -> bool:
         uri = record.get("artifact_uri")
-        if uri and isinstance(uri, str) and uri.lower().endswith(".webm"):
+        if uri and isinstance(uri, str) and uri.lower().endswith((".webm", ".mkv", ".mp4", ".mov")):
             return True
         if record.get("artifact_hash"):
             return True
@@ -1111,6 +1384,65 @@ def create_app(
             "credited_at": None,
         }
         workload_store.upsert(payload.workload_id, record)
+        stored = workload_store.get(payload.workload_id) or record
+        return _workload_to_model(payload.workload_id, stored)
+
+    @app.post("/api/workloads/time", response_model=WorkloadRecord)
+    async def create_workload_time_credit(
+        payload: WorkloadTimeCreditPayload,
+        _: Any = Depends(require_admin),
+    ) -> WorkloadRecord:
+        _ensure_orchestrator_exists(payload.orchestrator_id)
+        if payload.status not in WORKLOAD_STATUSES:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid workload status")
+        if workload_store.get(payload.workload_id):
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Workload already exists")
+
+        credit_rate = getattr(settings, "workload_time_credit_eth_per_minute", Decimal("0"))
+        amount = (Decimal(payload.duration_ms) * Decimal(credit_rate)) / Decimal(60_000)
+
+        record = {
+            "orchestrator_id": payload.orchestrator_id,
+            "plan_id": payload.plan_id,
+            "run_id": payload.run_id,
+            "artifact_hash": payload.artifact_hash,
+            "artifact_uri": payload.artifact_uri,
+            "payout_amount_eth": str(amount),
+            "notes": payload.notes,
+            "tx_hash": None,
+            "status": payload.status,
+            "credited": False,
+            "credited_at": None,
+            "pricing": {
+                "kind": "workload_time",
+                "duration_ms": int(payload.duration_ms),
+                "credit_eth_per_minute": str(credit_rate),
+                "computed_at": datetime.utcnow().isoformat() + "Z",
+            },
+        }
+        workload_store.upsert(payload.workload_id, record)
+
+        if payload.status in {"verified", "paid"} and amount > 0:
+            ledger.credit(
+                payload.orchestrator_id,
+                amount,
+                reason="workload_time",
+                metadata={
+                    "workload_id": payload.workload_id,
+                    "plan_id": payload.plan_id,
+                    "run_id": payload.run_id,
+                    "status": payload.status,
+                    "artifact_uri": payload.artifact_uri,
+                    "artifact_hash": payload.artifact_hash,
+                    "duration_ms": str(payload.duration_ms),
+                    "credit_eth_per_minute": str(credit_rate),
+                },
+            )
+            credited_at = datetime.utcnow().isoformat() + "Z"
+            updated = workload_store.update(payload.workload_id, {"credited": True, "credited_at": credited_at})
+            if updated is not None:
+                record = updated
+
         stored = workload_store.get(payload.workload_id) or record
         return _workload_to_model(payload.workload_id, stored)
 
@@ -1355,7 +1687,7 @@ def create_app(
     @app.post("/api/sessions/events", response_model=SessionRecord)
     async def record_session_event(
         payload: SessionEventPayload,
-        _: Request,
+        request: Request,
         __: Any = Depends(require_session_reporter),
     ) -> SessionRecord:
         now = datetime.now(timezone.utc)
@@ -1442,6 +1774,31 @@ def create_app(
             credit_eth_per_minute=credit_rate,
             ledger=ledger,
         )
+
+        # Tie session activity into activity leases so autosleep watchers can avoid stopping an orchestrator mid-session.
+        if orch_id:
+            try:
+                lease_id = f"session:{payload.session_id}"
+                seconds = _resolve_activity_lease_seconds(None)
+                if payload.event == "end":
+                    activity_leases.revoke(lease_id)
+                else:
+                    activity_leases.upsert(
+                        lease_id=lease_id,
+                        orchestrator_id=orch_id,
+                        upstream_addr=payload.upstream_addr,
+                        kind="session",
+                        client_ip=request_ip(request),
+                        lease_seconds=seconds,
+                        metadata={
+                            "session_id": payload.session_id,
+                            "edge_id": payload.edge_id,
+                            "upstream_addr": payload.upstream_addr,
+                            "upstream_port": payload.upstream_port,
+                        },
+                    )
+            except Exception:
+                pass
         return SessionRecord(**stored)
 
     @app.get("/api/sessions", response_model=SessionListResponse)

@@ -151,3 +151,66 @@ Edges can report “session connected / heartbeat / disconnected” events to th
 - Reporting endpoint: `POST /api/sessions/events`
 - Audit endpoint (viewer/admin token): `GET /api/sessions`
 - Ledger entries use `reason="session_time"` with `session_id`, `edge_id`, and `delta_ms` in metadata.
+- Each session event also updates an **activity lease** (`lease_id="session:<session_id>"`) so autosleep watchers can treat sessions and content jobs uniformly via `GET /api/activity/leases?active_only=true`.
+
+## Content Jobs (time-based workloads)
+
+For non-interactive content generation, prefer creating **time-based** workloads so the ledger is fully auditable (no opaque backfills).
+
+- Configure the rate:
+  - `PAYMENTS_WORKLOAD_TIME_CREDIT_ETH_PER_MINUTE=0.000005353596` (default aligns with `Embody-Inc/cost-model.md`)
+- Create a workload and credit the ledger immediately (admin token):
+
+```bash
+curl -sS -X POST \
+  -H "X-Admin-Token: $PAYMENTS_ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "workload_id":"<unique-id>",
+    "orchestrator_id":"<orch-id>",
+    "duration_ms":180000,
+    "plan_id":"<plan-id>",
+    "run_id":"<run-id>",
+    "artifact_uri":"/path/to/output.webm"
+  }' \
+  "https://<payments>/api/workloads/time"
+```
+
+## Orchestrator stats (dashboard helpers)
+
+With an orchestrator token (from invite redemption or admin minting), orchestrators can query their own state:
+
+- `GET /api/orchestrators/me`
+- `GET /api/orchestrators/me/stats?days=30`
+
+Admins/viewers can query stats for any orchestrator:
+
+- `GET /api/orchestrators/{orchestrator_id}/stats?days=30`
+
+## Ledger reconciliation (report)
+
+To compare the current `balances.json` to the append-only ledger journal (`audit/ledger-events.log`), generate a markdown report:
+
+```bash
+python3 scripts/reconcile_ledger.py \
+  --data-dir /app/data \
+  --label stage \
+  --out /app/data/audit/reconcile-report.md \
+  --write-reconciled-balances /app/data/balances.reconciled.json \
+  --write-mismatches-json /app/data/audit/reconcile-mismatches.json
+```
+
+If `workloads.json` exists, the report also includes a section listing verified/paid workloads that have artifacts but were not credited yet.
+
+## Ledger reconciliation (duplicate-hash sweep bug)
+
+If historical content sweeps produced duplicated `artifact_hash` values (and one orchestrator was consistently first in the sweep), you can standardize the **non-unique** workload credits with a single reconciliation adjustment per orchestrator:
+
+```bash
+python3 scripts/standardize_duplicate_workload_credits.py \
+  --data-dir /app/data \
+  --standard-non-unique-eth 0.00224230 \
+  --participation-only nico-utp \
+  --participation-only orch-local-hoshi \
+  --apply
+```
