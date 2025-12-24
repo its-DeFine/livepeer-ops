@@ -213,6 +213,24 @@ class WorkloadCreatePayload(BaseModel):
         return values
 
 
+class WorkloadTimeCreditPayload(BaseModel):
+    workload_id: str = Field(min_length=1, max_length=255)
+    orchestrator_id: str = Field(min_length=1, max_length=128)
+    duration_ms: int = Field(gt=0, le=24 * 60 * 60 * 1000)
+    plan_id: Optional[str] = Field(default=None, max_length=128)
+    run_id: Optional[str] = Field(default=None, max_length=256)
+    artifact_hash: Optional[str] = Field(default=None, max_length=256)
+    artifact_uri: Optional[str] = Field(default=None, max_length=512)
+    notes: Optional[str] = Field(default=None, max_length=1024)
+    status: str = Field(default="verified", max_length=32)
+
+    @model_validator(mode="after")
+    def ensure_artifact(cls, values):  # type: ignore[override]
+        if not values.artifact_hash and not values.artifact_uri:
+            raise ValueError("artifact_hash or artifact_uri required")
+        return values
+
+
 class WorkloadRecord(BaseModel):
     workload_id: str
     orchestrator_id: str
@@ -1362,6 +1380,65 @@ def create_app(
             "credited_at": None,
         }
         workload_store.upsert(payload.workload_id, record)
+        stored = workload_store.get(payload.workload_id) or record
+        return _workload_to_model(payload.workload_id, stored)
+
+    @app.post("/api/workloads/time", response_model=WorkloadRecord)
+    async def create_workload_time_credit(
+        payload: WorkloadTimeCreditPayload,
+        _: Any = Depends(require_admin),
+    ) -> WorkloadRecord:
+        _ensure_orchestrator_exists(payload.orchestrator_id)
+        if payload.status not in WORKLOAD_STATUSES:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid workload status")
+        if workload_store.get(payload.workload_id):
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Workload already exists")
+
+        credit_rate = getattr(settings, "workload_time_credit_eth_per_minute", Decimal("0"))
+        amount = (Decimal(payload.duration_ms) * Decimal(credit_rate)) / Decimal(60_000)
+
+        record = {
+            "orchestrator_id": payload.orchestrator_id,
+            "plan_id": payload.plan_id,
+            "run_id": payload.run_id,
+            "artifact_hash": payload.artifact_hash,
+            "artifact_uri": payload.artifact_uri,
+            "payout_amount_eth": str(amount),
+            "notes": payload.notes,
+            "tx_hash": None,
+            "status": payload.status,
+            "credited": False,
+            "credited_at": None,
+            "pricing": {
+                "kind": "workload_time",
+                "duration_ms": int(payload.duration_ms),
+                "credit_eth_per_minute": str(credit_rate),
+                "computed_at": datetime.utcnow().isoformat() + "Z",
+            },
+        }
+        workload_store.upsert(payload.workload_id, record)
+
+        if payload.status in {"verified", "paid"} and amount > 0:
+            ledger.credit(
+                payload.orchestrator_id,
+                amount,
+                reason="workload_time",
+                metadata={
+                    "workload_id": payload.workload_id,
+                    "plan_id": payload.plan_id,
+                    "run_id": payload.run_id,
+                    "status": payload.status,
+                    "artifact_uri": payload.artifact_uri,
+                    "artifact_hash": payload.artifact_hash,
+                    "duration_ms": str(payload.duration_ms),
+                    "credit_eth_per_minute": str(credit_rate),
+                },
+            )
+            credited_at = datetime.utcnow().isoformat() + "Z"
+            updated = workload_store.update(payload.workload_id, {"credited": True, "credited_at": credited_at})
+            if updated is not None:
+                record = updated
+
         stored = workload_store.get(payload.workload_id) or record
         return _workload_to_model(payload.workload_id, stored)
 

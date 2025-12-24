@@ -222,6 +222,10 @@ class PaymentSettings(BaseSettings):
         default=Decimal("0"),
         validation_alias="PAYMENTS_SESSION_CREDIT_ETH_PER_MINUTE",
     )
+    workload_time_credit_eth_per_minute: Decimal = Field(
+        default=Decimal("0.000005353596"),
+        validation_alias="PAYMENTS_WORKLOAD_TIME_CREDIT_ETH_PER_MINUTE",
+    )
     session_idle_timeout_seconds: int = Field(
         default=120,
         validation_alias="PAYMENTS_SESSION_IDLE_TIMEOUT_SECONDS",
