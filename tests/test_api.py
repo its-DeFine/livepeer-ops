@@ -445,6 +445,70 @@ async def test_viewer_tokens_allow_readonly_access(temp_paths):
 
 
 @pytest.mark.anyio("asyncio")
+async def test_orchestrator_token_can_view_self_and_stats(temp_paths):
+    balances_path, registry_path = temp_paths
+    journal_path = balances_path.parent / "audit" / "ledger-events.log"
+    ledger = Ledger(balances_path, journal_path=journal_path)
+    registry_settings = SimpleNamespace(
+        top_contract_address=None,
+        top_contract_function="getTop",
+        top_contract_abi_json=None,
+        top_contract_abi_path=None,
+        registration_rate_limit_per_minute=5,
+        registration_rate_limit_burst=5,
+        api_admin_token=None,
+        audit_log_path=registry_path.with_name("registry-audit.log"),
+    )
+    registry = Registry(
+        path=registry_path,
+        settings=registry_settings,
+        ledger=ledger,
+        web3=None,
+    )
+
+    address = "0xEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE"
+    with patch.object(Registry, "_resolve_top_set", return_value={address.lower()}):
+        registry.register(orchestrator_id="orch-self", address=address)
+
+    ledger.credit("orch-self", Decimal("0.01"), reason="session_time")
+    ledger.credit("orch-self", Decimal("0.02"), reason="workload")
+
+    app_settings = build_settings(temp_paths, api_admin_token="secret")
+    app = create_app(registry, ledger, app_settings)
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        token_resp = await client.post(
+            "/api/licenses/orchestrators/orch-self/tokens",
+            headers={"X-Admin-Token": "secret"},
+        )
+        assert token_resp.status_code == 200
+        token = token_resp.json()["token"]
+
+        me = await client.get(
+            "/api/orchestrators/me",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert me.status_code == 200
+        assert me.json()["orchestrator_id"] == "orch-self"
+
+        stats = await client.get(
+            "/api/orchestrators/me/stats",
+            params={"days": 1},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert stats.status_code == 200
+        body = stats.json()
+        assert body["orchestrator_id"] == "orch-self"
+        assert body["balance_eth"] == "0.03"
+        assert body["total_credits_eth"] == "0.03"
+        assert body["total_session_eth"] == "0.01"
+        assert body["total_workload_eth"] == "0.02"
+        assert body["days"] == 1
+        assert body["daily"]
+
+
+@pytest.mark.anyio("asyncio")
 async def test_ledger_adjustment_requires_admin(temp_paths):
     balances_path, registry_path = temp_paths
     journal_path = balances_path.parent / "ledger-events.log"
