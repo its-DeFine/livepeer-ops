@@ -456,6 +456,10 @@ class LicenseInviteRedeemResponse(BaseModel):
     image_ref: str
     token_id: str
     token: str
+    # Optional: allow Embody-managed orchestrators to auto-configure edge rotation
+    # during onboarding (so they don't need to edit .env).
+    edge_config_url: Optional[str] = None
+    edge_config_token: Optional[str] = None
 
 # -------------------------
 # Session metering (PS usage)
@@ -1787,11 +1791,15 @@ def create_app(
                 "request_ip": request_ip(request),
             },
         )
+        edge_config_url = getattr(settings, "edge_config_url", None)
+        edge_config_token = getattr(settings, "edge_config_token", None)
         return LicenseInviteRedeemResponse(
             orchestrator_id=payload.orchestrator_id,
             image_ref=image_ref,
             token_id=minted["token_id"],
             token=minted["token"],
+            edge_config_url=edge_config_url,
+            edge_config_token=edge_config_token,
         )
 
     @app.post("/api/licenses/lease", response_model=LicenseLeaseResponse)

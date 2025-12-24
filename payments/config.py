@@ -119,6 +119,14 @@ class PaymentSettings(BaseSettings):
         default=Decimal("0.02"),
         validation_alias="PAYMENTS_LIVEPEER_DEPOSIT_TARGET_ETH",
     )
+
+    # -------------------------
+    # Optional: Pixel Streaming edge-config plane
+    # -------------------------
+    # If set, invite redemption can return these values to orchestrator onboarding
+    # so orchestrators don't have to edit `.env` by hand.
+    edge_config_url: Optional[str] = Field(default=None, validation_alias="PAYMENTS_EDGE_CONFIG_URL")
+    edge_config_token: Optional[str] = Field(default=None, validation_alias="PAYMENTS_EDGE_CONFIG_TOKEN")
     livepeer_deposit_low_watermark_eth: Decimal = Field(
         default=Decimal("0.01"),
         validation_alias="PAYMENTS_LIVEPEER_DEPOSIT_LOW_WATERMARK_ETH",
