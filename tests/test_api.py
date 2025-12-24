@@ -324,7 +324,7 @@ async def test_workload_credit_requires_artifact_and_status(temp_paths):
         assert created.status_code == 200
         assert ledger.get_balance("orch-credit") == Decimal("0")
 
-        # Status update without webm should not credit
+        # Status update without a supported video artifact should not credit
         no_artifact = await client.patch(
             "/api/workloads/orch-credit-1",
             json={"status": "verified"},
@@ -333,13 +333,13 @@ async def test_workload_credit_requires_artifact_and_status(temp_paths):
         assert no_artifact.status_code == 200
         assert ledger.get_balance("orch-credit") == Decimal("0")
 
-        # Provide webm + verified -> credit once
-        with_webm = await client.patch(
+        # Provide mkv + verified -> credit once
+        with_artifact = await client.patch(
             "/api/workloads/orch-credit-1",
-            json={"status": "verified", "artifact_uri": "s3://clips/run-1.webm"},
+            json={"status": "verified", "artifact_uri": "s3://clips/run-1.mkv"},
             headers={"X-Admin-Token": "secret"},
         )
-        assert with_webm.status_code == 200
+        assert with_artifact.status_code == 200
         assert ledger.get_balance("orch-credit") == Decimal("0.5")
 
         # Second update should not double-credit

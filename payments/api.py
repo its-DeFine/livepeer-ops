@@ -1074,7 +1074,7 @@ def create_app(
 
     def _has_artifact(record: Dict[str, Any]) -> bool:
         uri = record.get("artifact_uri")
-        if uri and isinstance(uri, str) and uri.lower().endswith(".webm"):
+        if uri and isinstance(uri, str) and uri.lower().endswith((".webm", ".mkv", ".mp4", ".mov")):
             return True
         if record.get("artifact_hash"):
             return True

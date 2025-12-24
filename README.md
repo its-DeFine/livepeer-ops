@@ -151,3 +151,18 @@ Edges can report “session connected / heartbeat / disconnected” events to th
 - Reporting endpoint: `POST /api/sessions/events`
 - Audit endpoint (viewer/admin token): `GET /api/sessions`
 - Ledger entries use `reason="session_time"` with `session_id`, `edge_id`, and `delta_ms` in metadata.
+
+## Ledger reconciliation (report)
+
+To compare the current `balances.json` to the append-only ledger journal (`audit/ledger-events.log`), generate a markdown report:
+
+```bash
+python3 scripts/reconcile_ledger.py \
+  --data-dir /app/data \
+  --label stage \
+  --out /app/data/audit/reconcile-report.md \
+  --write-reconciled-balances /app/data/balances.reconciled.json \
+  --write-mismatches-json /app/data/audit/reconcile-mismatches.json
+```
+
+If `workloads.json` exists, the report also includes a section listing verified/paid workloads that have artifacts but were not credited yet.
