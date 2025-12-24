@@ -51,6 +51,44 @@ rsync -azP -e "ssh -i /path/to/key.pem" \
 
 Then store `./backups/payments-data/` somewhere durable (S3, another disk, etc.).
 
+## Option C: One-command backup + clean deploy (SSH)
+
+If you use this repo’s `ops/deploy_payments_backend_ssh.py`, you can:
+
+- pull a local snapshot of `data/` + `docker-compose.yml`
+- optionally reset the remote `data/` directory to a clean state
+- deploy a pinned `PAYMENTS_IMAGE`
+
+Example (essential backup; excludes very large audit DB/log artifacts by default):
+
+```bash
+python3 ops/deploy_payments_backend_ssh.py \
+  --inventory ops/inventory.json \
+  --target prod \
+  --ssh-key /path/to/key.pem \
+  --backup-out ./backups/payments-backend \
+  --backup-mode essential \
+  --image ghcr.io/its-define/payments-backend:latest \
+  --expect-openapi-path /health
+```
+
+Clean-state reset (destructive; archives the old `data/` under `backups/<timestamp>/data` on the host):
+
+```bash
+python3 ops/deploy_payments_backend_ssh.py \
+  --inventory ops/inventory.json \
+  --target prod \
+  --ssh-key /path/to/key.pem \
+  --backup-out ./backups/payments-backend \
+  --backup-mode full \
+  --reset-data --yes-really-reset-data \
+  --image ghcr.io/its-define/payments-backend:latest
+```
+
+Notes:
+- `--backup-mode full` can be large if `data/audit/payments-audit.log` is multi-GB.
+- `--backup-include-env` pulls `.env` too (contains secrets; keep private).
+
 ## Restore (high level)
 
 1. Restore `./data` from snapshot/backup onto the target host.
