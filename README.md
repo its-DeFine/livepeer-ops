@@ -151,6 +151,18 @@ Edges can report “session connected / heartbeat / disconnected” events to th
 - Reporting endpoint: `POST /api/sessions/events`
 - Audit endpoint (viewer/admin token): `GET /api/sessions`
 - Ledger entries use `reason="session_time"` with `session_id`, `edge_id`, and `delta_ms` in metadata.
+- Each session event also updates an **activity lease** (`lease_id="session:<session_id>"`) so autosleep watchers can treat sessions and content jobs uniformly via `GET /api/activity/leases?active_only=true`.
+
+## Orchestrator stats (dashboard helpers)
+
+With an orchestrator token (from invite redemption or admin minting), orchestrators can query their own state:
+
+- `GET /api/orchestrators/me`
+- `GET /api/orchestrators/me/stats?days=30`
+
+Admins/viewers can query stats for any orchestrator:
+
+- `GET /api/orchestrators/{orchestrator_id}/stats?days=30`
 
 ## Ledger reconciliation (report)
 
