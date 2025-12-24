@@ -145,6 +145,17 @@ def _render_md_hash_dupe_table(rows: list[tuple[str, int, str, str]]) -> str:
     return header + body
 
 
+def _render_md_unique_hash_workloads_table(
+    rows: list[tuple[str, str, str, str, str, str, str]]
+) -> str:
+    header = (
+        "| artifact_hash | orchestrator_id | workload_id | payout_amount_eth | artifact_uri | plan_id | run_id |\n"
+        "|---|---|---|---:|---|---|---|\n"
+    )
+    body = "".join(f"| {a} | {b} | {c} | {d} | {e} | {f} | {g} |\n" for a, b, c, d, e, f, g in rows)
+    return header + body
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Reconcile balances.json against audit/ledger-events.log")
     ap.add_argument("--data-dir", required=True, help="Directory containing balances.json and audit/ledger-events.log")
@@ -164,6 +175,16 @@ def main() -> int:
         "--write-workload-hash-index-json",
         default="",
         help="Optional path to write a JSON index of artifact_hash → workloads (verified/paid only)",
+    )
+    ap.add_argument(
+        "--write-workload-hash-unique-md",
+        default="",
+        help="Optional path to write a markdown table of verified/paid workloads with unique artifact_hash",
+    )
+    ap.add_argument(
+        "--write-workload-hash-dupes-md",
+        default="",
+        help="Optional path to write a markdown table of duplicate artifact_hash values (verified/paid only)",
     )
     ap.add_argument("--top", type=int, default=25, help="Top N balances to include (default 25)")
     args = ap.parse_args()
@@ -482,10 +503,13 @@ def main() -> int:
 
         # Hash uniqueness report.
         unique_hashes = 0
+        unique_hash_workloads: list[tuple[str, str, dict[str, Any]]] = []
         duplicate_hashes: list[tuple[str, list[tuple[str, dict[str, Any]]]]] = []
         for artifact_hash, items in artifact_hash_index.items():
             if len(items) == 1:
                 unique_hashes += 1
+                workload_id, record = items[0]
+                unique_hash_workloads.append((artifact_hash, str(workload_id), record))
             elif len(items) > 1:
                 duplicate_hashes.append((artifact_hash, items))
         duplicate_hashes.sort(key=lambda item: len(item[1]), reverse=True)
@@ -514,6 +538,37 @@ def main() -> int:
             lines.append("")
             lines.append("#### Duplicate artifact_hash values (top 50)")
             lines.append(_render_md_hash_dupe_table(rows))
+
+        if args.write_workload_hash_unique_md:
+            out_path = Path(args.write_workload_hash_unique_md).expanduser()
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            md_rows: list[tuple[str, str, str, str, str, str, str]] = []
+            for artifact_hash, workload_id, record in sorted(unique_hash_workloads, key=lambda row: row[0]):
+                md_rows.append(
+                    (
+                        artifact_hash,
+                        str(record.get("orchestrator_id") or ""),
+                        workload_id,
+                        str(record.get("payout_amount_eth") or ""),
+                        str(record.get("artifact_uri") or ""),
+                        str(record.get("plan_id") or ""),
+                        str(record.get("run_id") or ""),
+                    )
+                )
+            out_path.write_text(_render_md_unique_hash_workloads_table(md_rows), encoding="utf-8")
+
+        if args.write_workload_hash_dupes_md:
+            out_path = Path(args.write_workload_hash_dupes_md).expanduser()
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            md_rows = []
+            for artifact_hash, items in duplicate_hashes:
+                orch_ids = sorted(
+                    {str(rec.get("orchestrator_id") or "") for _, rec in items if isinstance(rec, dict)}
+                )
+                orch_list = ", ".join([oid for oid in orch_ids if oid])
+                workload_ids = [wid for wid, _ in items]
+                md_rows.append((artifact_hash, len(items), orch_list, ", ".join(workload_ids)))
+            out_path.write_text(_render_md_hash_dupe_table(md_rows), encoding="utf-8")
 
         if verified_paid_missing_hash:
             verified_paid_missing_hash.sort(
