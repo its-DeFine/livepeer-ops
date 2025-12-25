@@ -148,6 +148,65 @@ def _remote_set_env_var(target: Target, ssh_key: str | None, key: str, value: st
     _run(_ssh_cmd(target.user, target.host, ssh_key) + [_remote_bash(script)])
 
 
+def _remote_ensure_edge_token(target: Target, ssh_key: str | None, *, env_key: str) -> None:
+    # If env_key is unset in .env, generate a token on the host and write it without printing.
+    script = "\n".join(
+        [
+            "set -euo pipefail",
+            f"cd {shlex.quote(target.remote_path)}",
+            "touch .env",
+            f"if grep -q '^{env_key}=' .env; then",
+            "  exit 0",
+            "fi",
+            # Prefer python3; fall back to openssl.
+            "tok=''",
+            "if command -v python3 >/dev/null 2>&1; then",
+            "  tok=$(python3 - <<'PY'\nimport secrets\nprint(secrets.token_urlsafe(32))\nPY\n)",
+            "elif command -v openssl >/dev/null 2>&1; then",
+            "  tok=$(openssl rand -base64 32 | tr -d '\\n' | tr '+/' '-_' | tr -d '=')",
+            "else",
+            "  echo 'ERROR: need python3 or openssl to generate token' >&2; exit 2",
+            "fi",
+            f"echo '{env_key}='\"$tok\" >> .env",
+        ]
+    )
+    _run(_ssh_cmd(target.user, target.host, ssh_key) + [_remote_bash(script)])
+
+
+def _remote_write_edge_assignments_default(
+    target: Target,
+    ssh_key: str | None,
+    *,
+    edge_id: str,
+    matchmaker_host: str,
+    matchmaker_port: int,
+    edge_cidrs: list[str],
+) -> None:
+    # Write assignments file to the mounted data/ directory (root-owned in our compose).
+    payload = {
+        "default": {
+            "edge_id": edge_id,
+            "matchmaker_host": matchmaker_host,
+            "matchmaker_port": matchmaker_port,
+            "edge_cidrs": edge_cidrs,
+        },
+        "orchestrators": {},
+    }
+    script = "\n".join(
+        [
+            "set -euo pipefail",
+            f"cd {shlex.quote(target.remote_path)}",
+            "mkdir -p data",
+            "tmp=$(mktemp)",
+            f"cat >\"$tmp\" <<'JSON'\n{json.dumps(payload, indent=2, sort_keys=True)}\nJSON",
+            "sudo mv \"$tmp\" data/edge_assignments.json",
+            "sudo chmod 600 data/edge_assignments.json",
+            "sudo chown root:root data/edge_assignments.json || true",
+        ]
+    )
+    _run(_ssh_cmd(target.user, target.host, ssh_key) + [_remote_bash(script)])
+
+
 def _deploy(target: Target, ssh_key: str | None, image: str | None) -> None:
     if image:
         _remote_set_env_var(target, ssh_key, "PAYMENTS_IMAGE", image)
@@ -209,6 +268,14 @@ def main() -> int:
     ap.add_argument("--backup-include-env", action="store_true", help="Also rsync .env into the backup (contains secrets; keep private).")
     ap.add_argument("--reset-data", action="store_true", help="Move remote data/ aside and start clean")
     ap.add_argument("--yes-really-reset-data", action="store_true", help="Required to run --reset-data")
+
+    ap.add_argument("--edge-config-url", default="", help="Set PAYMENTS_EDGE_CONFIG_URL on the host (optional).")
+    ap.add_argument("--edge-config-token", default="", help="Set PAYMENTS_EDGE_CONFIG_TOKEN on the host (optional). If unset but URL is set, token is generated on-host if missing.")
+    ap.add_argument("--seed-default-edge", action="store_true", help="Write data/edge_assignments.json with a default assignment (optional).")
+    ap.add_argument("--default-edge-id", default="prod-default", help="Default edge_id to seed (used with --seed-default-edge).")
+    ap.add_argument("--default-matchmaker-host", default="", help="Matchmaker host/IP to seed (used with --seed-default-edge).")
+    ap.add_argument("--default-matchmaker-port", type=int, default=8889, help="Matchmaker port to seed (used with --seed-default-edge).")
+    ap.add_argument("--default-edge-cidrs", default="", help="Comma-separated CIDRs to seed (used with --seed-default-edge).")
     args = ap.parse_args()
 
     inventory_path = Path(args.inventory).expanduser().resolve()
@@ -241,6 +308,34 @@ def main() -> int:
         if not args.yes_really_reset_data:
             raise SystemExit("--reset-data requires --yes-really-reset-data")
         _reset_remote_state(target, ssh_key)
+
+    edge_config_url = args.edge_config_url.strip()
+    if edge_config_url:
+        _remote_set_env_var(target, ssh_key, "PAYMENTS_EDGE_CONFIG_URL", edge_config_url)
+        edge_config_token = args.edge_config_token.strip()
+        if edge_config_token:
+            _remote_set_env_var(target, ssh_key, "PAYMENTS_EDGE_CONFIG_TOKEN", edge_config_token)
+        else:
+            _remote_ensure_edge_token(target, ssh_key, env_key="PAYMENTS_EDGE_CONFIG_TOKEN")
+
+    if args.seed_default_edge:
+        mm_host = args.default_matchmaker_host.strip()
+        if not mm_host:
+            raise SystemExit("--seed-default-edge requires --default-matchmaker-host")
+        cidrs_raw = args.default_edge_cidrs.strip()
+        if not cidrs_raw:
+            raise SystemExit("--seed-default-edge requires --default-edge-cidrs")
+        cidrs = [c.strip() for c in cidrs_raw.split(",") if c.strip()]
+        if not cidrs:
+            raise SystemExit("--seed-default-edge requires at least one CIDR in --default-edge-cidrs")
+        _remote_write_edge_assignments_default(
+            target,
+            ssh_key,
+            edge_id=args.default_edge_id.strip() or "prod-default",
+            matchmaker_host=mm_host,
+            matchmaker_port=args.default_matchmaker_port,
+            edge_cidrs=cidrs,
+        )
 
     _deploy(target, ssh_key, image)
     _wait_health(target, ssh_key, args.expect_openapi_path, args.timeout_seconds)

@@ -127,6 +127,10 @@ class PaymentSettings(BaseSettings):
     # so orchestrators don't have to edit `.env` by hand.
     edge_config_url: Optional[str] = Field(default=None, validation_alias="PAYMENTS_EDGE_CONFIG_URL")
     edge_config_token: Optional[str] = Field(default=None, validation_alias="PAYMENTS_EDGE_CONFIG_TOKEN")
+    edge_assignments_path: Path = Field(
+        default=Path("/app/data/edge_assignments.json"),
+        validation_alias="PAYMENTS_EDGE_ASSIGNMENTS_PATH",
+    )
     livepeer_deposit_low_watermark_eth: Decimal = Field(
         default=Decimal("0.01"),
         validation_alias="PAYMENTS_LIVEPEER_DEPOSIT_LOW_WATERMARK_ETH",
