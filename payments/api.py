@@ -198,6 +198,57 @@ class OrchestratorBootstrapResponse(BaseModel):
     edge_config_token: Optional[str] = None
 
 
+class EdgeConfigResponse(BaseModel):
+    edge_id: str = Field(min_length=1, max_length=128)
+    matchmaker_host: str = Field(min_length=1, max_length=255)
+    matchmaker_port: int = Field(default=8889, ge=1, le=65535)
+    edge_cidrs: List[str] = Field(min_length=1)
+    turn_external_ip: Optional[str] = Field(default=None, max_length=64)
+
+    @field_validator("edge_cidrs")
+    @classmethod
+    def validate_edge_cidrs(cls, value: List[str]) -> List[str]:
+        normalized: List[str] = []
+        for item in value:
+            if not item:
+                continue
+            candidate = item.strip()
+            if not candidate:
+                continue
+            network = ipaddress.ip_network(candidate, strict=False)
+            normalized.append(str(network))
+        if not normalized:
+            raise ValueError("edge_cidrs must include at least one CIDR")
+        return normalized
+
+    @field_validator("turn_external_ip")
+    @classmethod
+    def validate_turn_ip(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        candidate = value.strip()
+        if not candidate:
+            return None
+        ip = ipaddress.ip_address(candidate)
+        return str(ip)
+
+
+class EdgeAssignmentUpsertPayload(BaseModel):
+    orchestrator_id: str = Field(min_length=1, max_length=128)
+    edge_id: str = Field(min_length=1, max_length=128)
+    matchmaker_host: str = Field(min_length=1, max_length=255)
+    matchmaker_port: int = Field(default=8889, ge=1, le=65535)
+    edge_cidrs: List[str] = Field(min_length=1)
+    turn_external_ip: Optional[str] = Field(default=None, max_length=64)
+
+    @model_validator(mode="after")
+    def normalize_fields(self):  # type: ignore[override]
+        self.matchmaker_host = self.matchmaker_host.strip()
+        self.edge_cidrs = EdgeConfigResponse.validate_edge_cidrs(self.edge_cidrs)
+        self.turn_external_ip = EdgeConfigResponse.validate_turn_ip(self.turn_external_ip)
+        return self
+
+
 WORKLOAD_STATUSES = {"pending", "verified", "paid", "rejected"}
 
 
@@ -666,6 +717,10 @@ def create_app(
         "last_session_edge_id": None,
     }
 
+    edge_assignments_path = Path(
+        getattr(settings, "edge_assignments_path", data_dir / "edge_assignments.json")
+    )
+
     def normalize_ip(value: Optional[str]) -> Optional[str]:
         if not value:
             return None
@@ -750,6 +805,14 @@ def create_app(
                 return candidate
         return None
 
+    def _provided_bearer_token(request: Request) -> Optional[str]:
+        auth_header = request.headers.get("Authorization") or ""
+        if auth_header.lower().startswith("bearer "):
+            candidate = auth_header.split(" ", 1)[1].strip()
+            if candidate:
+                return candidate
+        return None
+
     def _provided_session_token(request: Request) -> Optional[str]:
         token = request.headers.get("X-Session-Token")
         if token:
@@ -794,6 +857,17 @@ def create_app(
         if provided != token:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Admin token required")
 
+    async def require_edge_plane(request: Request) -> None:
+        expected = (getattr(settings, "edge_config_token", None) or "").strip()
+        if not expected:
+            return
+        provided = _provided_bearer_token(request)
+        if provided != expected:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Edge config token required",
+            )
+
     async def require_view_access(request: Request) -> None:
         admin_token = settings.api_admin_token
         viewer_tokens = settings.viewer_tokens
@@ -811,6 +885,50 @@ def create_app(
                 return
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Viewer token required")
         # No tokens configured => open access
+
+    def _read_edge_assignments() -> Dict[str, Any]:
+        try:
+            if not edge_assignments_path.exists():
+                return {}
+            raw = edge_assignments_path.read_text(encoding="utf-8")
+            if not raw.strip():
+                return {}
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+
+    def _write_edge_assignments(data: Dict[str, Any]) -> None:
+        edge_assignments_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = edge_assignments_path.with_suffix(edge_assignments_path.suffix + f".{int(time.time())}.tmp")
+        tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        tmp.replace(edge_assignments_path)
+
+    def _edge_assignment_for(orchestrator_id: str) -> EdgeConfigResponse:
+        data = _read_edge_assignments()
+        # Accept both:
+        # - {"default": {...}, "orchestrators": {"orch": {...}}}
+        # - {"orch": {...}} (legacy/minimal)
+        record: Optional[Dict[str, Any]] = None
+        if "orchestrators" in data and isinstance(data.get("orchestrators"), dict):
+            record = data["orchestrators"].get(orchestrator_id)
+            if record is None and isinstance(data.get("default"), dict):
+                record = data.get("default")
+        else:
+            maybe = data.get(orchestrator_id)
+            record = maybe if isinstance(maybe, dict) else None
+            if record is None and isinstance(data.get("default"), dict):
+                record = data.get("default")
+
+        if not isinstance(record, dict):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="No edge assignment configured for orchestrator",
+            )
+        try:
+            return EdgeConfigResponse.model_validate(record)
+        except Exception as exc:
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc))
 
     def parse_iso8601(value: Optional[str]) -> Optional[datetime]:
         if value is None:
@@ -1015,6 +1133,33 @@ def create_app(
             edge_config_url=edge_config_url,
             edge_config_token=edge_config_token,
         )
+
+    @app.get("/api/orchestrator-edge", response_model=EdgeConfigResponse)
+    async def get_orchestrator_edge(
+        orchestrator_id: str = Query(min_length=1, max_length=128),
+        _: Any = Depends(require_edge_plane),
+    ) -> EdgeConfigResponse:
+        return _edge_assignment_for(orchestrator_id)
+
+    @app.put("/api/orchestrator-edge", response_model=Dict[str, Any])
+    async def upsert_orchestrator_edge(
+        payload: EdgeAssignmentUpsertPayload,
+        _: Any = Depends(require_admin),
+    ) -> Dict[str, Any]:
+        data = _read_edge_assignments()
+        if "orchestrators" not in data or not isinstance(data.get("orchestrators"), dict):
+            data = {"default": data.get("default"), "orchestrators": {}}
+        orchestrators = data["orchestrators"]
+        assert isinstance(orchestrators, dict)
+        orchestrators[payload.orchestrator_id] = EdgeConfigResponse(
+            edge_id=payload.edge_id,
+            matchmaker_host=payload.matchmaker_host,
+            matchmaker_port=payload.matchmaker_port,
+            edge_cidrs=payload.edge_cidrs,
+            turn_external_ip=payload.turn_external_ip,
+        ).model_dump()
+        _write_edge_assignments(data)
+        return {"ok": True, "orchestrator_id": payload.orchestrator_id}
 
     def _parse_timestamp(value: Any) -> Optional[datetime]:
         if not isinstance(value, str) or not value:
