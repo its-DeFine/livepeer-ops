@@ -250,6 +250,18 @@ class PaymentSettings(BaseSettings):
         default=120,
         validation_alias="PAYMENTS_SESSION_IDLE_TIMEOUT_SECONDS",
     )
+    autosleep_enabled: bool = Field(
+        default=False,
+        validation_alias="PAYMENTS_AUTOSLEEP_ENABLED",
+    )
+    autosleep_idle_seconds: int = Field(
+        default=600,
+        validation_alias="PAYMENTS_AUTOSLEEP_IDLE_SECONDS",
+    )
+    autosleep_poll_seconds: int = Field(
+        default=60,
+        validation_alias="PAYMENTS_AUTOSLEEP_POLL_SECONDS",
+    )
 
     forwarder_health_ttl_seconds: int = Field(
         default=120,
@@ -375,6 +387,8 @@ class PaymentSettings(BaseSettings):
         "license_artifact_presign_seconds",
         "recordings_presign_seconds",
         "session_segment_seconds",
+        "autosleep_idle_seconds",
+        "autosleep_poll_seconds",
     )
     def validate_positive_int(cls, value: int) -> int:
         if value <= 0:

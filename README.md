@@ -190,6 +190,14 @@ For API-driven recording workloads (runner → recorder → upload), configure a
 - Get status (viewer/admin token): `GET /api/jobs/{job_id}`
 - Get a fresh download URL (viewer/admin token): `GET /api/recordings/presign?s3_uri=s3://...`
 
+## Autosleep (optional)
+
+If Payments can reach each orchestrator’s `/power` endpoint, it can automatically sleep idle stacks based on session + activity lease signals.
+
+- Enable: `PAYMENTS_AUTOSLEEP_ENABLED=1`
+- Idle threshold: `PAYMENTS_AUTOSLEEP_IDLE_SECONDS=600`
+- Poll interval: `PAYMENTS_AUTOSLEEP_POLL_SECONDS=60`
+
 ## Orchestrator stats (dashboard helpers)
 
 With an orchestrator token (from invite redemption or admin minting), orchestrators can query their own state:

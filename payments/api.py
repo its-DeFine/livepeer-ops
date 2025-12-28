@@ -751,6 +751,9 @@ def create_app(
     recordings_prefix = (getattr(settings, "recordings_prefix", "recordings") or "recordings").strip().strip("/")
     recordings_region = getattr(settings, "recordings_region", None)
     recordings_presign_seconds = int(getattr(settings, "recordings_presign_seconds", 3600) or 3600)
+    autosleep_enabled = bool(getattr(settings, "autosleep_enabled", False))
+    autosleep_idle_seconds = int(getattr(settings, "autosleep_idle_seconds", 600) or 600)
+    autosleep_poll_seconds = int(getattr(settings, "autosleep_poll_seconds", 60) or 60)
     license_invite_default_ttl_seconds = int(getattr(settings, "license_invite_default_ttl_seconds", 7 * 24 * 60 * 60))
     license_audit_log_path = Path(
         getattr(settings, "license_audit_log_path", data_dir / "audit" / "license.log")
@@ -879,6 +882,131 @@ def create_app(
         except Exception as exc:  # pragma: no cover
             logging.getLogger(__name__).warning("failed to presign recordings download: %s", exc)
             return None
+
+    def _parse_iso8601_any(value: Any) -> Optional[datetime]:
+        if not isinstance(value, str) or not value:
+            return None
+        candidate = value
+        if candidate.endswith("Z"):
+            candidate = candidate[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(candidate)
+        except Exception:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
+    async def _autosleep_once() -> None:
+        if not autosleep_enabled:
+            return
+        logger = logging.getLogger(__name__)
+        now = datetime.now(timezone.utc)
+        session_idle_timeout = int(getattr(settings, "session_idle_timeout_seconds", 120) or 120)
+
+        active_orchestrators: set[str] = set()
+        last_activity: Dict[str, datetime] = {}
+
+        # Sessions
+        for _, session in session_store.iter_with_ids():
+            orch = session.get("orchestrator_id")
+            if not isinstance(orch, str) or not orch:
+                continue
+            seen = _parse_iso8601_any(session.get("last_seen_at") or session.get("updated_at") or session.get("started_at"))
+            if seen:
+                prev = last_activity.get(orch)
+                if prev is None or seen > prev:
+                    last_activity[orch] = seen
+            ended_at = session.get("ended_at")
+            if ended_at:
+                continue
+            if seen and (now - seen).total_seconds() <= session_idle_timeout:
+                active_orchestrators.add(orch)
+
+        # Activity leases
+        for _, lease in activity_leases.iter_with_ids():
+            orch = lease.get("orchestrator_id")
+            if not isinstance(orch, str) or not orch:
+                continue
+            seen_raw = lease.get("last_seen_at") or lease.get("issued_at")
+            seen = _parse_iso8601_any(seen_raw)
+            if seen is None and isinstance(seen_raw, str):
+                try:
+                    seen = parse_activity_iso8601(seen_raw)
+                except Exception:
+                    seen = None
+            if seen:
+                prev = last_activity.get(orch)
+                if prev is None or seen > prev:
+                    last_activity[orch] = seen
+
+            if lease.get("revoked_at"):
+                continue
+            expires_raw = lease.get("expires_at")
+            if isinstance(expires_raw, str) and expires_raw:
+                try:
+                    expires = parse_activity_iso8601(expires_raw)
+                except Exception:
+                    continue
+                if expires > now:
+                    active_orchestrators.add(orch)
+
+        # Fallback: registry last_seen timestamp.
+        for orch_id, record in registry.all_records().items():
+            if orch_id in last_activity:
+                continue
+            if not isinstance(record, dict):
+                continue
+            seen = _parse_iso8601_any(record.get("last_seen"))
+            if seen:
+                last_activity[orch_id] = seen
+
+        timeout = httpx.Timeout(5.0, connect=3.0)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            for orch_id in registry.all_records().keys():
+                if orch_id in active_orchestrators:
+                    continue
+                host = _orchestrator_public_host(orch_id)
+                if not host:
+                    continue
+                last = last_activity.get(orch_id)
+                if last and (now - last).total_seconds() < autosleep_idle_seconds:
+                    continue
+
+                power_url = f"http://{host}:9090/power"
+                try:
+                    state_resp = await client.get(power_url)
+                    if state_resp.status_code != 200:
+                        continue
+                    state = str(state_resp.json().get("state") or "")
+                    if state != "awake":
+                        continue
+                except Exception:
+                    continue
+
+                try:
+                    sleep_resp = await client.post(power_url, json={"action": "sleep", "reason": "payments_autosleep"})
+                    if 200 <= sleep_resp.status_code < 300:
+                        logger.info("autosleep: %s -> sleeping", orch_id)
+                except Exception:
+                    continue
+
+    async def _autosleep_loop() -> None:
+        logger = logging.getLogger(__name__)
+        if not autosleep_enabled:
+            return
+        logger.info("autosleep enabled: idle=%ss poll=%ss", autosleep_idle_seconds, autosleep_poll_seconds)
+        while True:
+            try:
+                await _autosleep_once()
+            except Exception as exc:  # pragma: no cover - best-effort background loop
+                logger.warning("autosleep loop error: %s", exc)
+            await asyncio.sleep(max(5, autosleep_poll_seconds))
+
+    @app.on_event("startup")
+    async def _startup_tasks() -> None:
+        if autosleep_enabled:
+            asyncio.create_task(_autosleep_loop())
 
     def log_license_event(event: str, payload: Dict[str, Any]) -> None:
         try:
