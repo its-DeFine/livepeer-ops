@@ -61,6 +61,7 @@ def build_settings(temp_paths, **overrides):
         manager_ip_allowlist=[],
         viewer_tokens=[],
         workloads_path=base_dir / "workloads.json",
+        jobs_path=base_dir / "jobs.json",
         workload_archive_base=base_dir / "recordings",
     )
     defaults.update(overrides)
@@ -647,7 +648,7 @@ async def test_session_events_credit_by_time_delta(temp_paths):
 
     t0 = datetime(2025, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
     t1 = t0 + timedelta(seconds=10)
-    times = [t0, t1]
+    times = [t0, t1, t1]
 
     class FakeDateTime:
         @classmethod
@@ -666,11 +667,13 @@ async def test_session_events_credit_by_time_delta(temp_paths):
         with patch("payments.api.datetime", FakeDateTime):
             start = await client.post("/api/sessions/events", json={**payload, "event": "start"})
             heartbeat = await client.post("/api/sessions/events", json={**payload, "event": "heartbeat"})
+            ended = await client.post("/api/sessions/events", json={**payload, "event": "end"})
 
     assert start.status_code == 200
     assert heartbeat.status_code == 200
+    assert ended.status_code == 200
     assert ledger.get_balance("orch-session") == Decimal("0.01")
-    body = heartbeat.json()
+    body = ended.json()
     assert body["billed_ms"] == 10_000
     assert body["billed_eth"] == "0.01"
 

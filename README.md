@@ -147,10 +147,11 @@ Audit log: `data/audit/license.log` (JSONL).
 Edges can report “session connected / heartbeat / disconnected” events to the Payments backend, so orchestrators are credited by **connected session time**.
 
 - Enable on Payments: set `PAYMENTS_SESSION_CREDIT_ETH_PER_MINUTE` (non-zero) and optionally require `PAYMENTS_SESSION_REPORTER_TOKEN`.
+- Configure session segmenting (default 40 minutes): `PAYMENTS_SESSION_SEGMENT_SECONDS=2400`.
 - Configure each edge `ps-gateway`: set `PAYMENTS_API_URL` and `PAYMENTS_SESSION_TOKEN` (must match `PAYMENTS_SESSION_REPORTER_TOKEN`).
 - Reporting endpoint: `POST /api/sessions/events`
 - Audit endpoint (viewer/admin token): `GET /api/sessions`
-- Ledger entries use `reason="session_time"` with `session_id`, `edge_id`, and `delta_ms` in metadata.
+- Ledger entries use `reason="session_time"` with `session_id`, `edge_id`, `segment_index`, `duration_ms`, and `proof_hash` in metadata (credits are emitted on session close or segment rollover).
 - Each session event also updates an **activity lease** (`lease_id="session:<session_id>"`) so autosleep watchers can treat sessions and content jobs uniformly via `GET /api/activity/leases?active_only=true`.
 
 ## Content Jobs (time-based workloads)
@@ -175,6 +176,27 @@ curl -sS -X POST \
   }' \
   "https://<payments>/api/workloads/time"
 ```
+
+## Recording Jobs (S3 artifacts)
+
+For API-driven recording workloads (runner → recorder → upload), configure an S3 bucket and use the job endpoint:
+
+- Configure on Payments:
+  - `PAYMENTS_RECORDINGS_BUCKET=<bucket>`
+  - `PAYMENTS_RECORDINGS_PREFIX=recordings` (default)
+  - `PAYMENTS_RECORDINGS_REGION=<optional>`
+  - `PAYMENTS_RECORDINGS_PRESIGN_SECONDS=3600` (default)
+- Start a job (admin token): `POST /api/jobs/record`
+- Get status (viewer/admin token): `GET /api/jobs/{job_id}`
+- Get a fresh download URL (viewer/admin token): `GET /api/recordings/presign?s3_uri=s3://...`
+
+## Autosleep (optional)
+
+If Payments can reach each orchestrator’s `/power` endpoint, it can automatically sleep idle stacks based on session + activity lease signals.
+
+- Enable: `PAYMENTS_AUTOSLEEP_ENABLED=1`
+- Idle threshold: `PAYMENTS_AUTOSLEEP_IDLE_SECONDS=600`
+- Poll interval: `PAYMENTS_AUTOSLEEP_POLL_SECONDS=60`
 
 ## Orchestrator stats (dashboard helpers)
 
