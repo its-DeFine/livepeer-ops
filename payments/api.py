@@ -1,17 +1,20 @@
 """HTTP API for orchestrator self-registration and admin visibility."""
 from __future__ import annotations
 
+import asyncio
 import base64
 import ipaddress
 import json
 import logging
+import re
 import threading
 import time
+import uuid
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Deque, Dict, List, Optional
+from typing import Any, Deque, Dict, List, Literal, Optional
 
 try:
     import boto3  # type: ignore
@@ -20,10 +23,12 @@ except Exception:  # pragma: no cover
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
+import httpx
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from .activity import ActivityLeaseStore, parse_iso8601 as parse_activity_iso8601
 from .config import PaymentSettings
+from .jobs import JobStore
 from .ledger import Ledger
 from .registry import Registry, RegistryError
 from .licenses import (
@@ -319,6 +324,55 @@ class WorkloadSummaryResponse(BaseModel):
     range_start: Optional[str]
     range_end: Optional[str]
     orchestrators: List[WorkloadSummaryItem]
+
+
+class RecordingPresignResponse(BaseModel):
+    s3_uri: str
+    url: str
+    expires_in: int
+
+
+class RecordingJobCreatePayload(BaseModel):
+    job_id: Optional[str] = Field(default=None, min_length=1, max_length=255)
+    orchestrator_id: str = Field(min_length=1, max_length=128)
+    plan_id: Optional[str] = Field(default=None, max_length=128)
+    run_id: Optional[str] = Field(default=None, max_length=256)
+    notes: Optional[str] = Field(default=None, max_length=1024)
+    script: Dict[str, Any] = Field(default_factory=dict, description="Raw vtuber-script-runner /scripts/execute payload (minus session_id)")
+    recording_label: Optional[str] = Field(default=None, max_length=128)
+    recording_streamer_id: Optional[str] = Field(default=None, max_length=128)
+    wake_seconds: Optional[int] = Field(default=2400, ge=0, le=60 * 60 * 24)
+    max_wait_seconds: int = Field(default=900, ge=30, le=60 * 60)
+    delete_after_upload: bool = Field(default=True)
+
+    @model_validator(mode="after")
+    def ensure_script(cls, values):  # type: ignore[override]
+        script = values.script
+        if not isinstance(script, dict) or not script:
+            raise ValueError("script payload required")
+        commands = script.get("commands")
+        if not isinstance(commands, list) or not commands:
+            raise ValueError("script.commands list required")
+        return values
+
+
+class RecordingJobRecord(BaseModel):
+    job_id: str
+    orchestrator_id: str
+    state: Literal["pending", "running", "completed", "failed"]
+    created_at: str
+    updated_at: str
+    started_at: Optional[str] = None
+    ended_at: Optional[str] = None
+    plan_id: Optional[str] = None
+    run_id: Optional[str] = None
+    notes: Optional[str] = None
+    workload_id: Optional[str] = None
+    duration_ms: Optional[int] = None
+    artifact_uri: Optional[str] = None
+    artifact_hash: Optional[str] = None
+    artifact_download_url: Optional[str] = None
+    error: Optional[str] = None
 
 
 class LedgerEvent(BaseModel):
@@ -665,6 +719,7 @@ def create_app(
     app = FastAPI(title="Embody Payments", version="1.0.0")
 
     workload_store = WorkloadStore(settings.workloads_path)
+    job_store = JobStore(settings.jobs_path)
     data_dir = Path(getattr(settings, "workloads_path", Path("/app/data/workloads.json"))).parent
     session_store = SessionStore(Path(getattr(settings, "sessions_path", data_dir / "sessions.json")))
     activity_leases = ActivityLeaseStore(
@@ -692,6 +747,10 @@ def create_app(
     license_artifact_presign_seconds = int(
         getattr(settings, "license_artifact_presign_seconds", license_lease_seconds)
     )
+    recordings_bucket = (getattr(settings, "recordings_bucket", None) or "").strip() or None
+    recordings_prefix = (getattr(settings, "recordings_prefix", "recordings") or "recordings").strip().strip("/")
+    recordings_region = getattr(settings, "recordings_region", None)
+    recordings_presign_seconds = int(getattr(settings, "recordings_presign_seconds", 3600) or 3600)
     license_invite_default_ttl_seconds = int(getattr(settings, "license_invite_default_ttl_seconds", 7 * 24 * 60 * 60))
     license_audit_log_path = Path(
         getattr(settings, "license_audit_log_path", data_dir / "audit" / "license.log")
@@ -739,6 +798,31 @@ def create_app(
         client_host = request.client.host if request.client else None
         return normalize_ip(client_host)
 
+    def _sanitize_s3_segment(raw: str) -> str:
+        cleaned = re.sub(r"[^a-zA-Z0-9._-]+", "-", (raw or "").strip())
+        cleaned = cleaned.strip("-")
+        return cleaned or "unknown"
+
+    def _orchestrator_public_host(orchestrator_id: str) -> Optional[str]:
+        record = registry.get_record(orchestrator_id) or {}
+        health_url = record.get("health_url")
+        if isinstance(health_url, str) and health_url:
+            try:
+                from urllib.parse import urlparse
+
+                parsed = urlparse(health_url)
+                if parsed.hostname:
+                    return parsed.hostname
+            except Exception:
+                pass
+        host_public_ip = record.get("host_public_ip")
+        if isinstance(host_public_ip, str) and host_public_ip:
+            return host_public_ip
+        last_seen_ip = record.get("last_seen_ip")
+        if isinstance(last_seen_ip, str) and last_seen_ip:
+            return last_seen_ip
+        return None
+
     def presign_artifact_url(image_ref: str, image: Dict[str, Any]) -> Optional[str]:
         artifact_s3_uri = image.get("artifact_s3_uri")
         if not artifact_s3_uri:
@@ -760,6 +844,40 @@ def create_app(
             )
         except Exception as exc:  # pragma: no cover
             logging.getLogger(__name__).warning("failed to presign artifact for %s: %s", image_ref, exc)
+            return None
+
+    def presign_recording_upload_url(bucket: str, key: str) -> Optional[str]:
+        if boto3 is None:
+            logging.getLogger(__name__).warning("boto3 unavailable; cannot presign recordings upload")
+            return None
+        try:
+            client = boto3.client("s3", region_name=recordings_region)
+            return client.generate_presigned_url(
+                "put_object",
+                Params={"Bucket": bucket, "Key": key},
+                ExpiresIn=recordings_presign_seconds,
+            )
+        except Exception as exc:  # pragma: no cover
+            logging.getLogger(__name__).warning("failed to presign recordings upload: %s", exc)
+            return None
+
+    def presign_recording_download_url(s3_uri: str) -> Optional[str]:
+        if boto3 is None:
+            logging.getLogger(__name__).warning("boto3 unavailable; cannot presign recordings download")
+            return None
+        try:
+            bucket, key = parse_s3_uri(s3_uri)
+        except ValueError:
+            return None
+        try:
+            client = boto3.client("s3", region_name=recordings_region)
+            return client.generate_presigned_url(
+                "get_object",
+                Params={"Bucket": bucket, "Key": key},
+                ExpiresIn=recordings_presign_seconds,
+            )
+        except Exception as exc:  # pragma: no cover
+            logging.getLogger(__name__).warning("failed to presign recordings download: %s", exc)
             return None
 
     def log_license_event(event: str, payload: Dict[str, Any]) -> None:
@@ -1740,6 +1858,382 @@ def create_app(
         )
 
     # ======================================================
+    # RECORDINGS (S3 presigned URLs) + JOBS (API workloads)
+    # ======================================================
+
+    def _job_to_model(record: Dict[str, Any]) -> RecordingJobRecord:
+        artifact_uri = record.get("artifact_uri")
+        download_url: Optional[str] = None
+        if isinstance(artifact_uri, str) and artifact_uri.startswith("s3://"):
+            download_url = presign_recording_download_url(artifact_uri)
+        return RecordingJobRecord(
+            job_id=str(record.get("job_id") or ""),
+            orchestrator_id=str(record.get("orchestrator_id") or ""),
+            state=str(record.get("state") or "pending"),
+            created_at=str(record.get("created_at") or ""),
+            updated_at=str(record.get("updated_at") or ""),
+            started_at=record.get("started_at"),
+            ended_at=record.get("ended_at"),
+            plan_id=record.get("plan_id"),
+            run_id=record.get("run_id"),
+            notes=record.get("notes"),
+            workload_id=record.get("workload_id"),
+            duration_ms=record.get("duration_ms"),
+            artifact_uri=artifact_uri if isinstance(artifact_uri, str) else None,
+            artifact_hash=record.get("artifact_hash"),
+            artifact_download_url=download_url,
+            error=record.get("error"),
+        )
+
+    @app.get("/api/recordings/presign", response_model=RecordingPresignResponse)
+    async def presign_recording_download(
+        s3_uri: str = Query(min_length=3, max_length=1024),
+        _: Any = Depends(require_view_access),
+    ) -> RecordingPresignResponse:
+        if not s3_uri.startswith("s3://"):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Expected s3:// URI")
+        url = presign_recording_download_url(s3_uri)
+        if not url:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unable to presign URL")
+        return RecordingPresignResponse(s3_uri=s3_uri, url=url, expires_in=recordings_presign_seconds)
+
+    async def _run_record_job(job_id: str, payload: RecordingJobCreatePayload, *, requester_ip: Optional[str]) -> None:
+        logger = logging.getLogger(__name__)
+        lease_id = f"job:{job_id}"
+        orch_id = payload.orchestrator_id
+        host = _orchestrator_public_host(orch_id)
+        if not host:
+            job_store.update(
+                job_id,
+                {
+                    "state": "failed",
+                    "error": "orchestrator host missing from registry",
+                    "ended_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                },
+            )
+            return
+
+        power_url = f"http://{host}:9090/power"
+        runner_health = f"http://{host}:9877/health"
+        runner_execute = f"http://{host}:9877/scripts/execute"
+        recorder_root = f"http://{host}:8889/"
+        recorder_start = f"http://{host}:8889/recordings/start"
+        recorder_stop = f"http://{host}:8889/recordings/stop"
+
+        started_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        job_store.update(job_id, {"state": "running", "started_at": started_iso})
+        try:
+            try:
+                activity_leases.upsert(
+                    lease_id=lease_id,
+                    orchestrator_id=orch_id,
+                    upstream_addr=host,
+                    kind="job",
+                    client_ip=requester_ip,
+                    lease_seconds=_resolve_activity_lease_seconds(None),
+                    metadata={"job_id": job_id},
+                )
+            except Exception:
+                pass
+
+            job_start = time.time()
+            label = payload.recording_label or f"job_{job_id[:12]}"
+            label = _sanitize_s3_segment(label)[:64]
+            session_id = f"job_{job_id[:12]}_{int(job_start)}"
+
+            async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=5.0)) as client:
+                rec_filename: Optional[str] = None
+                try:
+                    wake_payload: Dict[str, Any] = {"action": "wake", "reason": "job"}
+                    if payload.wake_seconds is not None:
+                        wake_payload["awake_seconds"] = int(payload.wake_seconds)
+                    wake_resp = await client.post(power_url, json=wake_payload)
+                    wake_resp.raise_for_status()
+
+                    # Wait for runner + recorder endpoints to come up after wake.
+                    for _ in range(60):
+                        try:
+                            resp = await client.get(runner_health)
+                            if resp.status_code == 200:
+                                break
+                        except Exception:
+                            pass
+                        await asyncio.sleep(2)
+
+                    for _ in range(60):
+                        try:
+                            resp = await client.get(recorder_root)
+                            if resp.status_code == 200:
+                                break
+                        except Exception:
+                            pass
+                        await asyncio.sleep(2)
+
+                    start_payload: Dict[str, Any] = {"label": label}
+                    if payload.recording_streamer_id:
+                        start_payload["streamer_id"] = payload.recording_streamer_id
+                    start_resp = await client.post(recorder_start, json=start_payload)
+                    start_resp.raise_for_status()
+                    start_body = start_resp.json()
+                    output_path = str(start_body.get("output") or "")
+                    rec_filename = output_path.rsplit("/", 1)[-1] if output_path else None
+                    if not rec_filename:
+                        raise RuntimeError("recorder did not return output filename")
+
+                    runner_payload = dict(payload.script)
+                    runner_payload["session_id"] = session_id
+                    exec_resp = await client.post(runner_execute, json=runner_payload)
+                    exec_resp.raise_for_status()
+
+                    status_url = f"http://{host}:9877/scripts/{session_id}"
+                    deadline = time.monotonic() + float(payload.max_wait_seconds)
+                    final_state = ""
+                    while time.monotonic() < deadline:
+                        try:
+                            status_resp = await client.get(status_url)
+                            if status_resp.status_code == 200:
+                                state = str(status_resp.json().get("state") or "").strip()
+                                if state in {"completed", "failed"}:
+                                    final_state = state
+                                    break
+                        except Exception:
+                            pass
+                        await asyncio.sleep(1)
+
+                    if final_state != "completed":
+                        raise RuntimeError(f"runner did not complete (state={final_state or 'unknown'})")
+
+                except Exception as exc:  # noqa: BLE001
+                    # best-effort stop recorder if we started it
+                    try:
+                        await client.post(recorder_stop)
+                    except Exception:
+                        pass
+                    logger.warning("record job %s failed: %s", job_id, exc)
+                    job_store.update(
+                        job_id,
+                        {
+                            "state": "failed",
+                            "error": str(exc),
+                            "ended_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                        },
+                    )
+                    return
+
+                # Stop recorder (best-effort) and upload to S3.
+                try:
+                    await client.post(recorder_stop)
+                except Exception:
+                    pass
+
+                if not recordings_bucket:
+                    job_store.update(
+                        job_id,
+                        {
+                            "state": "failed",
+                            "error": "PAYMENTS_RECORDINGS_BUCKET is unset",
+                            "ended_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                        },
+                    )
+                    return
+                if boto3 is None:
+                    job_store.update(
+                        job_id,
+                        {
+                            "state": "failed",
+                            "error": "boto3 unavailable; cannot presign recordings",
+                            "ended_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                        },
+                    )
+                    return
+                if not rec_filename:
+                    job_store.update(
+                        job_id,
+                        {
+                            "state": "failed",
+                            "error": "recording filename missing",
+                            "ended_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                        },
+                    )
+                    return
+
+                key = "/".join(
+                    [
+                        segment
+                        for segment in [
+                            recordings_prefix or "recordings",
+                            _sanitize_s3_segment(orch_id),
+                            _sanitize_s3_segment(job_id),
+                            _sanitize_s3_segment(rec_filename),
+                        ]
+                        if segment
+                    ]
+                )
+                s3_uri = f"s3://{recordings_bucket}/{key}"
+                upload_url = presign_recording_upload_url(recordings_bucket, key)
+                if not upload_url:
+                    job_store.update(
+                        job_id,
+                        {
+                            "state": "failed",
+                            "error": "failed to presign upload URL",
+                            "ended_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                        },
+                    )
+                    return
+
+                upload_endpoint = f"http://{host}:8889/recordings/{rec_filename}/upload"
+                uploaded = None
+                for _ in range(90):
+                    try:
+                        up_resp = await client.post(
+                            upload_endpoint,
+                            json={"upload_url": upload_url, "delete_after": bool(payload.delete_after_upload)},
+                        )
+                        if up_resp.status_code == 200:
+                            uploaded = up_resp.json()
+                            break
+                    except Exception:
+                        pass
+                    await asyncio.sleep(1)
+
+                if not isinstance(uploaded, dict):
+                    job_store.update(
+                        job_id,
+                        {
+                            "state": "failed",
+                            "error": "upload did not complete",
+                            "ended_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                        },
+                    )
+                    return
+
+                artifact_hash = str(uploaded.get("sha256") or "")
+                duration_ms = int(max(0.0, (time.time() - job_start) * 1000.0))
+
+                # Credit orchestrator by duration and persist a workload record.
+                credit_rate = getattr(settings, "workload_time_credit_eth_per_minute", Decimal("0"))
+                amount = (Decimal(duration_ms) * Decimal(credit_rate)) / Decimal(60_000)
+                workload_id = f"job:{job_id}"
+                record = {
+                    "orchestrator_id": orch_id,
+                    "plan_id": payload.plan_id,
+                    "run_id": payload.run_id,
+                    "artifact_hash": artifact_hash or None,
+                    "artifact_uri": s3_uri,
+                    "payout_amount_eth": str(amount),
+                    "notes": payload.notes,
+                    "tx_hash": None,
+                    "status": "verified",
+                    "credited": False,
+                    "credited_at": None,
+                    "pricing": {
+                        "kind": "workload_time",
+                        "duration_ms": duration_ms,
+                        "credit_eth_per_minute": str(credit_rate),
+                        "computed_at": datetime.utcnow().isoformat() + "Z",
+                    },
+                }
+                if workload_store.get(workload_id):
+                    job_store.update(
+                        job_id,
+                        {
+                            "state": "failed",
+                            "error": "workload_id already exists; refusing to double-credit",
+                            "ended_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                        },
+                    )
+                    return
+
+                workload_store.upsert(workload_id, record)
+                if amount > 0:
+                    ledger.credit(
+                        orch_id,
+                        amount,
+                        reason="workload_time",
+                        metadata={
+                            "workload_id": workload_id,
+                            "job_id": job_id,
+                            "plan_id": payload.plan_id,
+                            "run_id": payload.run_id,
+                            "status": "verified",
+                            "artifact_uri": s3_uri,
+                            "artifact_hash": artifact_hash,
+                            "duration_ms": str(duration_ms),
+                            "credit_eth_per_minute": str(credit_rate),
+                        },
+                    )
+                    credited_at = datetime.utcnow().isoformat() + "Z"
+                    workload_store.update(workload_id, {"credited": True, "credited_at": credited_at})
+
+                ended_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+                job_store.update(
+                    job_id,
+                    {
+                        "state": "completed",
+                        "ended_at": ended_iso,
+                        "workload_id": workload_id,
+                        "duration_ms": duration_ms,
+                        "artifact_uri": s3_uri,
+                        "artifact_hash": artifact_hash,
+                    },
+                )
+        finally:
+            try:
+                activity_leases.revoke(lease_id)
+            except Exception:
+                pass
+
+    @app.post("/api/jobs/record", response_model=RecordingJobRecord)
+    async def create_recording_job(
+        payload: RecordingJobCreatePayload,
+        request: Request,
+        _: Any = Depends(require_admin),
+    ) -> RecordingJobRecord:
+        _ensure_orchestrator_exists(payload.orchestrator_id)
+        job_id = payload.job_id or uuid.uuid4().hex
+
+        for _, record in job_store.iter_with_ids():
+            if record.get("orchestrator_id") != payload.orchestrator_id:
+                continue
+            if record.get("state") in {"pending", "running"}:
+                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Orchestrator already has an active job")
+
+        if job_store.get(job_id):
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Job already exists")
+
+        record = {
+            "job_id": job_id,
+            "orchestrator_id": payload.orchestrator_id,
+            "state": "pending",
+            "created_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "updated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "plan_id": payload.plan_id,
+            "run_id": payload.run_id,
+            "notes": payload.notes,
+            "workload_id": None,
+            "duration_ms": None,
+            "artifact_uri": None,
+            "artifact_hash": None,
+            "error": None,
+        }
+        try:
+            job_store.create(job_id, record)
+        except KeyError:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Job already exists")
+
+        asyncio.create_task(_run_record_job(job_id, payload, requester_ip=request_ip(request)))
+        created = job_store.get(job_id) or record
+        return _job_to_model(created)
+
+    @app.get("/api/jobs/{job_id}", response_model=RecordingJobRecord)
+    async def get_job(job_id: str, _: Any = Depends(require_view_access)) -> RecordingJobRecord:
+        record = job_store.get(job_id)
+        if record is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+        return _job_to_model(record)
+
+    # ======================================================
     # ACTIVITY LEASES (autosleep/autostop guard for content jobs)
     # ======================================================
 
@@ -1929,6 +2423,7 @@ def create_app(
                 pass
 
         credit_rate = Decimal(str(getattr(settings, "session_credit_eth_per_minute", "0") or "0"))
+        segment_seconds = int(getattr(settings, "session_segment_seconds", 2400) or 2400)
         stored = session_store.apply_event(
             session_id=payload.session_id,
             event=payload.event,
@@ -1937,6 +2432,7 @@ def create_app(
             upstream_addr=payload.upstream_addr,
             upstream_port=payload.upstream_port,
             edge_id=payload.edge_id,
+            segment_seconds=segment_seconds,
             credit_eth_per_minute=credit_rate,
             ledger=ledger,
         )

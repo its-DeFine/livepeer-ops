@@ -210,6 +210,10 @@ class PaymentSettings(BaseSettings):
         default=Path("/app/data/workloads.json"),
         validation_alias="PAYMENTS_WORKLOADS_PATH",
     )
+    jobs_path: Path = Field(
+        default=Path("/app/data/jobs.json"),
+        validation_alias="PAYMENTS_JOBS_PATH",
+    )
     sessions_path: Path = Field(
         default=Path("/app/data/sessions.json"),
         validation_alias="PAYMENTS_SESSIONS_PATH",
@@ -233,6 +237,10 @@ class PaymentSettings(BaseSettings):
     session_credit_eth_per_minute: Decimal = Field(
         default=Decimal("0"),
         validation_alias="PAYMENTS_SESSION_CREDIT_ETH_PER_MINUTE",
+    )
+    session_segment_seconds: int = Field(
+        default=2400,
+        validation_alias="PAYMENTS_SESSION_SEGMENT_SECONDS",
     )
     workload_time_credit_eth_per_minute: Decimal = Field(
         default=Decimal("0.000005353596"),
@@ -279,6 +287,22 @@ class PaymentSettings(BaseSettings):
     license_artifact_presign_seconds: int = Field(
         default=900,
         validation_alias="PAYMENTS_LICENSE_ARTIFACT_PRESIGN_SECONDS",
+    )
+    recordings_bucket: Optional[str] = Field(
+        default=None,
+        validation_alias="PAYMENTS_RECORDINGS_BUCKET",
+    )
+    recordings_prefix: str = Field(
+        default="recordings",
+        validation_alias="PAYMENTS_RECORDINGS_PREFIX",
+    )
+    recordings_region: Optional[str] = Field(
+        default=None,
+        validation_alias="PAYMENTS_RECORDINGS_REGION",
+    )
+    recordings_presign_seconds: int = Field(
+        default=3600,
+        validation_alias="PAYMENTS_RECORDINGS_PRESIGN_SECONDS",
     )
     license_invite_default_ttl_seconds: int = Field(
         default=7 * 24 * 60 * 60,
@@ -348,6 +372,9 @@ class PaymentSettings(BaseSettings):
         "top_cache_ttl_seconds",
         "license_lease_seconds",
         "license_invite_default_ttl_seconds",
+        "license_artifact_presign_seconds",
+        "recordings_presign_seconds",
+        "session_segment_seconds",
     )
     def validate_positive_int(cls, value: int) -> int:
         if value <= 0:

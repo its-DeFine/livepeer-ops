@@ -58,6 +58,7 @@ def build_settings(temp_paths, **overrides):
         manager_ip_allowlist=[],
         viewer_tokens=[],
         workloads_path=base_dir / "workloads.json",
+        jobs_path=base_dir / "jobs.json",
         workload_archive_base=base_dir / "recordings",
         license_lease_seconds=60,
     )
