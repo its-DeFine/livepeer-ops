@@ -99,6 +99,15 @@ class PaymentSettings(BaseSettings):
         default=None,
         validation_alias="PAYMENTS_TEE_CORE_CREDIT_SIGNER_PRIVATE_KEY",
     )
+    tee_core_authority: bool = Field(
+        default=False,
+        validation_alias="PAYMENTS_TEE_CORE_AUTHORITY",
+        description="When true, the TEE core is the source of truth for balances and receives credits directly (no host-ledger syncing).",
+    )
+    tee_core_transparency_log_path: Path = Field(
+        default=Path("/app/data/audit/tee-core-transparency.log"),
+        validation_alias="PAYMENTS_TEE_CORE_TRANSPARENCY_LOG_PATH",
+    )
 
     payment_dry_run: bool = Field(default=True, validation_alias="PAYMENT_DRY_RUN")
     payout_strategy: str = Field(default="eth_transfer", validation_alias="PAYMENTS_PAYOUT_STRATEGY")

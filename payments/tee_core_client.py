@@ -133,6 +133,7 @@ class TeeCoreClient:
         amount_wei: int,
         event_id: str,
         signature: Optional[str] = None,
+        reason: Optional[str] = None,
         metadata: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
         params: dict[str, Any] = {
@@ -143,12 +144,48 @@ class TeeCoreClient:
         }
         if signature:
             params["signature"] = signature
+        if reason:
+            params["reason"] = reason
         if metadata:
             params["metadata"] = metadata
         return self._rpc("credit", params)
 
+    def apply_delta(
+        self,
+        *,
+        orchestrator_id: str,
+        recipient: str,
+        delta_wei: int,
+        event_id: str,
+        signature: Optional[str] = None,
+        reason: Optional[str] = None,
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {
+            "orchestrator_id": orchestrator_id,
+            "recipient": recipient,
+            "delta_wei": int(delta_wei),
+            "event_id": event_id,
+        }
+        if signature:
+            params["signature"] = signature
+        if reason:
+            params["reason"] = reason
+        if metadata:
+            params["metadata"] = metadata
+        return self._rpc("apply_delta", params)
+
     def balance(self, orchestrator_id: str) -> dict[str, Any]:
         return self._rpc("balance", {"orchestrator_id": orchestrator_id})
+
+    def audit_status(self) -> dict[str, Any]:
+        return self._rpc("audit_status")
+
+    def audit_checkpoint(self, *, chain_id: int, contract_address: Optional[str] = None) -> dict[str, Any]:
+        params: dict[str, Any] = {"chain_id": int(chain_id)}
+        if contract_address:
+            params["contract_address"] = contract_address
+        return self._rpc("audit_checkpoint", params)
 
     def livepeer_prepare_redeem_tx(
         self,

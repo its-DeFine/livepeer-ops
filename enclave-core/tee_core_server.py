@@ -11,6 +11,7 @@ import socket
 import struct
 import subprocess
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Optional
 from urllib.parse import urlparse
 
@@ -33,6 +34,7 @@ REDEEM_WINNING_TICKET_SELECTOR = bytes.fromhex("ec8b3cb6")
 BATCH_REDEEM_WINNING_TICKETS_SELECTOR = bytes.fromhex("d01b808e")
 
 MAX_UINT256 = (1 << 256) - 1
+SECP256K1_N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
 
 
 def recv_exact(sock: socket.socket, size: int) -> bytes:
@@ -283,6 +285,13 @@ def _derive_state_key(private_key_hex: str) -> bytes:
     return keccak(raw)
 
 
+def _derive_audit_private_key(private_key_hex: str) -> str:
+    raw = bytes.fromhex(private_key_hex[2:] if private_key_hex.startswith("0x") else private_key_hex)
+    seed = keccak(raw + b"payments-tee-core:audit:v1")
+    scalar = (int.from_bytes(seed, "big") % (SECP256K1_N - 1)) + 1
+    return "0x" + scalar.to_bytes(32, "big").hex()
+
+
 def _encrypt_state(private_key_hex: str, payload: dict[str, Any]) -> str:
     if AESGCM is None:  # pragma: no cover - host unit tests
         raise RuntimeError("cryptography is required for state sealing")
@@ -308,6 +317,14 @@ def _decrypt_state(private_key_hex: str, blob_b64: str) -> dict[str, Any]:
     if not isinstance(parsed, dict):
         raise RuntimeError("state blob must decode to an object")
     return parsed
+
+
+def _utcnow_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _canonical_json_bytes(payload: dict[str, Any]) -> bytes:
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
 
 def _ticket_hash(ticket: tuple[Any, ...]) -> bytes:
@@ -341,6 +358,15 @@ class TeeCoreState:
     balances: dict[str, TeeCoreBalances] = field(default_factory=dict)
     pending: dict[str, dict[str, Any]] = field(default_factory=dict)
     seen_event_ids: set[str] = field(default_factory=set)
+    audit_seq: int = 0
+    audit_head_hash: str = "0x" + ("00" * 32)
+    _audit_account: Any = field(default=None, repr=False, compare=False)
+
+    @property
+    def audit_account(self) -> Any:
+        if self._audit_account is None:
+            self._audit_account = Account.from_key(_derive_audit_private_key(self.private_key_hex))
+        return self._audit_account
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -352,6 +378,8 @@ class TeeCoreState:
             },
             "pending": dict(self.pending),
             "seen_event_ids": sorted(self.seen_event_ids),
+            "audit_seq": int(self.audit_seq),
+            "audit_head_hash": str(self.audit_head_hash or ""),
         }
 
     def load_payload(self, payload: dict[str, Any]) -> None:
@@ -380,6 +408,18 @@ class TeeCoreState:
         if isinstance(seen_raw, list):
             self.seen_event_ids = {str(item) for item in seen_raw if str(item)}
 
+        audit_seq = payload.get("audit_seq")
+        try:
+            self.audit_seq = max(int(audit_seq or 0), 0)
+        except Exception:
+            self.audit_seq = 0
+
+        audit_head_hash = payload.get("audit_head_hash")
+        if isinstance(audit_head_hash, str) and audit_head_hash.startswith("0x") and len(audit_head_hash) == 66:
+            self.audit_head_hash = audit_head_hash.lower()
+        else:
+            self.audit_head_hash = "0x" + ("00" * 32)
+
 
 def _credit_message_hash(*, orchestrator_id: str, recipient: str, amount_wei: int, event_id: str) -> bytes:
     orch_hash = keccak(text=orchestrator_id)
@@ -387,6 +427,16 @@ def _credit_message_hash(*, orchestrator_id: str, recipient: str, amount_wei: in
     packed = encode_packed(
         ["string", "bytes32", "address", "uint256", "bytes32"],
         ["payments-tee-core:credit:v1", orch_hash, to_checksum_address(recipient), int(amount_wei), event_hash],
+    )
+    return keccak(packed)
+
+
+def _delta_message_hash(*, orchestrator_id: str, recipient: str, delta_wei: int, event_id: str) -> bytes:
+    orch_hash = keccak(text=orchestrator_id)
+    event_hash = keccak(text=event_id)
+    packed = encode_packed(
+        ["string", "bytes32", "address", "int256", "bytes32"],
+        ["payments-tee-core:delta:v1", orch_hash, to_checksum_address(recipient), int(delta_wei), event_hash],
     )
     return keccak(packed)
 
@@ -418,6 +468,104 @@ def _verify_credit_signature(
         raise RuntimeError("credit signature signer mismatch")
 
 
+def _verify_delta_signature(
+    *,
+    signature_hex: str,
+    expected_signer: str,
+    orchestrator_id: str,
+    recipient: str,
+    delta_wei: int,
+    event_id: str,
+) -> None:
+    raw = signature_hex.strip()
+    if not raw.startswith("0x"):
+        raise RuntimeError("signature must be 0x-prefixed hex")
+    try:
+        sig_bytes = bytes.fromhex(raw[2:])
+    except ValueError as exc:
+        raise RuntimeError("signature must be hex") from exc
+    msg_hash = _delta_message_hash(
+        orchestrator_id=orchestrator_id,
+        recipient=recipient,
+        delta_wei=delta_wei,
+        event_id=event_id,
+    )
+    recovered = Account.recover_message(encode_defunct(primitive=msg_hash), signature=sig_bytes)
+    if recovered.lower() != expected_signer.lower():
+        raise RuntimeError("delta signature signer mismatch")
+
+
+def _append_audit_entry(
+    core: TeeCoreState,
+    *,
+    kind: str,
+    orchestrator_id: str,
+    recipient: str,
+    delta_wei: int,
+    balance_wei: int,
+    event_id: str,
+    reason: Optional[str],
+    metadata: Optional[dict[str, Any]],
+) -> dict[str, Any]:
+    seq = int(core.audit_seq) + 1
+    prev_hash = str(core.audit_head_hash or "")
+    if not prev_hash.startswith("0x") or len(prev_hash) != 66:
+        prev_hash = "0x" + ("00" * 32)
+
+    payload: dict[str, Any] = {
+        "schema": "payments-tee-core:audit:v1",
+        "seq": seq,
+        "prev_hash": prev_hash,
+        "timestamp": _utcnow_iso(),
+        "kind": str(kind),
+        "event_id": str(event_id),
+        "orchestrator_id": str(orchestrator_id),
+        "recipient": str(recipient).lower(),
+        "delta_wei": str(int(delta_wei)),
+        "balance_wei": str(int(balance_wei)),
+    }
+    if reason:
+        payload["reason"] = str(reason)
+    if metadata:
+        payload["metadata"] = metadata
+
+    entry_hash_bytes = keccak(_canonical_json_bytes(payload))
+    entry_hash = "0x" + entry_hash_bytes.hex()
+    signed = core.audit_account.sign_message(encode_defunct(primitive=entry_hash_bytes))
+    signature = "0x" + bytes(signed.signature).hex()
+
+    entry = dict(payload)
+    entry["entry_hash"] = entry_hash
+    entry["signer"] = core.audit_account.address.lower()
+    entry["signature"] = signature
+
+    core.audit_seq = seq
+    core.audit_head_hash = entry_hash
+    return entry
+
+
+def _checkpoint_message_hash(
+    *,
+    audit_signer: str,
+    seq: int,
+    head_hash: str,
+    chain_id: int,
+    contract_address: str,
+) -> bytes:
+    packed = encode_packed(
+        ["string", "address", "uint256", "bytes32", "uint256", "address"],
+        [
+            "payments-tee-core:checkpoint:v1",
+            to_checksum_address(audit_signer),
+            int(seq),
+            bytes.fromhex(head_hash[2:]),
+            int(chain_id),
+            to_checksum_address(contract_address),
+        ],
+    )
+    return keccak(packed)
+
+
 def handle_request(request: dict[str, Any], *, state: dict[str, Any]) -> dict[str, Any]:
     method = request.get("method")
     params = request.get("params") if isinstance(request.get("params"), dict) else {}
@@ -427,6 +575,7 @@ def handle_request(request: dict[str, Any], *, state: dict[str, Any]) -> dict[st
     if method == "status":
         if core is None:
             return {"result": {"provisioned": False, "attestation_available": bool(_load_nsm())}}
+        audit_address = core.audit_account.address.lower()
         return {
             "result": {
                 "provisioned": True,
@@ -434,6 +583,9 @@ def handle_request(request: dict[str, Any], *, state: dict[str, Any]) -> dict[st
                 "attestation_available": bool(_nsm_get_attestation_doc(nonce=None, user_data=b"payments-tee-core")),
                 "balances": len(core.balances),
                 "pending": len(core.pending),
+                "audit_address": audit_address,
+                "audit_seq": int(core.audit_seq),
+                "audit_head_hash": str(core.audit_head_hash),
             }
         }
 
@@ -451,7 +603,8 @@ def handle_request(request: dict[str, Any], *, state: dict[str, Any]) -> dict[st
 
         user_data = b"payments-tee-core:unprovisioned"
         if core is not None:
-            user_data = f"payments-tee-core:{core.account.address.lower()}".encode("utf-8")
+            audit_address = core.audit_account.address.lower()
+            user_data = f"payments-tee-core:{core.account.address.lower()}:audit:{audit_address}".encode("utf-8")
 
         try:
             doc = _nsm_get_attestation_doc(nonce=nonce, user_data=user_data)
@@ -465,6 +618,51 @@ def handle_request(request: dict[str, Any], *, state: dict[str, Any]) -> dict[st
         if core is None:
             return error("TEE core not provisioned")
         return {"result": {"address": core.account.address}}
+
+    if method == "audit_status":
+        if core is None:
+            return error("TEE core not provisioned")
+        return {
+            "result": {
+                "audit_address": core.audit_account.address.lower(),
+                "audit_seq": int(core.audit_seq),
+                "audit_head_hash": str(core.audit_head_hash),
+            }
+        }
+
+    if method == "audit_checkpoint":
+        if core is None:
+            return error("TEE core not provisioned")
+        chain_id = int(params.get("chain_id") or 0)
+        if chain_id <= 0:
+            return error("chain_id required")
+        contract_address = str(params.get("contract_address") or "").strip() or "0x" + ("00" * 20)
+        if not contract_address.startswith("0x") or len(contract_address) != 42:
+            return error("contract_address must be a 0x address")
+
+        seq = int(core.audit_seq)
+        head_hash = str(core.audit_head_hash)
+        msg_hash = _checkpoint_message_hash(
+            audit_signer=core.audit_account.address,
+            seq=seq,
+            head_hash=head_hash,
+            chain_id=chain_id,
+            contract_address=contract_address,
+        )
+        signed = core.audit_account.sign_message(encode_defunct(primitive=msg_hash))
+        return {
+            "result": {
+                "schema": "payments-tee-core:checkpoint:v1",
+                "audit_address": core.audit_account.address.lower(),
+                "chain_id": int(chain_id),
+                "contract_address": contract_address.lower(),
+                "seq": int(seq),
+                "head_hash": head_hash,
+                "message_hash": "0x" + msg_hash.hex(),
+                "signature": "0x" + bytes(signed.signature).hex(),
+                "timestamp": _utcnow_iso(),
+            }
+        }
 
     if method == "generate":
         if core is not None and not os.environ.get("SIGNER_ALLOW_REPROVISION", "").strip():
@@ -510,6 +708,8 @@ def handle_request(request: dict[str, Any], *, state: dict[str, Any]) -> dict[st
             balances={},
             pending={},
             seen_event_ids=set(),
+            audit_seq=0,
+            audit_head_hash="0x" + ("00" * 32),
         )
         state["core"] = core
         return {
@@ -565,6 +765,8 @@ def handle_request(request: dict[str, Any], *, state: dict[str, Any]) -> dict[st
             balances={},
             pending={},
             seen_event_ids=set(),
+            audit_seq=0,
+            audit_head_hash="0x" + ("00" * 32),
         )
         state["core"] = core
         return {"result": {"address": account.address}}
@@ -602,6 +804,8 @@ def handle_request(request: dict[str, Any], *, state: dict[str, Any]) -> dict[st
         event_id = str(params.get("event_id") or "").strip()
         if not event_id:
             return error("event_id required")
+        reason = str(params.get("reason") or "").strip() or None
+        metadata = params.get("metadata") if isinstance(params.get("metadata"), dict) else None
 
         if core.require_credit_signature:
             if not core.credit_reporter:
@@ -641,12 +845,105 @@ def handle_request(request: dict[str, Any], *, state: dict[str, Any]) -> dict[st
             return error(f"recipient mismatch for {orchestrator_id}: {entry.recipient} != {recipient}")
 
         entry.balance_wei = int(entry.balance_wei) + amount_wei
+        audit_entry = _append_audit_entry(
+            core,
+            kind="credit",
+            orchestrator_id=orchestrator_id,
+            recipient=entry.recipient,
+            delta_wei=amount_wei,
+            balance_wei=int(entry.balance_wei),
+            event_id=event_id,
+            reason=reason or "credit",
+            metadata=metadata,
+        )
         return {
             "result": {
                 "orchestrator_id": orchestrator_id,
                 "recipient": entry.recipient,
                 "balance_wei": int(entry.balance_wei),
                 "idempotent": False,
+                "audit_entry": audit_entry,
+            }
+        }
+
+    if method == "apply_delta":
+        if core is None:
+            return error("TEE core not provisioned")
+
+        orchestrator_id = str(params.get("orchestrator_id") or "").strip()
+        if not orchestrator_id:
+            return error("orchestrator_id required")
+        recipient = _normalize_address(params.get("recipient"), field="recipient")
+        delta_wei = int(params.get("delta_wei") or 0)
+        if delta_wei == 0:
+            return error("delta_wei must be non-zero")
+        event_id = str(params.get("event_id") or "").strip()
+        if not event_id:
+            return error("event_id required")
+        reason = str(params.get("reason") or "").strip() or None
+        metadata = params.get("metadata") if isinstance(params.get("metadata"), dict) else None
+
+        if core.require_credit_signature:
+            if not core.credit_reporter:
+                return error("credit reporter is not configured")
+            signature = str(params.get("signature") or "").strip()
+            if not signature:
+                return error("signature required")
+            try:
+                _verify_delta_signature(
+                    signature_hex=signature,
+                    expected_signer=core.credit_reporter,
+                    orchestrator_id=orchestrator_id,
+                    recipient=recipient,
+                    delta_wei=delta_wei,
+                    event_id=event_id,
+                )
+            except Exception as exc:
+                return error(str(exc))
+
+        if event_id in core.seen_event_ids:
+            entry = core.balances.get(orchestrator_id)
+            return {
+                "result": {
+                    "orchestrator_id": orchestrator_id,
+                    "recipient": entry.recipient if entry else recipient,
+                    "balance_wei": int(entry.balance_wei if entry else 0),
+                    "idempotent": True,
+                }
+            }
+        core.seen_event_ids.add(event_id)
+
+        entry = core.balances.get(orchestrator_id)
+        if entry is None:
+            if delta_wei < 0:
+                return error("insufficient balance")
+            entry = TeeCoreBalances(recipient=recipient, balance_wei=0)
+            core.balances[orchestrator_id] = entry
+        elif entry.recipient != recipient:
+            return error(f"recipient mismatch for {orchestrator_id}: {entry.recipient} != {recipient}")
+
+        new_balance = int(entry.balance_wei) + int(delta_wei)
+        if new_balance < 0:
+            return error("insufficient balance")
+        entry.balance_wei = new_balance
+        audit_entry = _append_audit_entry(
+            core,
+            kind="adjustment",
+            orchestrator_id=orchestrator_id,
+            recipient=entry.recipient,
+            delta_wei=delta_wei,
+            balance_wei=int(entry.balance_wei),
+            event_id=event_id,
+            reason=reason or "adjustment",
+            metadata=metadata,
+        )
+        return {
+            "result": {
+                "orchestrator_id": orchestrator_id,
+                "recipient": entry.recipient,
+                "balance_wei": int(entry.balance_wei),
+                "idempotent": False,
+                "audit_entry": audit_entry,
             }
         }
 
@@ -790,6 +1087,19 @@ def handle_request(request: dict[str, Any], *, state: dict[str, Any]) -> dict[st
         if entry is not None:
             entry.balance_wei = max(int(entry.balance_wei) - amount_wei, 0)
         core.pending.pop(tx_hash, None)
+        audit_entry = None
+        if entry is not None:
+            audit_entry = _append_audit_entry(
+                core,
+                kind="payout_debit",
+                orchestrator_id=orchestrator_id,
+                recipient=entry.recipient,
+                delta_wei=-int(amount_wei),
+                balance_wei=int(entry.balance_wei),
+                event_id=f"payout:{tx_hash}",
+                reason="payout",
+                metadata={"tx_hash": tx_hash, "status": int(status)},
+            )
         return {
             "result": {
                 "tx_hash": tx_hash,
@@ -797,6 +1107,7 @@ def handle_request(request: dict[str, Any], *, state: dict[str, Any]) -> dict[st
                 "debited": True,
                 "orchestrator_id": orchestrator_id,
                 "balance_wei": int(entry.balance_wei if entry else 0),
+                "audit_entry": audit_entry,
             }
         }
 

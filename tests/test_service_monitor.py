@@ -1,4 +1,5 @@
 import unittest
+import os
 from unittest.mock import MagicMock, patch
 
 from payments.service_monitor import ServiceMonitor
@@ -6,6 +7,9 @@ from payments.service_monitor import ServiceMonitor
 
 class ServiceMonitorTests(unittest.TestCase):
     def setUp(self):
+        self._env = patch.dict(os.environ, {"PAYMENTS_DOCKER_MONITORING_ENABLED": "true"})
+        self._env.start()
+        self.addCleanup(self._env.stop)
         self.fake_containers = []
 
         class FakeContainer:

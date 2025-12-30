@@ -24,10 +24,17 @@ class ServiceMonitor:
         remote_health_url: Optional[str] = None,
         remote_health_timeout: float = 5.0,
     ) -> None:
-        try:
-            self.docker_client = docker.from_env()
-        except Exception:  # pragma: no cover - fallback for custom sockets
-            self.docker_client = docker.DockerClient(base_url="unix://var/run/docker.sock")
+        docker_enabled_raw = (os.environ.get("PAYMENTS_DOCKER_MONITORING_ENABLED") or "").strip().lower()
+        self.docker_monitoring_enabled = docker_enabled_raw in {"1", "true", "yes"}
+        self.docker_client = None
+        if self.docker_monitoring_enabled:
+            try:
+                self.docker_client = docker.from_env()
+            except Exception:  # pragma: no cover - fallback for custom sockets
+                try:
+                    self.docker_client = docker.DockerClient(base_url="unix://var/run/docker.sock")
+                except Exception:
+                    self.docker_client = None
 
         env_services = os.environ.get("MONITORED_SERVICES")
         if env_services:
@@ -63,6 +70,30 @@ class ServiceMonitor:
             remote = self._fetch_remote_health()
             if remote is not None:
                 return remote
+
+        if self.docker_client is None:
+            current_time = time.time()
+            services_status: Dict[str, Dict[str, Any]] = {}
+            for name in self.monitored_services:
+                stats = self.service_stats.setdefault(
+                    name,
+                    {"checks": [], "uptime_percentage": 0.0, "last_status": "missing"},
+                )
+                stats.update({"last_status": "missing", "uptime_percentage": 0.0})
+                services_status[name] = {
+                    "status": "unavailable",
+                    "running": False,
+                    "uptime_percentage": 0.0,
+                    "checks_count": len(stats["checks"]),
+                    "health": "unknown",
+                }
+            self.last_check = current_time
+            return {
+                "timestamp": datetime.now().isoformat(),
+                "services": services_status,
+                "monitored_count": len(self.monitored_services),
+                "summary": self.get_summary(),
+            }
 
         containers = {c.name: c for c in self.docker_client.containers.list(all=True)}
         current_time = time.time()
