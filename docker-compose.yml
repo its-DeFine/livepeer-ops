@@ -38,8 +38,8 @@ services:
     volumes:
       - /var/lib/docker/containers:/var/lib/docker/containers:ro
       - ./data:/var/embody/data:ro
-      - ./data/audit:/var/embody/audit
-      - ../logging/fluent-bit.conf:/fluent-bit/etc/fluent-bit.conf:ro
+      - ./data/audit:/var/embody/audit:ro
+      - ./ops/fluent-bit.conf:/fluent-bit/etc/fluent-bit.conf:ro
     command: ["fluent-bit", "-c", "/fluent-bit/etc/fluent-bit.conf"]
     networks:
       - vtuber_network

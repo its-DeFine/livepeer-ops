@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ipaddress
+import json
 import os
 import re
 from urllib.parse import urlparse
@@ -207,6 +208,11 @@ class PaymentSettings(BaseSettings):
         default_factory=list,
         validation_alias="PAYMENTS_MANAGER_IP_ALLOWLIST",
     )
+    trusted_proxy_cidrs: List[str] = Field(
+        default_factory=list,
+        validation_alias="PAYMENTS_TRUSTED_PROXY_CIDRS",
+        description="CIDRs for reverse proxies whose X-Forwarded-For headers should be trusted.",
+    )
     viewer_tokens: List[str] = Field(
         default_factory=list,
         validation_alias="PAYMENTS_VIEWER_TOKENS",
@@ -379,6 +385,38 @@ class PaymentSettings(BaseSettings):
             return Decimal(str(value))
         except Exception as exc:  # pragma: no cover - defensive
             raise ValueError(f"Invalid decimal value: {value}") from exc
+
+    @field_validator("trusted_proxy_cidrs", mode="before")
+    def parse_trusted_proxy_cidrs(cls, value):  # type: ignore[override]
+        if value is None:
+            return []
+        if isinstance(value, (list, tuple)):
+            return list(value)
+        if isinstance(value, str):
+            raw = value.strip()
+            if not raw:
+                return []
+            if raw.startswith("["):
+                try:
+                    parsed = json.loads(raw)
+                except Exception:
+                    parsed = None
+                if isinstance(parsed, list):
+                    return [str(item).strip() for item in parsed if str(item).strip()]
+            parts = [part.strip() for part in re.split(r"[,\s]+", raw) if part.strip()]
+            return parts
+        return value
+
+    @field_validator("trusted_proxy_cidrs")
+    def validate_trusted_proxy_cidrs(cls, value: List[str]) -> List[str]:
+        normalized: List[str] = []
+        for item in value:
+            candidate = (item or "").strip()
+            if not candidate:
+                continue
+            network = ipaddress.ip_network(candidate, strict=False)
+            normalized.append(str(network))
+        return normalized
 
     @field_validator(
         "payment_interval_seconds",
