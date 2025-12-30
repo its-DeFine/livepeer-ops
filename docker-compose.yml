@@ -44,6 +44,34 @@ services:
     networks:
       - vtuber_network
 
+  payments-checkpoint-witness:
+    profiles: ["witness"]
+    image: ${PAYMENTS_IMAGE:-ghcr.io/its-define/payments-backend:latest}
+    container_name: payments-checkpoint-witness
+    restart: unless-stopped
+    depends_on:
+      - payments-backend
+    env_file:
+      - .env
+    command:
+      [
+        "python",
+        "/app/scripts/publish_tee_core_checkpoint.py",
+        "--watch",
+        "--backend-url",
+        "http://payments-backend:8081",
+        "--rpc-url",
+        "${CHECKPOINT_RPC_URL}",
+        "--contract-address",
+        "${CHECKPOINT_CONTRACT_ADDRESS}",
+        "--chain-id",
+        "${CHECKPOINT_CHAIN_ID:-42161}",
+        "--interval-seconds",
+        "${CHECKPOINT_INTERVAL_SECONDS:-600}"
+      ]
+    networks:
+      - vtuber_network
+
 networks:
   vtuber_network:
     driver: bridge

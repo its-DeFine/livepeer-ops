@@ -187,6 +187,27 @@ class TeeCoreClient:
             params["contract_address"] = contract_address
         return self._rpc("audit_checkpoint", params)
 
+    def audit_event(
+        self,
+        *,
+        kind: str,
+        event_id: str,
+        orchestrator_id: Optional[str] = None,
+        recipient: Optional[str] = None,
+        reason: Optional[str] = None,
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {"kind": str(kind), "event_id": str(event_id)}
+        if orchestrator_id:
+            params["orchestrator_id"] = str(orchestrator_id)
+        if recipient:
+            params["recipient"] = str(recipient)
+        if reason:
+            params["reason"] = str(reason)
+        if metadata:
+            params["metadata"] = metadata
+        return self._rpc("audit_event", params)
+
     def livepeer_prepare_redeem_tx(
         self,
         *,

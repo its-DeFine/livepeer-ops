@@ -75,6 +75,35 @@ class TeeCoreTransparencyLog:
                 if schema == TEE_CORE_AUDIT_SCHEMA:
                     yield _wrap_entry(parsed, received_at=None, source="legacy")
 
+    def audit_entries_by_seq(self, *, max_seq: Optional[int] = None) -> dict[int, dict[str, Any]]:
+        """Return audit_entry payloads keyed by seq (best-effort).
+
+        This is intentionally tolerant of duplicated seq values in the log (last one wins).
+        Callers that need strict validation should verify signatures + hash chaining.
+        """
+        upper = None
+        if max_seq is not None:
+            try:
+                upper = max(int(max_seq), 0)
+            except Exception:
+                upper = None
+
+        entries: dict[int, dict[str, Any]] = {}
+        for wrapper in self._iter_wrapped():
+            entry = wrapper.get("audit_entry")
+            if not isinstance(entry, dict):
+                continue
+            try:
+                seq = int(entry.get("seq") or 0)
+            except Exception:
+                continue
+            if seq <= 0:
+                continue
+            if upper is not None and seq > upper:
+                continue
+            entries[seq] = entry
+        return entries
+
     def entries(
         self,
         *,
@@ -141,4 +170,3 @@ class TeeCoreTransparencyLog:
             if str(entry.get("event_id") or "") == desired:
                 return wrapper
         return None
-
