@@ -327,6 +327,85 @@ def _canonical_json_bytes(payload: dict[str, Any]) -> bytes:
     return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
 
+def _parse_bytes32_hex(value: object, *, field: str) -> bytes:
+    if not isinstance(value, str) or not value.startswith("0x") or len(value) != 66:
+        raise RuntimeError(f"{field} must be a 0x-prefixed 32-byte hex string")
+    try:
+        raw = bytes.fromhex(value[2:])
+    except ValueError as exc:
+        raise RuntimeError(f"{field} must be hex") from exc
+    if len(raw) != 32:  # pragma: no cover - defensive
+        raise RuntimeError(f"{field} must be 32 bytes")
+    return raw
+
+
+def _merkle_hash_leaf(leaf: bytes) -> bytes:
+    return keccak(b"\x00" + leaf)
+
+
+def _merkle_hash_node(left: bytes, right: bytes) -> bytes:
+    return keccak(b"\x01" + left + right)
+
+
+def _merkle_frontier_to_bytes(frontier: list[Optional[str]]) -> list[Optional[bytes]]:
+    out: list[Optional[bytes]] = []
+    for item in frontier:
+        if item is None:
+            out.append(None)
+            continue
+        try:
+            out.append(_parse_bytes32_hex(item, field="audit_merkle_frontier entry"))
+        except Exception:
+            out.append(None)
+    return out
+
+
+def _merkle_frontier_to_hex(frontier: list[Optional[bytes]]) -> list[Optional[str]]:
+    trimmed = list(frontier)
+    while trimmed and trimmed[-1] is None:
+        trimmed.pop()
+    out: list[Optional[str]] = []
+    for item in trimmed:
+        out.append(("0x" + item.hex()) if item is not None else None)
+    return out
+
+
+def _merkle_root_from_frontier(frontier: list[Optional[bytes]]) -> bytes:
+    root: Optional[bytes] = None
+    for item in reversed(frontier):
+        if item is None:
+            continue
+        if root is None:
+            root = item
+        else:
+            root = _merkle_hash_node(root, item)
+    return root if root is not None else (b"\x00" * 32)
+
+
+def _merkle_append(frontier: list[Optional[bytes]], *, leaf: bytes) -> bytes:
+    node = _merkle_hash_leaf(leaf)
+    level = 0
+    while level < len(frontier) and frontier[level] is not None:
+        node = _merkle_hash_node(frontier[level], node)
+        frontier[level] = None
+        level += 1
+    if level >= len(frontier):
+        frontier.append(node)
+    else:
+        frontier[level] = node
+    return _merkle_root_from_frontier(frontier)
+
+
+def _checkpoint_head_commitment(*, chain_head_hash: str, merkle_root: str) -> bytes:
+    chain_bytes = _parse_bytes32_hex(chain_head_hash, field="chain_head_hash")
+    merkle_bytes = _parse_bytes32_hex(merkle_root, field="merkle_root")
+    packed = encode_packed(
+        ["string", "bytes32", "bytes32"],
+        ["payments-tee-core:checkpoint-head:v1", chain_bytes, merkle_bytes],
+    )
+    return keccak(packed)
+
+
 def _ticket_hash(ticket: tuple[Any, ...]) -> bytes:
     packed = encode_packed(
         ["address", "address", "uint256", "uint256", "uint256", "bytes32", "bytes"],
@@ -360,6 +439,8 @@ class TeeCoreState:
     seen_event_ids: set[str] = field(default_factory=set)
     audit_seq: int = 0
     audit_head_hash: str = "0x" + ("00" * 32)
+    audit_merkle_root: str = "0x" + ("00" * 32)
+    audit_merkle_frontier: list[Optional[str]] = field(default_factory=list)
     _audit_account: Any = field(default=None, repr=False, compare=False)
 
     @property
@@ -380,6 +461,8 @@ class TeeCoreState:
             "seen_event_ids": sorted(self.seen_event_ids),
             "audit_seq": int(self.audit_seq),
             "audit_head_hash": str(self.audit_head_hash or ""),
+            "audit_merkle_root": str(self.audit_merkle_root or ""),
+            "audit_merkle_frontier": list(self.audit_merkle_frontier),
         }
 
     def load_payload(self, payload: dict[str, Any]) -> None:
@@ -419,6 +502,27 @@ class TeeCoreState:
             self.audit_head_hash = audit_head_hash.lower()
         else:
             self.audit_head_hash = "0x" + ("00" * 32)
+
+        merkle_root = payload.get("audit_merkle_root")
+        if isinstance(merkle_root, str) and merkle_root.startswith("0x") and len(merkle_root) == 66:
+            self.audit_merkle_root = merkle_root.lower()
+        else:
+            self.audit_merkle_root = "0x" + ("00" * 32)
+
+        frontier = payload.get("audit_merkle_frontier")
+        if isinstance(frontier, list):
+            normalized: list[Optional[str]] = []
+            for item in frontier:
+                if item is None:
+                    normalized.append(None)
+                    continue
+                if isinstance(item, str) and item.startswith("0x") and len(item) == 66:
+                    normalized.append(item.lower())
+                    continue
+                normalized.append(None)
+            self.audit_merkle_frontier = normalized
+        else:
+            self.audit_merkle_frontier = []
 
 
 def _credit_message_hash(*, orchestrator_id: str, recipient: str, amount_wei: int, event_id: str) -> bytes:
@@ -541,6 +645,10 @@ def _append_audit_entry(
 
     core.audit_seq = seq
     core.audit_head_hash = entry_hash
+    frontier = _merkle_frontier_to_bytes(list(core.audit_merkle_frontier))
+    root = _merkle_append(frontier, leaf=entry_hash_bytes)
+    core.audit_merkle_root = "0x" + root.hex()
+    core.audit_merkle_frontier = _merkle_frontier_to_hex(frontier)
     return entry
 
 
@@ -576,6 +684,10 @@ def handle_request(request: dict[str, Any], *, state: dict[str, Any]) -> dict[st
         if core is None:
             return {"result": {"provisioned": False, "attestation_available": bool(_load_nsm())}}
         audit_address = core.audit_account.address.lower()
+        checkpoint_head_hash = "0x" + _checkpoint_head_commitment(
+            chain_head_hash=str(core.audit_head_hash),
+            merkle_root=str(core.audit_merkle_root),
+        ).hex()
         return {
             "result": {
                 "provisioned": True,
@@ -586,6 +698,8 @@ def handle_request(request: dict[str, Any], *, state: dict[str, Any]) -> dict[st
                 "audit_address": audit_address,
                 "audit_seq": int(core.audit_seq),
                 "audit_head_hash": str(core.audit_head_hash),
+                "audit_merkle_root": str(core.audit_merkle_root),
+                "audit_checkpoint_head_hash": checkpoint_head_hash,
             }
         }
 
@@ -627,6 +741,12 @@ def handle_request(request: dict[str, Any], *, state: dict[str, Any]) -> dict[st
                 "audit_address": core.audit_account.address.lower(),
                 "audit_seq": int(core.audit_seq),
                 "audit_head_hash": str(core.audit_head_hash),
+                "audit_merkle_root": str(core.audit_merkle_root),
+                "audit_checkpoint_head_hash": "0x"
+                + _checkpoint_head_commitment(
+                    chain_head_hash=str(core.audit_head_hash),
+                    merkle_root=str(core.audit_merkle_root),
+                ).hex(),
             }
         }
 
@@ -641,7 +761,9 @@ def handle_request(request: dict[str, Any], *, state: dict[str, Any]) -> dict[st
             return error("contract_address must be a 0x address")
 
         seq = int(core.audit_seq)
-        head_hash = str(core.audit_head_hash)
+        chain_head_hash = str(core.audit_head_hash)
+        merkle_root = str(core.audit_merkle_root)
+        head_hash = "0x" + _checkpoint_head_commitment(chain_head_hash=chain_head_hash, merkle_root=merkle_root).hex()
         msg_hash = _checkpoint_message_hash(
             audit_signer=core.audit_account.address,
             seq=seq,
@@ -658,6 +780,8 @@ def handle_request(request: dict[str, Any], *, state: dict[str, Any]) -> dict[st
                 "contract_address": contract_address.lower(),
                 "seq": int(seq),
                 "head_hash": head_hash,
+                "chain_head_hash": chain_head_hash,
+                "merkle_root": merkle_root,
                 "message_hash": "0x" + msg_hash.hex(),
                 "signature": "0x" + bytes(signed.signature).hex(),
                 "timestamp": _utcnow_iso(),
@@ -789,6 +913,52 @@ def handle_request(request: dict[str, Any], *, state: dict[str, Any]) -> dict[st
             return error("TEE core not provisioned")
         blob_b64 = _encrypt_state(core.private_key_hex, core.to_payload())
         return {"result": {"blob_b64": blob_b64}}
+
+    if method == "audit_event":
+        if core is None:
+            return error("TEE core not provisioned")
+        kind = str(params.get("kind") or "").strip()
+        if not kind:
+            return error("kind required")
+        event_id = str(params.get("event_id") or "").strip()
+        if not event_id:
+            return error("event_id required")
+        reason = str(params.get("reason") or "").strip() or None
+        metadata = params.get("metadata") if isinstance(params.get("metadata"), dict) else None
+        orchestrator_id = str(params.get("orchestrator_id") or "__system__").strip() or "__system__"
+        recipient = _normalize_address(
+            params.get("recipient") or ("0x" + ("00" * 20)),
+            field="recipient",
+        )
+
+        if event_id in core.seen_event_ids:
+            return {
+                "result": {
+                    "idempotent": True,
+                    "audit_seq": int(core.audit_seq),
+                    "audit_head_hash": str(core.audit_head_hash),
+                    "audit_merkle_root": str(core.audit_merkle_root),
+                }
+            }
+        core.seen_event_ids.add(event_id)
+
+        audit_entry = _append_audit_entry(
+            core,
+            kind=kind,
+            orchestrator_id=orchestrator_id,
+            recipient=recipient,
+            delta_wei=0,
+            balance_wei=0,
+            event_id=event_id,
+            reason=reason or kind,
+            metadata=metadata,
+        )
+        return {
+            "result": {
+                "idempotent": False,
+                "audit_entry": audit_entry,
+            }
+        }
 
     if method == "credit":
         if core is None:

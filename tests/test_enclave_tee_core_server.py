@@ -87,6 +87,7 @@ def test_tee_core_credit_signature_and_state_roundtrip():
     assert loaded["result"]["ok"] is True
     assert fresh["core"].audit_seq == 1
     assert fresh["core"].audit_head_hash == audit_entry.get("entry_hash")
+    assert isinstance(getattr(fresh["core"], "audit_merkle_root", None), str)
 
     balance = module.handle_request(
         {"method": "balance", "params": {"orchestrator_id": "orch-a"}},
@@ -127,6 +128,13 @@ def test_tee_core_credit_signature_and_state_roundtrip():
         },
         state=fresh,
     )["result"]
+    assert checkpoint.get("chain_head_hash") == fresh["core"].audit_head_hash
+    assert checkpoint.get("merkle_root") == getattr(fresh["core"], "audit_merkle_root", None)
+    expected_head = "0x" + module._checkpoint_head_commitment(
+        chain_head_hash=str(fresh["core"].audit_head_hash),
+        merkle_root=str(getattr(fresh["core"], "audit_merkle_root", "0x" + ("00" * 32))),
+    ).hex()
+    assert str(checkpoint.get("head_hash") or "").lower() == expected_head.lower()
     msg_hash = module._checkpoint_message_hash(
         audit_signer=fresh["core"].audit_account.address,
         seq=int(checkpoint["seq"]),
@@ -138,3 +146,28 @@ def test_tee_core_credit_signature_and_state_roundtrip():
     ck_sig = bytes.fromhex(str(checkpoint["signature"])[2:])
     ck_recovered = Account.recover_message(encode_defunct(primitive=msg_hash), signature=ck_sig)
     assert ck_recovered.lower() == str(checkpoint["audit_address"]).lower()
+
+
+def test_tee_core_audit_event_is_idempotent():
+    module = load_module()
+    core_account = Account.from_key("0x" + "11" * 32)
+    state = {"core": module.TeeCoreState(account=core_account, private_key_hex="0x" + "11" * 32)}
+
+    first = module.handle_request(
+        {"method": "audit_event", "params": {"kind": "policy", "event_id": "policy:test"}},
+        state=state,
+    )
+    assert first["result"]["idempotent"] is False
+    entry = first["result"].get("audit_entry")
+    assert isinstance(entry, dict)
+    assert entry.get("kind") == "policy"
+    assert entry.get("orchestrator_id") == "__system__"
+    assert entry.get("delta_wei") == "0"
+    assert state["core"].audit_seq == 1
+
+    second = module.handle_request(
+        {"method": "audit_event", "params": {"kind": "policy", "event_id": "policy:test"}},
+        state=state,
+    )
+    assert second["result"]["idempotent"] is True
+    assert state["core"].audit_seq == 1

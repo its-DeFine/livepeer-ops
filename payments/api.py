@@ -48,6 +48,8 @@ from .licenses import (
 from .sessions import SessionStore
 from .signer import Signer, SignerError
 from .tee_core_client import TeeCoreClient, TeeCoreError
+from .merkle import inclusion_proof, tree_root_for_size, verify_inclusion_proof
+from .policy import hash_snapshot as policy_hash_snapshot, snapshot as policy_snapshot
 from .transparency import TeeCoreTransparencyLog
 from .workloads import WorkloadStore
 
@@ -152,6 +154,8 @@ class TeeCoreStatusResponse(BaseModel):
     audit_address: Optional[str] = None
     audit_seq: Optional[int] = None
     audit_head_hash: Optional[str] = None
+    audit_merkle_root: Optional[str] = None
+    audit_checkpoint_head_hash: Optional[str] = None
 
 
 class TeeCoreAttestationResponse(BaseModel):
@@ -164,6 +168,8 @@ class TeeCoreAuditStatusResponse(BaseModel):
     audit_address: str
     audit_seq: int
     audit_head_hash: str
+    audit_merkle_root: Optional[str] = None
+    audit_checkpoint_head_hash: Optional[str] = None
 
 
 class TeeCoreAuditEntry(BaseModel):
@@ -202,9 +208,19 @@ class TeeCoreAuditCheckpointResponse(BaseModel):
     contract_address: str
     seq: int
     head_hash: str
+    chain_head_hash: Optional[str] = None
+    merkle_root: Optional[str] = None
     message_hash: str
     signature: str
     timestamp: str
+
+
+class TeeCoreAuditMerkleProofResponse(BaseModel):
+    checkpoint: TeeCoreAuditCheckpointResponse
+    audit_entry: TeeCoreAuditEntry
+    leaf_index: int
+    tree_size: int
+    proof: List[str]
 
 
 class OrchestratorRecord(BaseModel):
@@ -467,6 +483,7 @@ class LedgerAdjustmentResponse(BaseModel):
     reason: Optional[str]
     reference_workload_id: Optional[str]
     notes: Optional[str]
+    event_id: Optional[str] = None
 
 
 class WorkloadUpdatePayload(BaseModel):
@@ -1297,6 +1314,8 @@ def create_app(
         return JSONResponse(status_code=exc.status_code, content={"detail": str(exc)})
 
     WEI_PER_ETH = Decimal(10) ** 18
+    policy_payload = policy_snapshot(settings)
+    policy_hash = policy_hash_snapshot(policy_payload)
     tee_core_authority = bool(getattr(settings, "tee_core_authority", False))
     tee_core_credit_signer = None
     raw_signer = str(getattr(settings, "tee_core_credit_signer_private_key", "") or "").strip()
@@ -1322,6 +1341,26 @@ def create_app(
             tmp.replace(tee_core_state_path)
         except Exception:
             return
+
+    def _audit_policy_snapshot() -> None:
+        if tee_core is None:
+            return
+        event_id = f"policy:{policy_hash}"
+        try:
+            result = tee_core.audit_event(
+                kind="policy",
+                event_id=event_id,
+                reason="policy",
+                metadata={"policy_hash": policy_hash, "policy": policy_payload},
+            )
+            audit_entry = result.get("audit_entry") if isinstance(result, dict) else None
+            if isinstance(audit_entry, dict):
+                tee_core_transparency_log.append(audit_entry, source="policy")
+                _persist_tee_core_state()
+        except TeeCoreError:
+            return
+
+    _audit_policy_snapshot()
 
     def orchestrator_balance(orchestrator_id: str) -> Decimal:
         if tee_core is not None:
@@ -1392,6 +1431,8 @@ def create_app(
             amount_wei=amount_wei,
             event_id=event_id,
         )
+        meta = dict(metadata) if isinstance(metadata, dict) else {}
+        meta.setdefault("policy_hash", policy_hash)
         try:
             result = tee_core.credit(
                 orchestrator_id=orchestrator_id,
@@ -1400,7 +1441,7 @@ def create_app(
                 event_id=event_id,
                 signature=signature,
                 reason=reason,
-                metadata=metadata,
+                metadata=meta or None,
             )
         except TeeCoreError as exc:
             raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc))
@@ -1432,6 +1473,8 @@ def create_app(
             delta_wei=delta_wei,
             event_id=event_id,
         )
+        meta = dict(metadata) if isinstance(metadata, dict) else {}
+        meta.setdefault("policy_hash", policy_hash)
         try:
             result = tee_core.apply_delta(
                 orchestrator_id=orchestrator_id,
@@ -1440,7 +1483,7 @@ def create_app(
                 event_id=event_id,
                 signature=signature,
                 reason=reason,
-                metadata=metadata,
+                metadata=meta or None,
             )
         except TeeCoreError as exc:
             raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc))
@@ -1526,6 +1569,8 @@ def create_app(
             audit_address=result.get("audit_address"),
             audit_seq=result.get("audit_seq"),
             audit_head_hash=result.get("audit_head_hash"),
+            audit_merkle_root=result.get("audit_merkle_root"),
+            audit_checkpoint_head_hash=result.get("audit_checkpoint_head_hash"),
         )
 
     @app.get("/api/tee/core/attestation", response_model=TeeCoreAttestationResponse)
@@ -1579,6 +1624,8 @@ def create_app(
                 audit_address=str(result.get("audit_address") or ""),
                 audit_seq=int(result.get("audit_seq") or 0),
                 audit_head_hash=str(result.get("audit_head_hash") or ""),
+                audit_merkle_root=str(result.get("audit_merkle_root") or "") or None,
+                audit_checkpoint_head_hash=str(result.get("audit_checkpoint_head_hash") or "") or None,
             )
         except Exception as exc:
             raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc))
@@ -1606,12 +1653,121 @@ def create_app(
                 contract_address=str(result.get("contract_address") or ""),
                 seq=int(result.get("seq") or 0),
                 head_hash=str(result.get("head_hash") or ""),
+                chain_head_hash=str(result.get("chain_head_hash") or "") or None,
+                merkle_root=str(result.get("merkle_root") or "") or None,
                 message_hash=str(result.get("message_hash") or ""),
                 signature=str(result.get("signature") or ""),
                 timestamp=str(result.get("timestamp") or ""),
             )
         except Exception as exc:
             raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc))
+
+    @app.get("/api/transparency/tee-core/audit/proof", response_model=TeeCoreAuditMerkleProofResponse)
+    async def tee_core_audit_merkle_proof(
+        event_id: str = Query(min_length=1),
+        contract_address: Optional[str] = Query(default=None),
+        chain_id: Optional[int] = Query(default=None, ge=1),
+        _: Any = Depends(require_public_transparency),
+    ) -> TeeCoreAuditMerkleProofResponse:
+        if tee_core is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="TEE core unavailable")
+        effective_chain_id = int(chain_id) if chain_id is not None else int(getattr(settings, "chain_id", 0) or 0)
+        if effective_chain_id <= 0:
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="chain_id unavailable")
+
+        try:
+            checkpoint_raw = tee_core.audit_checkpoint(chain_id=effective_chain_id, contract_address=contract_address)
+        except TeeCoreError as exc:
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc))
+
+        tree_size = int(checkpoint_raw.get("seq") or 0)
+        if tree_size <= 0:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No audit entries available")
+
+        merkle_root_hex = str(checkpoint_raw.get("merkle_root") or "").strip().lower()
+        if not merkle_root_hex.startswith("0x") or len(merkle_root_hex) != 66:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Merkle root unavailable (TEE core state may predate proof support)",
+            )
+
+        entries_by_seq = tee_core_transparency_log.audit_entries_by_seq(max_seq=tree_size)
+        missing = [seq for seq in range(1, tree_size + 1) if seq not in entries_by_seq]
+        if missing:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Audit log history is incomplete on this host; use an external witness copy",
+            )
+
+        target_seq: Optional[int] = None
+        target_entry: Optional[dict[str, Any]] = None
+        for seq in range(1, tree_size + 1):
+            entry = entries_by_seq.get(seq)
+            if not isinstance(entry, dict):
+                continue
+            if str(entry.get("event_id") or "") == event_id:
+                target_seq = seq
+                target_entry = entry
+                break
+
+        if target_seq is None or target_entry is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Receipt not found")
+
+        try:
+            leaves: list[bytes] = []
+            for seq in range(1, tree_size + 1):
+                entry = entries_by_seq[seq]
+                entry_hash = str(entry.get("entry_hash") or "").strip().lower()
+                if not entry_hash.startswith("0x") or len(entry_hash) != 66:
+                    raise ValueError(f"invalid entry_hash at seq {seq}")
+                leaves.append(bytes.fromhex(entry_hash[2:]))
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc))
+
+        root = tree_root_for_size(leaves, tree_size)
+        root_hex = "0x" + root.hex()
+        if root_hex.lower() != merkle_root_hex:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Audit log does not match the TEE-reported merkle_root; use an external witness copy",
+            )
+
+        leaf_index = int(target_seq - 1)
+        proof = inclusion_proof(leaves, leaf_index=leaf_index, tree_size=tree_size)
+        if not verify_inclusion_proof(
+            leaf=leaves[leaf_index],
+            leaf_index=leaf_index,
+            tree_size=tree_size,
+            proof=proof,
+            expected_root=root,
+        ):
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Merkle proof self-check failed")
+
+        try:
+            checkpoint = TeeCoreAuditCheckpointResponse(
+                schema=str(checkpoint_raw.get("schema") or ""),
+                audit_address=str(checkpoint_raw.get("audit_address") or ""),
+                chain_id=int(checkpoint_raw.get("chain_id") or 0),
+                contract_address=str(checkpoint_raw.get("contract_address") or ""),
+                seq=int(checkpoint_raw.get("seq") or 0),
+                head_hash=str(checkpoint_raw.get("head_hash") or ""),
+                chain_head_hash=str(checkpoint_raw.get("chain_head_hash") or "") or None,
+                merkle_root=str(checkpoint_raw.get("merkle_root") or "") or None,
+                message_hash=str(checkpoint_raw.get("message_hash") or ""),
+                signature=str(checkpoint_raw.get("signature") or ""),
+                timestamp=str(checkpoint_raw.get("timestamp") or ""),
+            )
+            audit_entry = TeeCoreAuditEntry.model_validate(target_entry)
+        except Exception as exc:
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc))
+
+        return TeeCoreAuditMerkleProofResponse(
+            checkpoint=checkpoint,
+            audit_entry=audit_entry,
+            leaf_index=leaf_index,
+            tree_size=tree_size,
+            proof=["0x" + item.hex() for item in proof],
+        )
 
     @app.get("/api/transparency/tee-core/log", response_model=TeeCoreTransparencyLogResponse)
     async def tee_core_transparency_log_entries(
@@ -3508,11 +3664,12 @@ def create_app(
             metadata["reference_workload_id"] = payload.reference_workload_id
         if payload.notes:
             metadata["notes"] = payload.notes
+        event_id = f"adjustment:{uuid.uuid4().hex}"
         if tee_core_authority:
             balance = _tee_core_apply_delta(
                 orchestrator_id=payload.orchestrator_id,
                 delta_eth=payload.amount_eth,
-                event_id=f"adjustment:{uuid.uuid4().hex}",
+                event_id=event_id,
                 reason=payload.reason or "adjustment",
                 metadata=metadata or None,
                 source="ledger_adjustment",
@@ -3531,6 +3688,7 @@ def create_app(
             reason=payload.reason or "adjustment",
             reference_workload_id=payload.reference_workload_id,
             notes=payload.notes,
+            event_id=event_id if tee_core_authority else None,
         )
 
     @app.get("/api/ledger/events", response_model=LedgerEventsResponse)
