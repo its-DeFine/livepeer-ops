@@ -507,6 +507,47 @@ async def test_transparency_endpoints_are_public_even_with_tokens(temp_paths):
 
 
 @pytest.mark.anyio("asyncio")
+async def test_public_transparency_rate_limit_ignores_untrusted_xff(temp_paths):
+    registry, ledger = build_registry(temp_paths)
+    settings = build_settings(temp_paths, trusted_proxy_cidrs=[])
+    app = create_app(registry, ledger, settings)
+    transport = httpx.ASGITransport(app=app, client=("203.0.113.200", 12345))
+
+    with patch("payments.api.time.monotonic", return_value=0.0):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            last = None
+            for i in range(21):
+                last = await client.get(
+                    "/api/transparency/tee-core/log?limit=1",
+                    headers={"X-Forwarded-For": f"1.2.3.{i}"},
+                )
+
+    assert last is not None
+    assert last.status_code == 429
+
+
+@pytest.mark.anyio("asyncio")
+async def test_public_transparency_rate_limit_trusts_xff_for_trusted_proxy(temp_paths):
+    registry, ledger = build_registry(temp_paths)
+    settings = build_settings(temp_paths, trusted_proxy_cidrs=["10.0.0.0/8"])
+    app = create_app(registry, ledger, settings)
+    transport = httpx.ASGITransport(app=app, client=("10.0.0.5", 12345))
+
+    with patch("payments.api.time.monotonic", return_value=0.0):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            statuses = []
+            for i in range(25):
+                resp = await client.get(
+                    "/api/transparency/tee-core/log?limit=1",
+                    headers={"X-Forwarded-For": f"1.2.3.{i}"},
+                )
+                statuses.append(resp.status_code)
+
+    assert statuses[-1] == 200
+    assert 429 not in statuses
+
+
+@pytest.mark.anyio("asyncio")
 async def test_orchestrator_edge_disabled_without_token(temp_paths):
     registry, ledger = build_registry(temp_paths)
     settings = build_settings(temp_paths)

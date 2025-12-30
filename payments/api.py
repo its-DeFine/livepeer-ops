@@ -827,6 +827,15 @@ def create_app(
     manager_ip_allowlist = {
         str(ipaddress.ip_address(ip)) for ip in getattr(settings, "manager_ip_allowlist", [])
     }
+    trusted_proxy_networks: List[ipaddress._BaseNetwork] = []  # type: ignore[attr-defined]
+    for raw in getattr(settings, "trusted_proxy_cidrs", []) or []:
+        candidate = str(raw or "").strip()
+        if not candidate:
+            continue
+        try:
+            trusted_proxy_networks.append(ipaddress.ip_network(candidate, strict=False))
+        except ValueError:
+            continue
     sensitive_fields = {
         "host_public_ip": None,
         "last_seen_ip": None,
@@ -851,15 +860,25 @@ def create_app(
         except ValueError:
             return None
 
+    def is_trusted_proxy(value: Optional[str]) -> bool:
+        if not value or not trusted_proxy_networks:
+            return False
+        try:
+            ip = ipaddress.ip_address(value)
+        except ValueError:
+            return False
+        return any(ip in network for network in trusted_proxy_networks)
+
     def request_ip(request: Request) -> Optional[str]:
-        forwarded = request.headers.get("X-Forwarded-For")
-        if forwarded:
-            first = forwarded.split(",", 1)[0].strip()
-            normalized = normalize_ip(first)
-            if normalized:
-                return normalized
-        client_host = request.client.host if request.client else None
-        return normalize_ip(client_host)
+        client_host = normalize_ip(request.client.host if request.client else None)
+        if client_host and is_trusted_proxy(client_host):
+            forwarded = request.headers.get("X-Forwarded-For")
+            if forwarded:
+                first = forwarded.split(",", 1)[0].strip()
+                normalized = normalize_ip(first)
+                if normalized:
+                    return normalized
+        return client_host
 
     def _sanitize_s3_segment(raw: str) -> str:
         cleaned = re.sub(r"[^a-zA-Z0-9._-]+", "-", (raw or "").strip())
