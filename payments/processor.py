@@ -24,6 +24,7 @@ from .payout_store import PendingPayoutStore
 from .registry import Registry
 from .service_monitor import ServiceMonitor
 from .tee_core_client import TeeCoreClient, TeeCoreError
+from .transparency import TeeCoreTransparencyLog
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +55,10 @@ class PaymentProcessor:
 
         self._tee_core_cursor_path = Path(getattr(settings, "tee_core_sync_cursor_path", "/app/data/tee_core_sync.cursor"))
         self._tee_core_state_path = Path(getattr(settings, "tee_core_state_path", "/app/data/tee_core_state.b64"))
+        self._tee_core_authority = bool(getattr(settings, "tee_core_authority", False))
+        self._tee_core_transparency_log = TeeCoreTransparencyLog(
+            Path(getattr(settings, "tee_core_transparency_log_path", "/app/data/audit/tee-core-transparency.log"))
+        )
         self._tee_core_cursor = 0
         self._tee_core_credit_signer = None
         raw_signer = str(getattr(settings, "tee_core_credit_signer_private_key", "") or "").strip()
@@ -157,6 +162,27 @@ class PaymentProcessor:
         signed = signer.sign_message(encode_defunct(primitive=msg_hash))
         return "0x" + bytes(signed.signature).hex()
 
+    def _maybe_sign_delta(
+        self,
+        *,
+        orchestrator_id: str,
+        recipient: str,
+        delta_wei: int,
+        event_id: str,
+    ) -> Optional[str]:
+        signer = self._tee_core_credit_signer
+        if signer is None:
+            return None
+        orch_hash = keccak(text=orchestrator_id)
+        event_hash = keccak(text=event_id)
+        packed = encode_packed(
+            ["string", "bytes32", "address", "int256", "bytes32"],
+            ["payments-tee-core:delta:v1", orch_hash, to_checksum_address(recipient), int(delta_wei), event_hash],
+        )
+        msg_hash = keccak(packed)
+        signed = signer.sign_message(encode_defunct(primitive=msg_hash))
+        return "0x" + bytes(signed.signature).hex()
+
     def _sync_tee_core_credits(self) -> None:
         """Forward ledger credit events to the TEE core (best-effort).
 
@@ -164,6 +190,8 @@ class PaymentProcessor:
         """
 
         if self.tee_core is None:
+            return
+        if self._tee_core_authority:
             return
 
         journal_path = getattr(self.ledger, "journal_path", None)
@@ -202,7 +230,7 @@ class PaymentProcessor:
                     except Exception:
                         continue
                     amount_wei = int(amount_eth * WEI_PER_ETH)
-                    if amount_wei <= 0:
+                    if amount_wei == 0:
                         continue
 
                     record = self.registry.get_record(orchestrator_id) or {}
@@ -214,20 +242,42 @@ class PaymentProcessor:
                     signature = self._maybe_sign_credit(
                         orchestrator_id=orchestrator_id,
                         recipient=recipient,
-                        amount_wei=amount_wei,
+                        amount_wei=abs(amount_wei),
                         event_id=event_id,
                     )
+                    delta_signature = self._maybe_sign_delta(
+                        orchestrator_id=orchestrator_id,
+                        recipient=recipient,
+                        delta_wei=amount_wei,
+                        event_id=event_id,
+                    )
+                    reason = entry.get("reason") if isinstance(entry.get("reason"), str) else None
                     metadata = entry.get("metadata") if isinstance(entry.get("metadata"), dict) else None
 
                     try:
-                        self.tee_core.credit(
-                            orchestrator_id=orchestrator_id,
-                            recipient=recipient,
-                            amount_wei=amount_wei,
-                            event_id=event_id,
-                            signature=signature,
-                            metadata=metadata,
-                        )
+                        if amount_wei > 0:
+                            result = self.tee_core.credit(
+                                orchestrator_id=orchestrator_id,
+                                recipient=recipient,
+                                amount_wei=amount_wei,
+                                event_id=event_id,
+                                signature=signature,
+                                reason=reason,
+                                metadata=metadata,
+                            )
+                        else:
+                            result = self.tee_core.apply_delta(
+                                orchestrator_id=orchestrator_id,
+                                recipient=recipient,
+                                delta_wei=amount_wei,
+                                event_id=event_id,
+                                signature=delta_signature,
+                                reason=reason,
+                                metadata=metadata,
+                            )
+                        audit_entry = result.get("audit_entry") if isinstance(result, dict) else None
+                        if isinstance(audit_entry, dict):
+                            self._tee_core_transparency_log.append(audit_entry, source="ledger_sync")
                         progressed = True
                     except TeeCoreError as exc:
                         logger.warning("TEE core credit sync failed (will retry): %s", exc)
@@ -849,7 +899,10 @@ class PaymentProcessor:
 
             if self.tee_core is not None:
                 try:
-                    self.tee_core.confirm_payout(tx_hash=tx_hash, status=status)
+                    result = self.tee_core.confirm_payout(tx_hash=tx_hash, status=status)
+                    audit_entry = result.get("audit_entry") if isinstance(result, dict) else None
+                    if isinstance(audit_entry, dict):
+                        self._tee_core_transparency_log.append(audit_entry, source="payout_confirm")
                     self._persist_tee_core_state()
                 except TeeCoreError as exc:
                     logger.warning("[%s] Failed to confirm TEE core payout (tx=%s): %s", orchestrator_id, tx_hash, exc)
@@ -1021,7 +1074,10 @@ class PaymentProcessor:
                 return
 
             try:
-                self.tee_core.confirm_payout(tx_hash=tx_hash, status=status)
+                result = self.tee_core.confirm_payout(tx_hash=tx_hash, status=status)
+                audit_entry = result.get("audit_entry") if isinstance(result, dict) else None
+                if isinstance(audit_entry, dict):
+                    self._tee_core_transparency_log.append(audit_entry, source="payout_confirm")
                 self._persist_tee_core_state()
             except TeeCoreError as exc:
                 logger.warning("[%s] Failed to confirm TEE core payout (tx=%s): %s", orchestrator_id, tx_hash, exc)

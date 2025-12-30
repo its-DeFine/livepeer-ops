@@ -13,8 +13,16 @@ services:
       - .env
     environment:
       - MONITORED_SERVICES=${MONITORED_SERVICES:-vtuber-unreal-game,vtuber-unreal-signaling,vtuber-turn-server}
+      - PAYMENTS_DOCKER_MONITORING_ENABLED=${PAYMENTS_DOCKER_MONITORING_ENABLED:-false}
+    user: "1000:1000"
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
       - ./data:/app/data
     ports:
       - "8081:8081"

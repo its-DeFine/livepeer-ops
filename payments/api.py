@@ -24,7 +24,11 @@ except Exception:  # pragma: no cover
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
 import httpx
+from eth_abi.packed import encode_packed
+from eth_account import Account
+from eth_account.messages import encode_defunct
 from pydantic import BaseModel, Field, field_validator, model_validator
+from eth_utils import keccak, to_checksum_address
 
 from .activity import ActivityLeaseStore, parse_iso8601 as parse_activity_iso8601
 from .config import PaymentSettings
@@ -44,6 +48,7 @@ from .licenses import (
 from .sessions import SessionStore
 from .signer import Signer, SignerError
 from .tee_core_client import TeeCoreClient, TeeCoreError
+from .transparency import TeeCoreTransparencyLog
 from .workloads import WorkloadStore
 
 
@@ -144,12 +149,63 @@ class TeeCoreStatusResponse(BaseModel):
     attestation_available: bool = False
     balances: Optional[int] = None
     pending: Optional[int] = None
+    audit_address: Optional[str] = None
+    audit_seq: Optional[int] = None
+    audit_head_hash: Optional[str] = None
 
 
 class TeeCoreAttestationResponse(BaseModel):
     address: str
     document_b64: str
     nonce_hex: Optional[str] = None
+
+
+class TeeCoreAuditStatusResponse(BaseModel):
+    audit_address: str
+    audit_seq: int
+    audit_head_hash: str
+
+
+class TeeCoreAuditEntry(BaseModel):
+    schema_: str = Field(alias="schema")
+    seq: int
+    prev_hash: str
+    timestamp: str
+    kind: str
+    event_id: str
+    orchestrator_id: str
+    recipient: str
+    delta_wei: str
+    balance_wei: str
+    reason: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None
+    entry_hash: str
+    signer: str
+    signature: str
+
+
+class TeeCoreTransparencyLogEntry(BaseModel):
+    schema_: str = Field(alias="schema")
+    received_at: Optional[str] = None
+    source: Optional[str] = None
+    audit_entry: TeeCoreAuditEntry
+
+
+class TeeCoreTransparencyLogResponse(BaseModel):
+    entries: List[TeeCoreTransparencyLogEntry]
+
+
+class TeeCoreAuditCheckpointResponse(BaseModel):
+    schema_: str = Field(alias="schema")
+    audit_address: str
+    chain_id: int
+    contract_address: str
+    seq: int
+    head_hash: str
+    message_hash: str
+    signature: str
+    timestamp: str
+
 
 class OrchestratorRecord(BaseModel):
     orchestrator_id: str
@@ -783,6 +839,10 @@ def create_app(
         getattr(settings, "edge_assignments_path", data_dir / "edge_assignments.json")
     )
 
+    tee_core_transparency_log = TeeCoreTransparencyLog(
+        Path(getattr(settings, "tee_core_transparency_log_path", data_dir / "audit" / "tee-core-transparency.log"))
+    )
+
     def normalize_ip(value: Optional[str]) -> Optional[str]:
         if not value:
             return None
@@ -1103,10 +1163,21 @@ def create_app(
         if provided != token:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Admin token required")
 
+    async def require_strict_admin(request: Request) -> None:
+        token = (settings.api_admin_token or "").strip()
+        if not token:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Admin endpoint disabled")
+        provided = _provided_token(request)
+        if provided != token:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Admin token required")
+
     async def require_edge_plane(request: Request) -> None:
         expected = (getattr(settings, "edge_config_token", None) or "").strip()
         if not expected:
-            return
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Edge config endpoint disabled",
+            )
         provided = _provided_bearer_token(request)
         if provided != expected:
             raise HTTPException(
@@ -1131,6 +1202,21 @@ def create_app(
                 return
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Viewer token required")
         # No tokens configured => open access
+
+    transparency_per_minute_limiter = RateLimiter(max_calls=120, window_seconds=60)
+    transparency_burst_limiter = RateLimiter(max_calls=20, window_seconds=10)
+
+    async def require_public_transparency(request: Request) -> None:
+        """Public rate limit for transparency/attestation endpoints.
+
+        These endpoints are intentionally unauthenticated so third-party witnesses can operate without
+        operator-issued tokens. Keep abuse protection lightweight (IP-based) and do not rely on secrets.
+        """
+        client = request_ip(request) or "unknown"
+        if not transparency_burst_limiter.allow(f"transparency:burst:{client}"):
+            raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Rate limited")
+        if not transparency_per_minute_limiter.allow(f"transparency:minute:{client}"):
+            raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Rate limited")
 
     def _read_edge_assignments() -> Dict[str, Any]:
         try:
@@ -1192,6 +1278,31 @@ def create_app(
         return JSONResponse(status_code=exc.status_code, content={"detail": str(exc)})
 
     WEI_PER_ETH = Decimal(10) ** 18
+    tee_core_authority = bool(getattr(settings, "tee_core_authority", False))
+    tee_core_credit_signer = None
+    raw_signer = str(getattr(settings, "tee_core_credit_signer_private_key", "") or "").strip()
+    if raw_signer:
+        try:
+            tee_core_credit_signer = Account.from_key(raw_signer)
+        except Exception:
+            tee_core_credit_signer = None
+
+    tee_core_state_path = Path(getattr(settings, "tee_core_state_path", data_dir / "tee_core_state.b64"))
+
+    def _persist_tee_core_state() -> None:
+        if tee_core is None:
+            return
+        try:
+            result = tee_core.export_state()
+            blob = str(result.get("blob_b64") or "").strip()
+            if not blob:
+                return
+            tee_core_state_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = tee_core_state_path.with_suffix(".tmp")
+            tmp.write_text(blob, encoding="utf-8")
+            tmp.replace(tee_core_state_path)
+        except Exception:
+            return
 
     def orchestrator_balance(orchestrator_id: str) -> Decimal:
         if tee_core is not None:
@@ -1202,6 +1313,124 @@ def create_app(
             except TeeCoreError:
                 pass
         return ledger.get_balance(orchestrator_id)
+
+    def _resolve_recipient(orchestrator_id: str) -> str:
+        record = registry.get_record(orchestrator_id) or {}
+        recipient = record.get("address") or record.get("payout_address")
+        if not isinstance(recipient, str) or not recipient.startswith("0x") or len(recipient) != 42:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Orchestrator is missing a valid payout address",
+            )
+        return recipient
+
+    def _sign_credit(*, orchestrator_id: str, recipient: str, amount_wei: int, event_id: str) -> Optional[str]:
+        signer = tee_core_credit_signer
+        if signer is None:
+            return None
+        orch_hash = keccak(text=orchestrator_id)
+        event_hash = keccak(text=event_id)
+        packed = encode_packed(
+            ["string", "bytes32", "address", "uint256", "bytes32"],
+            ["payments-tee-core:credit:v1", orch_hash, to_checksum_address(recipient), int(amount_wei), event_hash],
+        )
+        msg_hash = keccak(packed)
+        signed = signer.sign_message(encode_defunct(primitive=msg_hash))
+        return "0x" + bytes(signed.signature).hex()
+
+    def _sign_delta(*, orchestrator_id: str, recipient: str, delta_wei: int, event_id: str) -> Optional[str]:
+        signer = tee_core_credit_signer
+        if signer is None:
+            return None
+        orch_hash = keccak(text=orchestrator_id)
+        event_hash = keccak(text=event_id)
+        packed = encode_packed(
+            ["string", "bytes32", "address", "int256", "bytes32"],
+            ["payments-tee-core:delta:v1", orch_hash, to_checksum_address(recipient), int(delta_wei), event_hash],
+        )
+        msg_hash = keccak(packed)
+        signed = signer.sign_message(encode_defunct(primitive=msg_hash))
+        return "0x" + bytes(signed.signature).hex()
+
+    def _tee_core_credit(
+        *,
+        orchestrator_id: str,
+        amount_eth: Decimal,
+        event_id: str,
+        reason: Optional[str],
+        metadata: Optional[Dict[str, Any]],
+        source: str,
+    ) -> Decimal:
+        if tee_core is None:
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="TEE core unavailable")
+        amount_wei = int(Decimal(amount_eth) * WEI_PER_ETH)
+        if amount_wei <= 0:
+            return Decimal("0")
+        recipient = _resolve_recipient(orchestrator_id)
+        signature = _sign_credit(
+            orchestrator_id=orchestrator_id,
+            recipient=recipient,
+            amount_wei=amount_wei,
+            event_id=event_id,
+        )
+        try:
+            result = tee_core.credit(
+                orchestrator_id=orchestrator_id,
+                recipient=recipient,
+                amount_wei=amount_wei,
+                event_id=event_id,
+                signature=signature,
+                reason=reason,
+                metadata=metadata,
+            )
+        except TeeCoreError as exc:
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc))
+        audit_entry = result.get("audit_entry") if isinstance(result, dict) else None
+        if isinstance(audit_entry, dict):
+            tee_core_transparency_log.append(audit_entry, source=source)
+            _persist_tee_core_state()
+        balance_wei = int(result.get("balance_wei") or 0) if isinstance(result, dict) else 0
+        return Decimal(balance_wei) / WEI_PER_ETH
+
+    def _tee_core_apply_delta(
+        *,
+        orchestrator_id: str,
+        delta_eth: Decimal,
+        event_id: str,
+        reason: Optional[str],
+        metadata: Optional[Dict[str, Any]],
+        source: str,
+    ) -> Decimal:
+        if tee_core is None:
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="TEE core unavailable")
+        delta_wei = int(Decimal(delta_eth) * WEI_PER_ETH)
+        if delta_wei == 0:
+            return Decimal("0")
+        recipient = _resolve_recipient(orchestrator_id)
+        signature = _sign_delta(
+            orchestrator_id=orchestrator_id,
+            recipient=recipient,
+            delta_wei=delta_wei,
+            event_id=event_id,
+        )
+        try:
+            result = tee_core.apply_delta(
+                orchestrator_id=orchestrator_id,
+                recipient=recipient,
+                delta_wei=delta_wei,
+                event_id=event_id,
+                signature=signature,
+                reason=reason,
+                metadata=metadata,
+            )
+        except TeeCoreError as exc:
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc))
+        audit_entry = result.get("audit_entry") if isinstance(result, dict) else None
+        if isinstance(audit_entry, dict):
+            tee_core_transparency_log.append(audit_entry, source=source)
+            _persist_tee_core_state()
+        balance_wei = int(result.get("balance_wei") or 0) if isinstance(result, dict) else 0
+        return Decimal(balance_wei) / WEI_PER_ETH
 
     @app.get("/api/tee/status", response_model=TeeStatusResponse)
     async def tee_status(_: Any = Depends(require_view_access)) -> TeeStatusResponse:
@@ -1224,7 +1453,7 @@ def create_app(
     @app.get("/api/tee/attestation", response_model=TeeAttestationResponse)
     async def tee_attestation(
         nonce: Optional[str] = Query(default=None),
-        _: Any = Depends(require_view_access),
+        _: Any = Depends(require_public_transparency),
     ) -> TeeAttestationResponse:
         if signer is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="TEE signer unavailable")
@@ -1275,12 +1504,15 @@ def create_app(
             attestation_available=bool(result.get("attestation_available", False)),
             balances=result.get("balances"),
             pending=result.get("pending"),
+            audit_address=result.get("audit_address"),
+            audit_seq=result.get("audit_seq"),
+            audit_head_hash=result.get("audit_head_hash"),
         )
 
     @app.get("/api/tee/core/attestation", response_model=TeeCoreAttestationResponse)
     async def tee_core_attestation(
         nonce: Optional[str] = Query(default=None),
-        _: Any = Depends(require_view_access),
+        _: Any = Depends(require_public_transparency),
     ) -> TeeCoreAttestationResponse:
         if tee_core is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="TEE core unavailable")
@@ -1314,6 +1546,79 @@ def create_app(
             document_b64=base64.b64encode(doc).decode("utf-8"),
             nonce_hex=nonce_hex,
         )
+
+    @app.get("/api/transparency/tee-core/audit/status", response_model=TeeCoreAuditStatusResponse)
+    async def tee_core_audit_status(_: Any = Depends(require_public_transparency)) -> TeeCoreAuditStatusResponse:
+        if tee_core is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="TEE core unavailable")
+        try:
+            result = tee_core.audit_status()
+        except TeeCoreError as exc:
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc))
+        try:
+            return TeeCoreAuditStatusResponse(
+                audit_address=str(result.get("audit_address") or ""),
+                audit_seq=int(result.get("audit_seq") or 0),
+                audit_head_hash=str(result.get("audit_head_hash") or ""),
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc))
+
+    @app.get("/api/transparency/tee-core/audit/checkpoint", response_model=TeeCoreAuditCheckpointResponse)
+    async def tee_core_audit_checkpoint(
+        contract_address: Optional[str] = Query(default=None),
+        chain_id: Optional[int] = Query(default=None, ge=1),
+        _: Any = Depends(require_public_transparency),
+    ) -> TeeCoreAuditCheckpointResponse:
+        if tee_core is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="TEE core unavailable")
+        effective_chain_id = int(chain_id) if chain_id is not None else int(getattr(settings, "chain_id", 0) or 0)
+        if effective_chain_id <= 0:
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="chain_id unavailable")
+        try:
+            result = tee_core.audit_checkpoint(chain_id=effective_chain_id, contract_address=contract_address)
+        except TeeCoreError as exc:
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc))
+        try:
+            return TeeCoreAuditCheckpointResponse(
+                schema=str(result.get("schema") or ""),
+                audit_address=str(result.get("audit_address") or ""),
+                chain_id=int(result.get("chain_id") or 0),
+                contract_address=str(result.get("contract_address") or ""),
+                seq=int(result.get("seq") or 0),
+                head_hash=str(result.get("head_hash") or ""),
+                message_hash=str(result.get("message_hash") or ""),
+                signature=str(result.get("signature") or ""),
+                timestamp=str(result.get("timestamp") or ""),
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc))
+
+    @app.get("/api/transparency/tee-core/log", response_model=TeeCoreTransparencyLogResponse)
+    async def tee_core_transparency_log_entries(
+        orchestrator_id: Optional[str] = Query(default=None),
+        since_seq: Optional[int] = Query(default=None, ge=0),
+        limit: int = Query(default=200, ge=1, le=1000),
+        order: Literal["asc", "desc"] = Query(default="desc"),
+        _: Any = Depends(require_public_transparency),
+    ) -> TeeCoreTransparencyLogResponse:
+        entries = tee_core_transparency_log.entries(
+            orchestrator_id=orchestrator_id,
+            since_seq=since_seq,
+            limit=int(limit),
+            order=order,
+        )
+        return TeeCoreTransparencyLogResponse(entries=entries)
+
+    @app.get("/api/transparency/tee-core/receipt", response_model=TeeCoreTransparencyLogEntry)
+    async def tee_core_transparency_receipt(
+        event_id: str = Query(min_length=1),
+        _: Any = Depends(require_public_transparency),
+    ) -> TeeCoreTransparencyLogEntry:
+        entry = tee_core_transparency_log.find_by_event_id(event_id)
+        if entry is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Receipt not found")
+        return entry
 
     @app.post("/api/orchestrators/register", response_model=RegistrationResponse)
     async def register(payload: RegistrationPayload, request: Request) -> RegistrationResponse:
@@ -1835,21 +2140,32 @@ def create_app(
         workload_store.upsert(payload.workload_id, record)
 
         if payload.status in {"verified", "paid"} and amount > 0:
-            ledger.credit(
-                payload.orchestrator_id,
-                amount,
-                reason="workload_time",
-                metadata={
-                    "workload_id": payload.workload_id,
-                    "plan_id": payload.plan_id,
-                    "run_id": payload.run_id,
-                    "status": payload.status,
-                    "artifact_uri": payload.artifact_uri,
-                    "artifact_hash": payload.artifact_hash,
-                    "duration_ms": str(payload.duration_ms),
-                    "credit_eth_per_minute": str(credit_rate),
-                },
-            )
+            credit_metadata = {
+                "workload_id": payload.workload_id,
+                "plan_id": payload.plan_id,
+                "run_id": payload.run_id,
+                "status": payload.status,
+                "artifact_uri": payload.artifact_uri,
+                "artifact_hash": payload.artifact_hash,
+                "duration_ms": str(payload.duration_ms),
+                "credit_eth_per_minute": str(credit_rate),
+            }
+            if tee_core_authority:
+                _tee_core_credit(
+                    orchestrator_id=payload.orchestrator_id,
+                    amount_eth=amount,
+                    event_id=f"workload_time:{payload.workload_id}",
+                    reason="workload_time",
+                    metadata=credit_metadata,
+                    source="workload_time",
+                )
+            else:
+                ledger.credit(
+                    payload.orchestrator_id,
+                    amount,
+                    reason="workload_time",
+                    metadata=credit_metadata,
+                )
             credited_at = datetime.utcnow().isoformat() + "Z"
             updated = workload_store.update(payload.workload_id, {"credited": True, "credited_at": credited_at})
             if updated is not None:
@@ -1918,19 +2234,30 @@ def create_app(
             record = updated
         if _should_credit(record):
             amount = Decimal(record.get("payout_amount_eth", "0"))
-            ledger.credit(
-                record["orchestrator_id"],
-                amount,
-                reason="workload",
-                metadata={
-                    "workload_id": workload_id,
-                    "plan_id": record.get("plan_id"),
-                    "run_id": record.get("run_id"),
-                    "status": record.get("status"),
-                    "artifact_uri": record.get("artifact_uri"),
-                    "artifact_hash": record.get("artifact_hash"),
-                },
-            )
+            credit_metadata = {
+                "workload_id": workload_id,
+                "plan_id": record.get("plan_id"),
+                "run_id": record.get("run_id"),
+                "status": record.get("status"),
+                "artifact_uri": record.get("artifact_uri"),
+                "artifact_hash": record.get("artifact_hash"),
+            }
+            if tee_core_authority:
+                _tee_core_credit(
+                    orchestrator_id=record["orchestrator_id"],
+                    amount_eth=amount,
+                    event_id=f"workload:{workload_id}",
+                    reason="workload",
+                    metadata=credit_metadata,
+                    source="workload",
+                )
+            else:
+                ledger.credit(
+                    record["orchestrator_id"],
+                    amount,
+                    reason="workload",
+                    metadata=credit_metadata,
+                )
             credited_at = datetime.utcnow().isoformat() + "Z"
             credited_update = workload_store.update(
                 workload_id,
@@ -2016,10 +2343,26 @@ def create_app(
     @app.get("/api/recordings/presign", response_model=RecordingPresignResponse)
     async def presign_recording_download(
         s3_uri: str = Query(min_length=3, max_length=1024),
-        _: Any = Depends(require_view_access),
+        _: Any = Depends(require_strict_admin),
     ) -> RecordingPresignResponse:
         if not s3_uri.startswith("s3://"):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Expected s3:// URI")
+        if not recordings_bucket:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="PAYMENTS_RECORDINGS_BUCKET is unset",
+            )
+        try:
+            bucket, key = parse_s3_uri(s3_uri)
+        except ValueError:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid s3:// URI")
+        if bucket != recordings_bucket:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="S3 bucket not permitted")
+        expected_prefix = (recordings_prefix or "").strip().strip("/")
+        if expected_prefix:
+            required_prefix = expected_prefix + "/"
+            if not key.startswith(required_prefix):
+                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="S3 key prefix not permitted")
         url = presign_recording_download_url(s3_uri)
         if not url:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unable to presign URL")
@@ -2275,22 +2618,33 @@ def create_app(
 
                 workload_store.upsert(workload_id, record)
                 if amount > 0:
-                    ledger.credit(
-                        orch_id,
-                        amount,
-                        reason="workload_time",
-                        metadata={
-                            "workload_id": workload_id,
-                            "job_id": job_id,
-                            "plan_id": payload.plan_id,
-                            "run_id": payload.run_id,
-                            "status": "verified",
-                            "artifact_uri": s3_uri,
-                            "artifact_hash": artifact_hash,
-                            "duration_ms": str(duration_ms),
-                            "credit_eth_per_minute": str(credit_rate),
-                        },
-                    )
+                    credit_metadata = {
+                        "workload_id": workload_id,
+                        "job_id": job_id,
+                        "plan_id": payload.plan_id,
+                        "run_id": payload.run_id,
+                        "status": "verified",
+                        "artifact_uri": s3_uri,
+                        "artifact_hash": artifact_hash,
+                        "duration_ms": str(duration_ms),
+                        "credit_eth_per_minute": str(credit_rate),
+                    }
+                    if tee_core_authority:
+                        _tee_core_credit(
+                            orchestrator_id=orch_id,
+                            amount_eth=amount,
+                            event_id=f"workload_time:{workload_id}",
+                            reason="workload_time",
+                            metadata=credit_metadata,
+                            source="job_workload_time",
+                        )
+                    else:
+                        ledger.credit(
+                            orch_id,
+                            amount,
+                            reason="workload_time",
+                            metadata=credit_metadata,
+                        )
                     credited_at = datetime.utcnow().isoformat() + "Z"
                     workload_store.update(workload_id, {"credited": True, "credited_at": credited_at})
 
@@ -2552,6 +2906,35 @@ def create_app(
 
         credit_rate = Decimal(str(getattr(settings, "session_credit_eth_per_minute", "0") or "0"))
         segment_seconds = int(getattr(settings, "session_segment_seconds", 2400) or 2400)
+
+        ledger_sink: Optional[Any] = ledger
+        if tee_core_authority and credit_rate > 0:
+            if tee_core is None:
+                raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="TEE core unavailable")
+
+            class TeeCoreLedgerAdapter:
+                def credit(
+                    self,
+                    orchestrator_id: str,
+                    amount: Decimal,
+                    *,
+                    reason: Optional[str] = None,
+                    metadata: Optional[Dict[str, Any]] = None,
+                ) -> Decimal:
+                    meta = dict(metadata) if isinstance(metadata, dict) else None
+                    proof_hash = meta.get("proof_hash") if meta else None
+                    event_id = f"session:{proof_hash}" if isinstance(proof_hash, str) and proof_hash else f"session:{uuid.uuid4().hex}"
+                    return _tee_core_credit(
+                        orchestrator_id=orchestrator_id,
+                        amount_eth=amount,
+                        event_id=event_id,
+                        reason=reason,
+                        metadata=meta,
+                        source="session_time",
+                    )
+
+            ledger_sink = TeeCoreLedgerAdapter()
+
         stored = session_store.apply_event(
             session_id=payload.session_id,
             event=payload.event,
@@ -2562,7 +2945,7 @@ def create_app(
             edge_id=payload.edge_id,
             segment_seconds=segment_seconds,
             credit_eth_per_minute=credit_rate,
-            ledger=ledger,
+            ledger=ledger_sink,
         )
 
         # Tie session activity into activity leases so autosleep watchers can avoid stopping an orchestrator mid-session.
@@ -3106,12 +3489,22 @@ def create_app(
             metadata["reference_workload_id"] = payload.reference_workload_id
         if payload.notes:
             metadata["notes"] = payload.notes
-        balance = ledger.credit(
-            payload.orchestrator_id,
-            payload.amount_eth,
-            reason=payload.reason or "adjustment",
-            metadata=metadata or None,
-        )
+        if tee_core_authority:
+            balance = _tee_core_apply_delta(
+                orchestrator_id=payload.orchestrator_id,
+                delta_eth=payload.amount_eth,
+                event_id=f"adjustment:{uuid.uuid4().hex}",
+                reason=payload.reason or "adjustment",
+                metadata=metadata or None,
+                source="ledger_adjustment",
+            )
+        else:
+            balance = ledger.credit(
+                payload.orchestrator_id,
+                payload.amount_eth,
+                reason=payload.reason or "adjustment",
+                metadata=metadata or None,
+            )
         return LedgerAdjustmentResponse(
             orchestrator_id=payload.orchestrator_id,
             balance_eth=str(balance),

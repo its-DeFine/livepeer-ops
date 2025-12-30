@@ -419,6 +419,228 @@ async def test_workload_credit_includes_artifact_metadata(temp_paths):
 
 
 @pytest.mark.anyio("asyncio")
+async def test_transparency_log_endpoints_read_jsonl(temp_paths):
+    registry, ledger = build_registry(temp_paths)
+    settings = build_settings(temp_paths, api_admin_token="secret")
+    app = create_app(registry, ledger, settings)
+    transport = httpx.ASGITransport(app=app)
+
+    balances_path, _ = temp_paths
+    log_path = balances_path.parent / "audit" / "tee-core-transparency.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    log_entry = {
+        "schema": "payments-host:tee-core-transparency-log:v1",
+        "received_at": "2025-01-01T00:00:00Z",
+        "source": "test",
+        "audit_entry": {
+            "schema": "payments-tee-core:audit:v1",
+            "seq": 1,
+            "prev_hash": "0x" + ("00" * 32),
+            "timestamp": "2025-01-01T00:00:00Z",
+            "kind": "credit",
+            "event_id": "event-1",
+            "orchestrator_id": "orch-x",
+            "recipient": "0x" + ("11" * 20),
+            "delta_wei": "1",
+            "balance_wei": "1",
+            "entry_hash": "0x" + ("22" * 32),
+            "signer": "0x" + ("33" * 20),
+            "signature": "0x" + ("44" * 65),
+        },
+    }
+    log_path.write_text(json.dumps(log_entry) + "\n", encoding="utf-8")
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get(
+            "/api/transparency/tee-core/log?orchestrator_id=orch-x",
+            headers={"X-Admin-Token": "secret"},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["entries"][0]["audit_entry"]["event_id"] == "event-1"
+
+        receipt = await client.get(
+            "/api/transparency/tee-core/receipt?event_id=event-1",
+            headers={"X-Admin-Token": "secret"},
+        )
+        assert receipt.status_code == 200
+        assert receipt.json()["audit_entry"]["seq"] == 1
+
+
+@pytest.mark.anyio("asyncio")
+async def test_transparency_endpoints_are_public_even_with_tokens(temp_paths):
+    registry, ledger = build_registry(temp_paths)
+    settings = build_settings(temp_paths, api_admin_token="secret", viewer_tokens=["viewer-token"])
+    app = create_app(registry, ledger, settings)
+    transport = httpx.ASGITransport(app=app)
+
+    balances_path, _ = temp_paths
+    log_path = balances_path.parent / "audit" / "tee-core-transparency.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_entry = {
+        "schema": "payments-host:tee-core-transparency-log:v1",
+        "received_at": "2025-01-01T00:00:00Z",
+        "source": "test",
+        "audit_entry": {
+            "schema": "payments-tee-core:audit:v1",
+            "seq": 1,
+            "prev_hash": "0x" + ("00" * 32),
+            "timestamp": "2025-01-01T00:00:00Z",
+            "kind": "credit",
+            "event_id": "event-1",
+            "orchestrator_id": "orch-x",
+            "recipient": "0x" + ("11" * 20),
+            "delta_wei": "1",
+            "balance_wei": "1",
+            "entry_hash": "0x" + ("22" * 32),
+            "signer": "0x" + ("33" * 20),
+            "signature": "0x" + ("44" * 65),
+        },
+    }
+    log_path.write_text(json.dumps(log_entry) + "\n", encoding="utf-8")
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get("/api/transparency/tee-core/log?orchestrator_id=orch-x")
+        assert resp.status_code == 200
+        assert resp.json()["entries"][0]["audit_entry"]["event_id"] == "event-1"
+
+
+@pytest.mark.anyio("asyncio")
+async def test_orchestrator_edge_disabled_without_token(temp_paths):
+    registry, ledger = build_registry(temp_paths)
+    settings = build_settings(temp_paths)
+    app = create_app(registry, ledger, settings)
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get("/api/orchestrator-edge?orchestrator_id=orch-edge")
+
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "Edge config endpoint disabled"
+
+
+@pytest.mark.anyio("asyncio")
+async def test_orchestrator_edge_requires_token_when_enabled(temp_paths):
+    balances_path, _ = temp_paths
+    edge_assignments_path = balances_path.parent / "edge_assignments.json"
+    edge_assignments_path.write_text(
+        json.dumps(
+            {
+                "orch-edge": {
+                    "edge_id": "edge-1",
+                    "matchmaker_host": "match.example.com",
+                    "matchmaker_port": 8889,
+                    "edge_cidrs": ["10.0.0.0/24"],
+                    "turn_external_ip": "203.0.113.10",
+                }
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    registry, ledger = build_registry(temp_paths)
+    settings = build_settings(
+        temp_paths,
+        edge_config_token="edge-secret",
+        edge_assignments_path=edge_assignments_path,
+    )
+    app = create_app(registry, ledger, settings)
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        missing = await client.get("/api/orchestrator-edge?orchestrator_id=orch-edge")
+        assert missing.status_code == 401
+
+        wrong = await client.get(
+            "/api/orchestrator-edge?orchestrator_id=orch-edge",
+            headers={"Authorization": "Bearer nope"},
+        )
+        assert wrong.status_code == 401
+
+        ok = await client.get(
+            "/api/orchestrator-edge?orchestrator_id=orch-edge",
+            headers={"Authorization": "Bearer edge-secret"},
+        )
+
+    assert ok.status_code == 200
+    data = ok.json()
+    assert data["edge_id"] == "edge-1"
+    assert data["matchmaker_host"] == "match.example.com"
+
+
+@pytest.mark.anyio("asyncio")
+async def test_presign_recording_download_disabled_without_admin_token(temp_paths):
+    registry, ledger = build_registry(temp_paths)
+    settings = build_settings(
+        temp_paths,
+        recordings_bucket="clips",
+        recordings_prefix="recordings",
+    )
+    app = create_app(registry, ledger, settings)
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get("/api/recordings/presign?s3_uri=s3://clips/recordings/test.mkv")
+
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "Admin endpoint disabled"
+
+
+@pytest.mark.anyio("asyncio")
+async def test_presign_recording_download_requires_admin_and_enforces_prefix(temp_paths):
+    registry, ledger = build_registry(temp_paths)
+    settings = build_settings(
+        temp_paths,
+        api_admin_token="secret",
+        recordings_bucket="clips",
+        recordings_prefix="recordings",
+        recordings_presign_seconds=123,
+    )
+    app = create_app(registry, ledger, settings)
+    transport = httpx.ASGITransport(app=app)
+
+    class _FakeS3Client:
+        def generate_presigned_url(self, *_args, **_kwargs):
+            return "https://example.com/recording.mkv"
+
+    with patch("payments.api.boto3.client", return_value=_FakeS3Client()):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            missing = await client.get("/api/recordings/presign?s3_uri=s3://clips/recordings/test.mkv")
+            assert missing.status_code == 401
+
+            wrong = await client.get(
+                "/api/recordings/presign?s3_uri=s3://clips/recordings/test.mkv",
+                headers={"X-Admin-Token": "nope"},
+            )
+            assert wrong.status_code == 401
+
+            wrong_bucket = await client.get(
+                "/api/recordings/presign?s3_uri=s3://other/recordings/test.mkv",
+                headers={"X-Admin-Token": "secret"},
+            )
+            assert wrong_bucket.status_code == 403
+
+            wrong_prefix = await client.get(
+                "/api/recordings/presign?s3_uri=s3://clips/other/test.mkv",
+                headers={"X-Admin-Token": "secret"},
+            )
+            assert wrong_prefix.status_code == 403
+
+            ok = await client.get(
+                "/api/recordings/presign?s3_uri=s3://clips/recordings/test.mkv",
+                headers={"X-Admin-Token": "secret"},
+            )
+
+    assert ok.status_code == 200
+    body = ok.json()
+    assert body["s3_uri"] == "s3://clips/recordings/test.mkv"
+    assert body["url"] == "https://example.com/recording.mkv"
+    assert body["expires_in"] == 123
+
+
+@pytest.mark.anyio("asyncio")
 async def test_viewer_tokens_allow_readonly_access(temp_paths):
     registry, ledger = build_registry(temp_paths)
     address = "0xCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
