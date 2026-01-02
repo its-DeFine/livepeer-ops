@@ -163,7 +163,7 @@ jobs:
       - name: Create or update draft PR
         if: ${{ steps.secrets.outputs.can_run == 'true' && steps.diff.outputs.has_changes == 'true' }}
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.LAUNCH_FACTORY_GH_TOKEN || github.token }}
           CODEX_FINAL_MESSAGE: ${{ steps.run_codex.outputs['final-message'] }}
         run: |
           set -euo pipefail
@@ -195,7 +195,7 @@ jobs:
       - name: Comment on issue with result
         if: ${{ steps.secrets.outputs.can_run == 'true' }}
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.LAUNCH_FACTORY_GH_TOKEN || github.token }}
           CODEX_FINAL_MESSAGE: ${{ steps.run_codex.outputs['final-message'] }}
         run: |
           set -euo pipefail
