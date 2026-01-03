@@ -35,9 +35,11 @@ jobs:
           case "${{ github.event.label.name }}" in
             agent:code)
               echo "PROMPT_FILE=.github/codex/prompts/agent_code.md" >> "$GITHUB_ENV"
+              echo "CODEX_MODEL=gpt-5.1-codex-max" >> "$GITHUB_ENV"
               ;;
             agent:marketing)
               echo "PROMPT_FILE=.github/codex/prompts/agent_marketing.md" >> "$GITHUB_ENV"
+              echo "CODEX_MODEL=gpt-5.1" >> "$GITHUB_ENV"
               ;;
             *)
               echo "Unexpected label: ${{ github.event.label.name }}" >&2
@@ -114,7 +116,7 @@ jobs:
           openai-api-key: ${{ secrets.OPENAI_API_KEY }}
           prompt-file: ${{ env.PROMPT_FILE }}
           sandbox: workspace-write
-          codex-args: --full-auto
+          codex-args: --full-auto --model ${{ env.CODEX_MODEL }}
 
       - name: Detect changes
         if: ${{ steps.secrets.outputs.can_run == 'true' }}
