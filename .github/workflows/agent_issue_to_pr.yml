@@ -6,7 +6,7 @@ on:
 
 jobs:
   codex:
-    if: ${{ github.event.label.name == 'agent:code' || github.event.label.name == 'agent:marketing' }}
+    if: ${{ github.event.label.name == 'agent:code' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -36,10 +36,6 @@ jobs:
             agent:code)
               echo "PROMPT_FILE=.github/codex/prompts/agent_code.md" >> "$GITHUB_ENV"
               echo "CODEX_MODEL=gpt-5.1-codex-max" >> "$GITHUB_ENV"
-              ;;
-            agent:marketing)
-              echo "PROMPT_FILE=.github/codex/prompts/agent_marketing.md" >> "$GITHUB_ENV"
-              echo "CODEX_MODEL=gpt-5.1" >> "$GITHUB_ENV"
               ;;
             *)
               echo "Unexpected label: ${{ github.event.label.name }}" >&2
