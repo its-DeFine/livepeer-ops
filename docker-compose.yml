@@ -22,6 +22,11 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     volumes:
       - ./data:/app/data
     ports:
@@ -41,6 +46,11 @@ services:
       - ./data/audit:/var/embody/audit:ro
       - ./ops/fluent-bit.conf:/fluent-bit/etc/fluent-bit.conf:ro
     command: ["fluent-bit", "-c", "/fluent-bit/etc/fluent-bit.conf"]
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     networks:
       - vtuber_network
 
@@ -69,6 +79,11 @@ services:
         "--interval-seconds",
         "${CHECKPOINT_INTERVAL_SECONDS:-600}"
       ]
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     networks:
       - vtuber_network
 

@@ -38,6 +38,12 @@ See `docs/backups.md`.
 
 This backend can pay orchestrators by issuing an *always-winning* Livepeer TicketBroker ticket and redeeming it while paying gas.
 
+Quickstart (local backend + optional demo redemption):
+
+```bash
+./scripts/onboard_livepeer_ticketbroker.sh
+```
+
 - Configure:
   - `PAYMENTS_PAYOUT_STRATEGY=livepeer_ticket`
   - `PAYMENTS_LIVEPEER_TICKET_BROKER_ADDRESS=0xa8bb618b1520e284046f3dfc448851a1ff26e41b` (Arbitrum mainnet proxy)

@@ -238,4 +238,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except Exception as exc:
+        sys.stderr.write(f"{exc}\n")
+        raise SystemExit(1)
