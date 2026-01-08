@@ -34,6 +34,7 @@ from .activity import ActivityLeaseStore, parse_iso8601 as parse_activity_iso860
 from .config import PaymentSettings
 from .jobs import JobStore
 from .ledger import Ledger
+from .ledger_proofs import build_proof as build_ledger_proof
 from .registry import Registry, RegistryError
 from .licenses import (
     ImageAccessStore,
@@ -552,12 +553,38 @@ class OrchestratorCredentialTokenPayload(BaseModel):
 class OrchestratorCredentialTokenResponse(BaseModel):
     token_id: str
     token: str
+    expires_at: Optional[str] = None
+
+
+class LedgerProofEntry(BaseModel):
+    orchestrator_id: str
+    recipient: str
+    balance_eth: str
+    balance_wei: str
+    orch_hash: str
+    leaf_hash: str
+
+
+class LedgerEntryResponse(BaseModel):
+    ledger_root: str
+    leaf_index: int
+    tree_size: int
+    entry: LedgerProofEntry
+
+
+class LedgerProofResponse(BaseModel):
+    ledger_root: str
+    leaf_index: int
+    tree_size: int
+    entry: LedgerProofEntry
+    proof: List[str]
 
 
 class LicenseTokenRecord(BaseModel):
     token_id: str
     orchestrator_id: str
     created_at: str
+    expires_at: Optional[str] = None
     revoked_at: Optional[str]
     last_seen_at: Optional[str]
 
@@ -1873,6 +1900,69 @@ def create_app(
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Receipt not found")
         return entry
 
+    @app.get(
+        "/api/transparency/tee-core/ledger-entry",
+        response_model=LedgerEntryResponse,
+    )
+    async def tee_core_ledger_entry(
+        orchestrator_id: str = Query(min_length=1, max_length=128),
+        _: Dict[str, str] = Depends(require_orchestrator_token),
+    ) -> LedgerEntryResponse:
+        try:
+            entry, leaf_index, tree_size, root, _ = build_ledger_proof(
+                ledger,
+                registry,
+                orchestrator_id,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+
+        return LedgerEntryResponse(
+            ledger_root="0x" + root.hex(),
+            leaf_index=int(leaf_index),
+            tree_size=int(tree_size),
+            entry=LedgerProofEntry(
+                orchestrator_id=entry.orchestrator_id,
+                recipient=entry.recipient,
+                balance_eth=entry.balance_eth,
+                balance_wei=str(entry.balance_wei),
+                orch_hash="0x" + entry.orch_hash.hex(),
+                leaf_hash="0x" + entry.leaf_hash.hex(),
+            ),
+        )
+
+    @app.get(
+        "/api/transparency/tee-core/ledger-proof",
+        response_model=LedgerProofResponse,
+    )
+    async def tee_core_ledger_proof(
+        orchestrator_id: str = Query(min_length=1, max_length=128),
+        _: Dict[str, str] = Depends(require_orchestrator_token),
+    ) -> LedgerProofResponse:
+        try:
+            entry, leaf_index, tree_size, root, proof = build_ledger_proof(
+                ledger,
+                registry,
+                orchestrator_id,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+
+        return LedgerProofResponse(
+            ledger_root="0x" + root.hex(),
+            leaf_index=int(leaf_index),
+            tree_size=int(tree_size),
+            entry=LedgerProofEntry(
+                orchestrator_id=entry.orchestrator_id,
+                recipient=entry.recipient,
+                balance_eth=entry.balance_eth,
+                balance_wei=str(entry.balance_wei),
+                orch_hash="0x" + entry.orch_hash.hex(),
+                leaf_hash="0x" + entry.leaf_hash.hex(),
+            ),
+            proof=["0x" + item.hex() for item in proof],
+        )
+
     @app.post("/api/orchestrators/register", response_model=RegistrationResponse)
     async def register(payload: RegistrationPayload, request: Request) -> RegistrationResponse:
         client_ip = request.client.host if request.client else None
@@ -2019,7 +2109,10 @@ def create_app(
         if not credential_verifier.verify(owner_norm, delegate_norm):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Credential not valid on-chain")
 
-        minted = credential_tokens.mint(orchestrator_id)
+        ttl_seconds = int(
+            getattr(settings, "orchestrator_credential_token_ttl_seconds", 900) or 900
+        )
+        minted = credential_tokens.mint(orchestrator_id, ttl_seconds=ttl_seconds)
         return OrchestratorCredentialTokenResponse(**minted)
 
     @app.get("/api/orchestrator-edge", response_model=EdgeConfigResponse)

@@ -20,7 +20,7 @@ For the ZK ledger proof statement and protocol, see `docs/tee-zk-proof.md`.
 
 These endpoints are rate-limited and intentionally unauthenticated so **external witnesses** can operate without operator-issued tokens.
 
-## Private endpoints (credential required; planned)
+## Private endpoints (credential required)
 
 - `GET /api/transparency/tee-core/ledger-proof?orchestrator_id=...`
 - `GET /api/transparency/tee-core/ledger-entry?orchestrator_id=...`

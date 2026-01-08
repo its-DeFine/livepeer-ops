@@ -16,6 +16,8 @@ from payments.api import create_app
 from payments.ledger import Ledger
 from payments.registry import Registry
 from payments.orchestrator_credentials import credential_message_hash
+from payments.ledger_proofs import build_proof as build_ledger_proof
+from payments.merkle import verify_inclusion_proof
 
 
 @pytest.fixture()
@@ -854,6 +856,71 @@ async def test_orchestrator_credential_token_flow(temp_paths):
         )
         assert me.status_code == 200
         assert me.json()["orchestrator_id"] == "orch-self"
+
+
+@pytest.mark.anyio("asyncio")
+async def test_ledger_proof_endpoint(temp_paths):
+    balances_path, registry_path = temp_paths
+    journal_path = balances_path.parent / "audit" / "ledger-events.log"
+    ledger = Ledger(balances_path, journal_path=journal_path)
+    registry_settings = SimpleNamespace(
+        top_contract_address=None,
+        top_contract_function="getTop",
+        top_contract_abi_json=None,
+        top_contract_abi_path=None,
+        registration_rate_limit_per_minute=5,
+        registration_rate_limit_burst=5,
+        api_admin_token=None,
+        audit_log_path=registry_path.with_name("registry-audit.log"),
+    )
+    registry = Registry(
+        path=registry_path,
+        settings=registry_settings,
+        ledger=ledger,
+        web3=None,
+    )
+
+    address = "0xEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE"
+    with patch.object(Registry, "_resolve_top_set", return_value={address.lower()}):
+        registry.register(orchestrator_id="orch-proof", address=address)
+
+    ledger.credit("orch-proof", Decimal("0.05"), reason="workload")
+
+    app_settings = build_settings(temp_paths, api_admin_token="secret")
+    app = create_app(registry, ledger, app_settings)
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        token_resp = await client.post(
+            "/api/licenses/orchestrators/orch-proof/tokens",
+            headers={"X-Admin-Token": "secret"},
+        )
+        assert token_resp.status_code == 200
+        token = token_resp.json()["token"]
+
+        proof_resp = await client.get(
+            "/api/transparency/tee-core/ledger-proof",
+            params={"orchestrator_id": "orch-proof"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert proof_resp.status_code == 200
+        payload = proof_resp.json()
+
+        entry, leaf_index, tree_size, root, proof = build_ledger_proof(
+            ledger, registry, "orch-proof"
+        )
+        assert payload["ledger_root"].lower() == ("0x" + root.hex())
+        assert payload["leaf_index"] == leaf_index
+        assert payload["tree_size"] == tree_size
+
+        proof_bytes = [bytes.fromhex(item[2:]) for item in payload["proof"]]
+        assert verify_inclusion_proof(
+            leaf=entry.leaf_hash,
+            leaf_index=leaf_index,
+            tree_size=tree_size,
+            proof=proof_bytes,
+            expected_root=root,
+        )
 
 @pytest.mark.anyio("asyncio")
 async def test_ledger_adjustment_requires_admin(temp_paths):

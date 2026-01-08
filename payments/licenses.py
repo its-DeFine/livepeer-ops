@@ -108,21 +108,30 @@ class OrchestratorTokenStore:
             json.dump(self._tokens, handle, indent=2, sort_keys=True)
         tmp.replace(self.path)
 
-    def mint(self, orchestrator_id: str) -> Dict[str, str]:
+    def mint(self, orchestrator_id: str, *, ttl_seconds: Optional[int] = None) -> Dict[str, str]:
         token_value = secrets.token_urlsafe(32)
         token_hash = _sha256_hex(token_value)
         token_id = uuid.uuid4().hex
+        expires_at = None
+        if ttl_seconds is not None:
+            ttl = int(ttl_seconds)
+            if ttl > 0:
+                expires_at = isoformat(utcnow() + timedelta(seconds=ttl))
         record = {
             "orchestrator_id": orchestrator_id,
             "token_hash": token_hash,
             "created_at": isoformat(utcnow()),
+            "expires_at": expires_at,
             "revoked_at": None,
             "last_seen_at": None,
         }
         with self._lock:
             self._tokens[token_id] = record
             self._persist()
-        return {"token_id": token_id, "token": token_value}
+        result = {"token_id": token_id, "token": token_value}
+        if expires_at:
+            result["expires_at"] = expires_at
+        return result
 
     def revoke(self, token_id: str) -> bool:
         with self._lock:
@@ -151,6 +160,17 @@ class OrchestratorTokenStore:
             for token_id, record in self._tokens.items():
                 if record.get("revoked_at"):
                     continue
+                expires_at = record.get("expires_at")
+                if isinstance(expires_at, str) and expires_at:
+                    try:
+                        if parse_iso8601(expires_at) <= utcnow():
+                            updated = dict(record)
+                            updated["revoked_at"] = isoformat(utcnow())
+                            self._tokens[token_id] = updated
+                            self._persist()
+                            continue
+                    except Exception:
+                        continue
                 stored = record.get("token_hash")
                 if not isinstance(stored, str):
                     continue

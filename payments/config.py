@@ -191,6 +191,10 @@ class PaymentSettings(BaseSettings):
         default=300,
         validation_alias="PAYMENTS_ORCHESTRATOR_CREDENTIAL_NONCE_TTL_SECONDS",
     )
+    orchestrator_credential_token_ttl_seconds: int = Field(
+        default=900,
+        validation_alias="PAYMENTS_ORCHESTRATOR_CREDENTIAL_TOKEN_TTL_SECONDS",
+    )
 
     api_host: str = Field(default="0.0.0.0", validation_alias="PAYMENTS_API_HOST")
     api_port: int = Field(default=8081, validation_alias="PAYMENTS_API_PORT")

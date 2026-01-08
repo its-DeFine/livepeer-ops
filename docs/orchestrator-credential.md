@@ -34,13 +34,19 @@ The reference implementation lives in `contracts/OrchestratorCredential.sol`.
 1) Client requests a nonce from the backend.
 2) Delegate signs the nonce + orchestrator_id + owner + delegate + expiry.
 3) Backend verifies on-chain ownership + delegate binding.
-4) Backend issues an access token (TTL optional/configurable).
+4) Backend issues an access token (short-lived; TTL configurable).
 5) Private endpoints accept the access token (no repeated wallet signatures).
 
-API endpoints (planned):
+API endpoints:
 
 - `POST /api/orchestrators/{orchestrator_id}/credential/nonce`
 - `POST /api/orchestrators/{orchestrator_id}/credential/token`
+
+Config:
+
+- `PAYMENTS_ORCHESTRATOR_CREDENTIAL_CONTRACT_ADDRESS`
+- `PAYMENTS_ORCHESTRATOR_CREDENTIAL_NONCE_TTL_SECONDS` (default 300)
+- `PAYMENTS_ORCHESTRATOR_CREDENTIAL_TOKEN_TTL_SECONDS` (default 900)
 
 ## Revocation / rotation
 
