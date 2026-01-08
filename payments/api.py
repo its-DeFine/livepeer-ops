@@ -59,6 +59,7 @@ from .merkle import inclusion_proof, tree_root_for_size, verify_inclusion_proof
 from .policy import hash_snapshot as policy_hash_snapshot, snapshot as policy_snapshot
 from .transparency import TeeCoreTransparencyLog
 from .workloads import WorkloadStore
+from .workload_offers import WorkloadOfferStore, WorkloadSubscriptionStore
 
 
 class RateLimiter:
@@ -403,6 +404,51 @@ class WorkloadSummaryResponse(BaseModel):
     range_start: Optional[str]
     range_end: Optional[str]
     orchestrators: List[WorkloadSummaryItem]
+
+
+class WorkloadOfferCreatePayload(BaseModel):
+    offer_id: str = Field(min_length=1, max_length=64)
+    title: str = Field(min_length=1, max_length=128)
+    description: Optional[str] = Field(default=None, max_length=1024)
+    kind: str = Field(min_length=1, max_length=64)
+    payout_amount_eth: Decimal = Field(gt=Decimal("0"))
+    active: bool = True
+    config: Dict[str, Any] = Field(default_factory=dict)
+
+
+class WorkloadOfferUpdatePayload(BaseModel):
+    title: Optional[str] = Field(default=None, max_length=128)
+    description: Optional[str] = Field(default=None, max_length=1024)
+    kind: Optional[str] = Field(default=None, max_length=64)
+    payout_amount_eth: Optional[Decimal] = Field(default=None, gt=Decimal("0"))
+    active: Optional[bool] = None
+    config: Optional[Dict[str, Any]] = None
+
+
+class WorkloadOfferRecord(BaseModel):
+    offer_id: str
+    title: str
+    description: Optional[str]
+    kind: str
+    payout_amount_eth: str
+    active: bool
+    config: Dict[str, Any]
+    created_at: str
+    updated_at: str
+
+
+class WorkloadOfferListResponse(BaseModel):
+    offers: List[WorkloadOfferRecord]
+
+
+class WorkloadOfferSelectionPayload(BaseModel):
+    offer_ids: List[str] = Field(default_factory=list)
+
+
+class WorkloadOfferSelectionResponse(BaseModel):
+    orchestrator_id: str
+    offer_ids: List[str]
+    offers: List[WorkloadOfferRecord]
 
 
 class RecordingPresignResponse(BaseModel):
@@ -865,9 +911,16 @@ def create_app(
     app = FastAPI(title="Embody Payments", version="1.0.0")
     logger = logging.getLogger(__name__)
 
-    workload_store = WorkloadStore(settings.workloads_path)
-    job_store = JobStore(settings.jobs_path)
     data_dir = Path(getattr(settings, "workloads_path", Path("/app/data/workloads.json"))).parent
+    workload_store = WorkloadStore(settings.workloads_path)
+    workload_offer_store = WorkloadOfferStore(
+        Path(getattr(settings, "workload_offers_path", data_dir / "workload_offers.json"))
+    )
+    workload_subscriptions = WorkloadSubscriptionStore(
+        Path(getattr(settings, "workload_subscriptions_path", data_dir / "workload_subscriptions.json")),
+        max_offers=int(getattr(settings, "workload_subscription_max", 50) or 50),
+    )
+    job_store = JobStore(settings.jobs_path)
     session_store = SessionStore(Path(getattr(settings, "sessions_path", data_dir / "sessions.json")))
     activity_leases = ActivityLeaseStore(
         Path(getattr(settings, "activity_leases_path", data_dir / "activity_leases.json"))
@@ -2740,6 +2793,140 @@ def create_app(
             range_start=since,
             range_end=until,
             orchestrators=summary,
+        )
+
+    # ======================================================
+    # WORKLOAD OFFERS (catalog + orchestrator opt-in)
+    # ======================================================
+
+    def _offer_to_model(offer_id: str, payload: Dict[str, Any]) -> WorkloadOfferRecord:
+        cfg = payload.get("config")
+        return WorkloadOfferRecord(
+            offer_id=offer_id,
+            title=str(payload.get("title") or ""),
+            description=payload.get("description"),
+            kind=str(payload.get("kind") or ""),
+            payout_amount_eth=str(payload.get("payout_amount_eth") or "0"),
+            active=bool(payload.get("active", False)),
+            config=cfg if isinstance(cfg, dict) else {},
+            created_at=str(payload.get("created_at") or ""),
+            updated_at=str(payload.get("updated_at") or ""),
+        )
+
+    @app.post("/api/workload-offers", response_model=WorkloadOfferRecord)
+    async def create_workload_offer(
+        payload: WorkloadOfferCreatePayload,
+        _: Any = Depends(require_admin),
+    ) -> WorkloadOfferRecord:
+        if workload_offer_store.get(payload.offer_id):
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Offer already exists")
+        record = workload_offer_store.create(
+            payload.offer_id,
+            {
+                "title": payload.title,
+                "description": payload.description,
+                "kind": payload.kind,
+                "payout_amount_eth": str(payload.payout_amount_eth),
+                "active": bool(payload.active),
+                "config": payload.config or {},
+            },
+        )
+        return _offer_to_model(payload.offer_id, record)
+
+    @app.patch("/api/workload-offers/{offer_id}", response_model=WorkloadOfferRecord)
+    async def update_workload_offer(
+        offer_id: str,
+        payload: WorkloadOfferUpdatePayload,
+        _: Any = Depends(require_admin),
+    ) -> WorkloadOfferRecord:
+        record = workload_offer_store.get(offer_id)
+        if record is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Offer not found")
+        updates: Dict[str, Any] = {}
+        if payload.title is not None:
+            updates["title"] = payload.title
+        if payload.description is not None:
+            updates["description"] = payload.description
+        if payload.kind is not None:
+            updates["kind"] = payload.kind
+        if payload.payout_amount_eth is not None:
+            updates["payout_amount_eth"] = str(payload.payout_amount_eth)
+        if payload.active is not None:
+            updates["active"] = bool(payload.active)
+        if payload.config is not None:
+            updates["config"] = payload.config
+        updated = workload_offer_store.update(offer_id, updates) if updates else record
+        if updated is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Offer not found")
+        return _offer_to_model(offer_id, updated)
+
+    @app.get("/api/workload-offers", response_model=WorkloadOfferListResponse)
+    async def list_workload_offers(
+        active_only: bool = Query(default=True),
+        _: Any = Depends(require_view_access),
+    ) -> WorkloadOfferListResponse:
+        offers: List[WorkloadOfferRecord] = []
+        for offer_id, payload in workload_offer_store.iter_with_ids():
+            if active_only and not bool(payload.get("active", False)):
+                continue
+            offers.append(_offer_to_model(offer_id, payload))
+        offers.sort(key=lambda entry: entry.offer_id)
+        return WorkloadOfferListResponse(offers=offers)
+
+    @app.get("/api/workload-offers/subscriptions")
+    async def list_workload_offer_subscriptions(
+        _: Any = Depends(require_view_access),
+    ) -> Dict[str, Any]:
+        return {
+            "subscriptions": {
+                orchestrator_id: (payload.get("offer_ids") if isinstance(payload, dict) else [])
+                for orchestrator_id, payload in workload_subscriptions.iter_with_ids()
+            }
+        }
+
+    @app.get("/api/orchestrators/me/workload-offers", response_model=WorkloadOfferSelectionResponse)
+    async def get_orchestrator_workload_offers(
+        auth: Dict[str, str] = Depends(require_orchestrator_token),
+    ) -> WorkloadOfferSelectionResponse:
+        orchestrator_id = auth.get("orchestrator_id", "")
+        offer_ids = workload_subscriptions.get(orchestrator_id)
+        offers: List[WorkloadOfferRecord] = []
+        for offer_id in offer_ids:
+            record = workload_offer_store.get(offer_id)
+            if record is None:
+                continue
+            offers.append(_offer_to_model(offer_id, record))
+        return WorkloadOfferSelectionResponse(
+            orchestrator_id=orchestrator_id,
+            offer_ids=offer_ids,
+            offers=offers,
+        )
+
+    @app.put("/api/orchestrators/me/workload-offers", response_model=WorkloadOfferSelectionResponse)
+    async def set_orchestrator_workload_offers(
+        payload: WorkloadOfferSelectionPayload,
+        auth: Dict[str, str] = Depends(require_orchestrator_token),
+    ) -> WorkloadOfferSelectionResponse:
+        orchestrator_id = auth.get("orchestrator_id", "")
+        wanted = payload.offer_ids or []
+        missing = [offer_id for offer_id in wanted if not workload_offer_store.get(offer_id)]
+        if missing:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={"error": "Unknown offer ids", "missing": missing},
+            )
+        stored = workload_subscriptions.set(orchestrator_id, wanted)
+        offer_ids = stored.get("offer_ids") if isinstance(stored, dict) else []
+        offers: List[WorkloadOfferRecord] = []
+        for offer_id in offer_ids:
+            record = workload_offer_store.get(offer_id)
+            if record is None:
+                continue
+            offers.append(_offer_to_model(offer_id, record))
+        return WorkloadOfferSelectionResponse(
+            orchestrator_id=orchestrator_id,
+            offer_ids=offer_ids if isinstance(offer_ids, list) else [],
+            offers=offers,
         )
 
     # ======================================================

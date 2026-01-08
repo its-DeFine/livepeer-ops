@@ -246,6 +246,18 @@ class PaymentSettings(BaseSettings):
         default=Path("/app/data/workloads.json"),
         validation_alias="PAYMENTS_WORKLOADS_PATH",
     )
+    workload_offers_path: Path = Field(
+        default=Path("/app/data/workload_offers.json"),
+        validation_alias="PAYMENTS_WORKLOAD_OFFERS_PATH",
+    )
+    workload_subscriptions_path: Path = Field(
+        default=Path("/app/data/workload_subscriptions.json"),
+        validation_alias="PAYMENTS_WORKLOAD_SUBSCRIPTIONS_PATH",
+    )
+    workload_subscription_max: int = Field(
+        default=50,
+        validation_alias="PAYMENTS_WORKLOAD_SUBSCRIPTION_MAX",
+    )
     jobs_path: Path = Field(
         default=Path("/app/data/jobs.json"),
         validation_alias="PAYMENTS_JOBS_PATH",

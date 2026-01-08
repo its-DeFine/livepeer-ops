@@ -859,6 +859,77 @@ async def test_orchestrator_credential_token_flow(temp_paths):
 
 
 @pytest.mark.anyio("asyncio")
+async def test_workload_offers_create_list_and_select(temp_paths):
+    registry, ledger = build_registry(temp_paths)
+
+    address = "0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    with patch.object(Registry, "_resolve_top_set", return_value={address.lower()}):
+        registry.register(orchestrator_id="orch-offers", address=address)
+
+    app_settings = build_settings(temp_paths, api_admin_token="secret")
+    app = create_app(registry, ledger, app_settings)
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        create_offer = await client.post(
+            "/api/workload-offers",
+            headers={"X-Admin-Token": "secret"},
+            json={
+                "offer_id": "offer-gpu-bench",
+                "title": "GPU Benchmark",
+                "description": "Run a quick GPU benchmark",
+                "kind": "sla_gpu_benchmark",
+                "payout_amount_eth": "0.001",
+                "active": True,
+                "config": {"benchmark_type": "matrix_4096"},
+            },
+        )
+        assert create_offer.status_code == 200
+
+        offers = await client.get(
+            "/api/workload-offers",
+            headers={"X-Admin-Token": "secret"},
+        )
+        assert offers.status_code == 200
+        body = offers.json()
+        assert len(body["offers"]) == 1
+        assert body["offers"][0]["offer_id"] == "offer-gpu-bench"
+
+        token_resp = await client.post(
+            "/api/licenses/orchestrators/orch-offers/tokens",
+            headers={"X-Admin-Token": "secret"},
+        )
+        assert token_resp.status_code == 200
+        token = token_resp.json()["token"]
+
+        bad_select = await client.put(
+            "/api/orchestrators/me/workload-offers",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"offer_ids": ["missing-offer"]},
+        )
+        assert bad_select.status_code == 400
+
+        select = await client.put(
+            "/api/orchestrators/me/workload-offers",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"offer_ids": ["offer-gpu-bench"]},
+        )
+        assert select.status_code == 200
+        selection = select.json()
+        assert selection["orchestrator_id"] == "orch-offers"
+        assert selection["offer_ids"] == ["offer-gpu-bench"]
+        assert selection["offers"][0]["offer_id"] == "offer-gpu-bench"
+
+        get_sel = await client.get(
+            "/api/orchestrators/me/workload-offers",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert get_sel.status_code == 200
+        get_body = get_sel.json()
+        assert get_body["offer_ids"] == ["offer-gpu-bench"]
+
+
+@pytest.mark.anyio("asyncio")
 async def test_ledger_proof_endpoint(temp_paths):
     balances_path, registry_path = temp_paths
     journal_path = balances_path.parent / "audit" / "ledger-events.log"
