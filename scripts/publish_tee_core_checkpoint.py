@@ -220,17 +220,23 @@ def publish_once(args: argparse.Namespace) -> int:
     except Exception:
         tx["gas"] = 250_000
 
-    gas_price = web3.eth.gas_price
+    # web3 may include legacy fee fields (gasPrice) in build_transaction even when
+    # the chain supports EIP-1559. eth-account treats these as mutually exclusive.
+    tx.pop("gasPrice", None)
+    tx.pop("maxPriorityFeePerGas", None)
+    tx.pop("maxFeePerGas", None)
+
+    gas_price = int(web3.eth.gas_price)
     max_priority_fee = getattr(web3.eth, "max_priority_fee", None)
     if callable(max_priority_fee):
         try:
-            priority_fee = max_priority_fee()
+            priority_fee = int(max_priority_fee())
         except Exception:
             priority_fee = gas_price
-        tx["maxPriorityFeePerGas"] = priority_fee
-        tx["maxFeePerGas"] = max(gas_price, priority_fee) * 2
+        tx["maxPriorityFeePerGas"] = int(priority_fee)
+        tx["maxFeePerGas"] = int(max(gas_price, priority_fee) * 2)
     else:
-        tx["gasPrice"] = gas_price * 2
+        tx["gasPrice"] = int(gas_price * 2)
 
     signed = publisher.sign_transaction(tx)
     raw_tx = getattr(signed, "rawTransaction", None) or getattr(signed, "raw_transaction", None)
