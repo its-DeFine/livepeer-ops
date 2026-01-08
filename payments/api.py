@@ -45,6 +45,12 @@ from .licenses import (
     parse_s3_uri,
     parse_iso8601 as parse_license_iso8601,
 )
+from .orchestrator_credentials import (
+    CredentialNonceStore,
+    OrchestratorCredentialVerifier,
+    recover_delegate,
+    normalize_nonce,
+)
 from .sessions import SessionStore
 from .signer import Signer, SignerError
 from .tee_core_client import TeeCoreClient, TeeCoreError
@@ -508,6 +514,46 @@ class LicenseTokenCreateResponse(BaseModel):
     token: str
 
 
+class OrchestratorCredentialNonceResponse(BaseModel):
+    nonce: str
+    expires_at: int
+    owner_address: str
+    contract_address: Optional[str] = None
+
+
+class OrchestratorCredentialTokenPayload(BaseModel):
+    delegate_address: str = Field(pattern=r"^0x[a-fA-F0-9]{40}$")
+    nonce: str
+    expires_at: int
+    signature: str
+
+    @field_validator("nonce")
+    @classmethod
+    def validate_nonce(cls, value: str) -> str:
+        normalize_nonce(value)
+        return value
+
+    @field_validator("expires_at")
+    @classmethod
+    def validate_expires_at(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("expires_at must be a unix timestamp")
+        return value
+
+    @field_validator("signature")
+    @classmethod
+    def validate_signature(cls, value: str) -> str:
+        candidate = value.strip()
+        if not candidate.startswith("0x"):
+            raise ValueError("signature must be 0x hex")
+        return candidate
+
+
+class OrchestratorCredentialTokenResponse(BaseModel):
+    token_id: str
+    token: str
+
+
 class LicenseTokenRecord(BaseModel):
     token_id: str
     orchestrator_id: str
@@ -790,6 +836,7 @@ def create_app(
     tee_core: Optional[TeeCoreClient] = None,
 ) -> FastAPI:
     app = FastAPI(title="Embody Payments", version="1.0.0")
+    logger = logging.getLogger(__name__)
 
     workload_store = WorkloadStore(settings.workloads_path)
     job_store = JobStore(settings.jobs_path)
@@ -803,6 +850,37 @@ def create_app(
     license_tokens = OrchestratorTokenStore(
         Path(getattr(settings, "license_tokens_path", data_dir / "license_tokens.json"))
     )
+    credential_tokens = OrchestratorTokenStore(
+        Path(
+            getattr(
+                settings,
+                "orchestrator_credential_tokens_path",
+                data_dir / "orchestrator_credential_tokens.json",
+            )
+        )
+    )
+    credential_nonces = CredentialNonceStore(
+        Path(
+            getattr(
+                settings,
+                "orchestrator_credential_nonces_path",
+                data_dir / "orchestrator_credential_nonces.json",
+            )
+        ),
+        ttl_seconds=int(getattr(settings, "orchestrator_credential_nonce_ttl_seconds", 300) or 300),
+    )
+    credential_contract_address = (
+        getattr(settings, "orchestrator_credential_contract_address", None) or ""
+    ).strip() or None
+    credential_verifier: Optional[OrchestratorCredentialVerifier] = None
+    if credential_contract_address and getattr(registry, "web3", None):
+        try:
+            credential_verifier = OrchestratorCredentialVerifier(
+                registry.web3,  # type: ignore[arg-type]
+                credential_contract_address,
+            )
+        except Exception as exc:  # pragma: no cover - depends on web3 provider state
+            logger.warning("Failed to configure credential verifier: %s", exc)
     license_images = ImageKeyStore(
         Path(getattr(settings, "license_images_path", data_dir / "license_images.json"))
     )
@@ -1175,7 +1253,7 @@ def create_app(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Orchestrator token required",
             )
-        info = license_tokens.authenticate(provided)
+        info = credential_tokens.authenticate(provided) or license_tokens.authenticate(provided)
         if not info or not info.get("orchestrator_id"):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
@@ -1859,6 +1937,90 @@ def create_app(
             edge_config_url=edge_config_url,
             edge_config_token=edge_config_token,
         )
+
+    @app.post(
+        "/api/orchestrators/{orchestrator_id}/credential/nonce",
+        response_model=OrchestratorCredentialNonceResponse,
+    )
+    async def credential_nonce(orchestrator_id: str) -> OrchestratorCredentialNonceResponse:
+        if not credential_verifier or not credential_contract_address:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Credential contract not configured",
+            )
+        record = registry.get_record(orchestrator_id)
+        if not record:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Orchestrator not found")
+        if record.get("denylisted"):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Orchestrator is denylisted")
+        owner_address = str(record.get("address") or "").strip()
+        if not owner_address:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Orchestrator address missing")
+        try:
+            owner_norm = normalize_eth_address(owner_address)
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+        minted = credential_nonces.mint()
+        return OrchestratorCredentialNonceResponse(
+            nonce=str(minted["nonce"]),
+            expires_at=int(minted["expires_at"]),
+            owner_address=owner_norm,
+            contract_address=credential_contract_address,
+        )
+
+    @app.post(
+        "/api/orchestrators/{orchestrator_id}/credential/token",
+        response_model=OrchestratorCredentialTokenResponse,
+    )
+    async def credential_token(
+        orchestrator_id: str,
+        payload: OrchestratorCredentialTokenPayload,
+    ) -> OrchestratorCredentialTokenResponse:
+        if not credential_verifier or not credential_contract_address:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Credential contract not configured",
+            )
+        record = registry.get_record(orchestrator_id)
+        if not record:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Orchestrator not found")
+        if record.get("denylisted"):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Orchestrator is denylisted")
+        owner_address = str(record.get("address") or "").strip()
+        if not owner_address:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Orchestrator address missing")
+        try:
+            owner_norm = normalize_eth_address(owner_address)
+            delegate_norm = normalize_eth_address(payload.delegate_address)
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+        now_ts = int(time.time())
+        max_expires = now_ts + int(
+            getattr(settings, "orchestrator_credential_nonce_ttl_seconds", 300) or 300
+        )
+        if payload.expires_at < now_ts or payload.expires_at > max_expires:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Credential expired")
+
+        if not credential_nonces.consume(payload.nonce):
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credential nonce")
+
+        recovered = recover_delegate(
+            orchestrator_id=orchestrator_id,
+            owner=owner_norm,
+            delegate=delegate_norm,
+            nonce=payload.nonce,
+            expires_at=payload.expires_at,
+            signature=payload.signature,
+        )
+        if recovered != delegate_norm.lower():
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credential signature")
+
+        if not credential_verifier.verify(owner_norm, delegate_norm):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Credential not valid on-chain")
+
+        minted = credential_tokens.mint(orchestrator_id)
+        return OrchestratorCredentialTokenResponse(**minted)
 
     @app.get("/api/orchestrator-edge", response_model=EdgeConfigResponse)
     async def get_orchestrator_edge(

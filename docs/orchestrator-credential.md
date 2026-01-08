@@ -22,27 +22,31 @@ private balance proofs and API access without repeated wallet signatures.
 
 ## Minting / eligibility
 
-Minting requires a signed authorization from the registry/oracle (EIP-712),
-or a call from a registry contract. The authorization should bind:
+Minting is permissionless but gated by on-chain checks:
 
-- owner address
-- delegate address
-- orchestrator_id
-- issuance timestamp and nonce
+- `registry.isRegistered(owner)` (optional registry contract)
+- `bondingManager.transcoderTotalStake(owner) >= minStake`
+
+The reference implementation lives in `contracts/OrchestratorCredential.sol`.
 
 ## Auth flow (private endpoints)
 
 1) Client requests a nonce from the backend.
-2) Delegate signs the nonce.
+2) Delegate signs the nonce + orchestrator_id + owner + delegate + expiry.
 3) Backend verifies on-chain ownership + delegate binding.
-4) Backend issues a short-lived access token (JWT/session).
+4) Backend issues an access token (TTL optional/configurable).
 5) Private endpoints accept the access token (no repeated wallet signatures).
+
+API endpoints (planned):
+
+- `POST /api/orchestrators/{orchestrator_id}/credential/nonce`
+- `POST /api/orchestrators/{orchestrator_id}/credential/token`
 
 ## Revocation / rotation
 
 - Owner can rotate delegate or burn the credential.
 - Delegate can burn for emergency revocation.
-- Access tokens are short-lived; after burn/rotation, new tokens cannot be issued.
+- Access tokens can be short-lived; after burn/rotation, new tokens cannot be issued.
 
 ## API usage
 
@@ -54,4 +58,4 @@ unauthenticated.
 
 - Emit explicit events: `CredentialMinted`, `DelegateUpdated`,
   `CredentialBurned`.
-- Include replay protection for mint authorizations (nonce + expiry).
+- Include replay protection for auth nonces (single-use + TTL).

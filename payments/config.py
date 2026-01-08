@@ -175,6 +175,23 @@ class PaymentSettings(BaseSettings):
     top_contract_abi_json: Optional[str] = Field(default=None, validation_alias="TOP_CONTRACT_ABI_JSON")
     top_cache_ttl_seconds: int = Field(default=300, validation_alias="TOP_CACHE_TTL_SECONDS")
 
+    orchestrator_credential_contract_address: Optional[str] = Field(
+        default=None,
+        validation_alias="PAYMENTS_ORCHESTRATOR_CREDENTIAL_CONTRACT_ADDRESS",
+    )
+    orchestrator_credential_tokens_path: Path = Field(
+        default=Path("/app/data/orchestrator_credential_tokens.json"),
+        validation_alias="PAYMENTS_ORCHESTRATOR_CREDENTIAL_TOKENS_PATH",
+    )
+    orchestrator_credential_nonces_path: Path = Field(
+        default=Path("/app/data/orchestrator_credential_nonces.json"),
+        validation_alias="PAYMENTS_ORCHESTRATOR_CREDENTIAL_NONCES_PATH",
+    )
+    orchestrator_credential_nonce_ttl_seconds: int = Field(
+        default=300,
+        validation_alias="PAYMENTS_ORCHESTRATOR_CREDENTIAL_NONCE_TTL_SECONDS",
+    )
+
     api_host: str = Field(default="0.0.0.0", validation_alias="PAYMENTS_API_HOST")
     api_port: int = Field(default=8081, validation_alias="PAYMENTS_API_PORT")
     api_root_path: str = Field(default="", validation_alias="PAYMENTS_API_ROOT_PATH")
