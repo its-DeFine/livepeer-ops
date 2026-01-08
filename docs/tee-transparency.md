@@ -7,6 +7,8 @@ This repo ships a **TEE-signed, append-only audit log** plus an **on-chain check
 - that the audit history is append-only (prev_hash chain + Merkle root)
 - that a third party can witness the latest state on-chain (checkpoint contract)
 
+For the ZK ledger proof statement and protocol, see `docs/tee-zk-proof.md`.
+
 ## Public endpoints (no token)
 
 - `GET /api/tee/core/attestation` (Nitro attestation doc)
@@ -110,4 +112,3 @@ Optional:
 - `--verify-log` downloads the full log and verifies signatures + prev-hash chaining.
 - `--pcr0-allowlist` lets partners pin expected measurements (comma-separated hex).
 - `--nitro-root-pem` points at a trusted Nitro root PEM for cert-chain verification.
-

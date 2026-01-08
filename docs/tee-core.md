@@ -3,6 +3,7 @@
 This doc defines the next step beyond “TEE signer”: make the **enclave the final authority** for ledger updates + payouts, so we can attest not just *where the key lives*, but *what payout logic ran*.
 
 For transparency endpoints + on-chain checkpointing + verifier tooling, see `docs/tee-transparency.md`.
+For the ZK ledger proof statement and protocol, see `docs/tee-zk-proof.md`.
 
 ## Problem this solves
 
