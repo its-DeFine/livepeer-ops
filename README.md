@@ -11,6 +11,10 @@ FastAPI service that tracks orchestrator registrations, balances, and workload c
 docker compose up -d
 ```
 
+## Metrics environment (Livepeer SLA / synthetic workloads)
+
+If you need a separate **devops + stage** environment for workload verification and payouts, see `docs/metrics-environment.md`.
+
 ## Deploy (recommended: GHCR image)
 
 This repo publishes a Docker image to GHCR on every `main` push.
