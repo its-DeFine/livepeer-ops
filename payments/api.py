@@ -2902,6 +2902,25 @@ def create_app(
             offers=offers,
         )
 
+    @app.get(
+        "/api/orchestrators/me/workload-offers/available",
+        response_model=WorkloadOfferListResponse,
+    )
+    async def list_available_workload_offers(
+        active_only: bool = Query(default=True),
+        auth: Dict[str, str] = Depends(require_orchestrator_token),
+    ) -> WorkloadOfferListResponse:
+        orchestrator_id = auth.get("orchestrator_id", "")
+        if not orchestrator_id:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Orchestrator token required")
+        offers: List[WorkloadOfferRecord] = []
+        for offer_id, payload in workload_offer_store.iter_with_ids():
+            if active_only and not bool(payload.get("active", False)):
+                continue
+            offers.append(_offer_to_model(offer_id, payload))
+        offers.sort(key=lambda entry: entry.offer_id)
+        return WorkloadOfferListResponse(offers=offers)
+
     @app.put("/api/orchestrators/me/workload-offers", response_model=WorkloadOfferSelectionResponse)
     async def set_orchestrator_workload_offers(
         payload: WorkloadOfferSelectionPayload,

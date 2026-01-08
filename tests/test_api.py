@@ -928,6 +928,14 @@ async def test_workload_offers_create_list_and_select(temp_paths):
         get_body = get_sel.json()
         assert get_body["offer_ids"] == ["offer-gpu-bench"]
 
+        available = await client.get(
+            "/api/orchestrators/me/workload-offers/available",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert available.status_code == 200
+        available_body = available.json()
+        assert available_body["offers"][0]["offer_id"] == "offer-gpu-bench"
+
 
 @pytest.mark.anyio("asyncio")
 async def test_ledger_proof_endpoint(temp_paths):
