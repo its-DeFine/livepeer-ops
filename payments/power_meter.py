@@ -79,6 +79,7 @@ class PowerMeterStore:
         state: str,
         now: datetime,
         credit_eth_per_minute: Decimal,
+        credit_unit: str,
         ledger: Optional[Ledger],
         max_gap_seconds: int,
     ) -> Dict[str, Any]:
@@ -119,6 +120,7 @@ class PowerMeterStore:
                                 "duration_ms": str(int(elapsed * 1000)),
                                 "state": state_norm,
                                 "credit_rate_eth_per_minute": str(credit_eth_per_minute),
+                                "credit_unit": credit_unit,
                             },
                         )
                         billed_ms += int(elapsed * 1000)

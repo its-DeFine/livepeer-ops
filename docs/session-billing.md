@@ -17,6 +17,7 @@ Orchestrator attribution is done by matching `upstream_addr` (the game host IP) 
 Set (via env or `.env`):
 
 - `PAYMENTS_SESSION_CREDIT_ETH_PER_MINUTE` (set to a non-zero value to enable)
+- `PAYMENTS_CREDIT_UNIT` (label for credits; default `eth`, can be `usd` or `credits`)
 - `PAYMENTS_SESSION_REPORTER_TOKEN` (optional; if set, edges must send it)
 - `PAYMENTS_SESSIONS_PATH` (optional; defaults to `/app/data/sessions.json`)
 

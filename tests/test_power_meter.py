@@ -16,6 +16,7 @@ def test_power_meter_credits_only_on_awake(tmp_path):
         state="awake",
         now=now,
         credit_eth_per_minute=rate,
+        credit_unit="eth",
         ledger=ledger,
         max_gap_seconds=120,
     )
@@ -26,6 +27,7 @@ def test_power_meter_credits_only_on_awake(tmp_path):
         state="awake",
         now=now + timedelta(seconds=60),
         credit_eth_per_minute=rate,
+        credit_unit="eth",
         ledger=ledger,
         max_gap_seconds=120,
     )
@@ -36,6 +38,7 @@ def test_power_meter_credits_only_on_awake(tmp_path):
         state="sleep",
         now=now + timedelta(seconds=90),
         credit_eth_per_minute=rate,
+        credit_unit="eth",
         ledger=ledger,
         max_gap_seconds=120,
     )
@@ -53,6 +56,7 @@ def test_power_meter_skips_large_gaps(tmp_path):
         state="awake",
         now=now,
         credit_eth_per_minute=rate,
+        credit_unit="eth",
         ledger=ledger,
         max_gap_seconds=60,
     )
@@ -61,6 +65,7 @@ def test_power_meter_skips_large_gaps(tmp_path):
         state="awake",
         now=now + timedelta(seconds=300),
         credit_eth_per_minute=rate,
+        credit_unit="eth",
         ledger=ledger,
         max_gap_seconds=60,
     )

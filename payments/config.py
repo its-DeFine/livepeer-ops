@@ -65,6 +65,7 @@ class PaymentSettings(BaseSettings):
     payout_threshold_eth: Decimal = Field(
         default=Decimal("0.001"), validation_alias="PAYMENT_PAYOUT_THRESHOLD_ETH"
     )
+    credit_unit: str = Field(default="eth", validation_alias="PAYMENTS_CREDIT_UNIT")
 
     eth_rpc_url: str = Field(default="http://localhost:8545", validation_alias="ETH_RPC_URL")
     chain_id: int = Field(default=42161, validation_alias="ETH_CHAIN_ID")
@@ -690,6 +691,9 @@ class PaymentSettings(BaseSettings):
                 candidate = raw_session_token.strip()
                 if candidate:
                     self.session_reporter_token = candidate
+        if self.credit_unit:
+            candidate = self.credit_unit.strip().lower()
+            self.credit_unit = candidate or "eth"
         raw_session_rate = os.environ.get("PAYMENTS_SESSION_CREDIT_ETH_PER_MINUTE")
         if raw_session_rate is not None:
             candidate = raw_session_rate.strip()

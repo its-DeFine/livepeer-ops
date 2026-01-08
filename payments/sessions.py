@@ -92,6 +92,7 @@ class SessionStore:
         edge_id: Optional[str],
         segment_seconds: int,
         credit_eth_per_minute: Decimal,
+        credit_unit: str = "eth",
         ledger: Optional[Ledger],
     ) -> Dict[str, Any]:
         event_norm = (event or "heartbeat").strip().lower()
@@ -211,6 +212,7 @@ class SessionStore:
                                 "upstream_addr": upstream_addr,
                                 "upstream_port": upstream_port,
                                 "edge_id": edge_id,
+                                "credit_unit": credit_unit,
                             },
                         )
                         billed_ms += duration_ms

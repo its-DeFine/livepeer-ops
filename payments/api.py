@@ -236,6 +236,7 @@ class OrchestratorRecord(BaseModel):
     orchestrator_id: str
     address: str
     balance_eth: str
+    credit_unit: str = "eth"
     eligible_for_payments: bool
     is_top_100: bool
     denylisted: bool
@@ -889,6 +890,7 @@ class OrchestratorDailyStats(BaseModel):
 class OrchestratorStatsResponse(BaseModel):
     orchestrator_id: str
     balance_eth: str
+    credit_unit: str = "eth"
     days: int
     total_credits_eth: str
     total_payouts_eth: str
@@ -1292,6 +1294,7 @@ def create_app(
                     state=state,
                     now=now,
                     credit_eth_per_minute=power_credit_eth_per_minute,
+                    credit_unit=str(getattr(settings, "credit_unit", "eth") or "eth"),
                     ledger=ledger_sink,
                     max_gap_seconds=power_max_gap_seconds,
                 )
@@ -2371,6 +2374,7 @@ def create_app(
             orchestrator_id=orchestrator_id,
             address=record.get("address", ""),
             balance_eth=str(balance),
+            credit_unit=str(getattr(settings, "credit_unit", "eth") or "eth"),
             eligible_for_payments=bool(record.get("eligible_for_payments", False)),
             is_top_100=bool(record.get("is_top_100", False)),
             denylisted=bool(record.get("denylisted", False)),
@@ -2506,6 +2510,7 @@ def create_app(
         return OrchestratorStatsResponse(
             orchestrator_id=orchestrator_id,
             balance_eth=str(orchestrator_balance(orchestrator_id)),
+            credit_unit=str(getattr(settings, "credit_unit", "eth") or "eth"),
             days=days,
             total_credits_eth=str(totals["credits"]),
             total_payouts_eth=str(totals["payouts"]),
@@ -2659,6 +2664,7 @@ def create_app(
 
         credit_rate = getattr(settings, "workload_time_credit_eth_per_minute", Decimal("0"))
         amount = (Decimal(payload.duration_ms) * Decimal(credit_rate)) / Decimal(60_000)
+        credit_unit = str(getattr(settings, "credit_unit", "eth") or "eth")
 
         record = {
             "orchestrator_id": payload.orchestrator_id,
@@ -2676,6 +2682,7 @@ def create_app(
                 "kind": "workload_time",
                 "duration_ms": int(payload.duration_ms),
                 "credit_eth_per_minute": str(credit_rate),
+                "credit_unit": credit_unit,
                 "computed_at": datetime.utcnow().isoformat() + "Z",
             },
         }
@@ -2691,6 +2698,7 @@ def create_app(
                 "artifact_hash": payload.artifact_hash,
                 "duration_ms": str(payload.duration_ms),
                 "credit_eth_per_minute": str(credit_rate),
+                "credit_unit": credit_unit,
             }
             if tee_core_authority:
                 _tee_core_credit(
@@ -3662,6 +3670,7 @@ def create_app(
             edge_id=payload.edge_id,
             segment_seconds=segment_seconds,
             credit_eth_per_minute=credit_rate,
+            credit_unit=str(getattr(settings, "credit_unit", "eth") or "eth"),
             ledger=ledger_sink,
         )
 
