@@ -10,7 +10,7 @@ services:
     container_name: payments-backend
     restart: unless-stopped
     env_file:
-      - .env
+      - ${PAYMENTS_ENV_FILE:-.env}
     environment:
       - MONITORED_SERVICES=${MONITORED_SERVICES:-vtuber-unreal-game,vtuber-unreal-signaling,vtuber-turn-server}
       - PAYMENTS_DOCKER_MONITORING_ENABLED=${PAYMENTS_DOCKER_MONITORING_ENABLED:-false}
@@ -28,9 +28,9 @@ services:
         max-size: "10m"
         max-file: "3"
     volumes:
-      - ./data:/app/data
+      - ${PAYMENTS_DATA_DIR:-./data}:/app/data
     ports:
-      - "8081:8081"
+      - "${PAYMENTS_PORT:-8081}:8081"
     networks:
       - vtuber_network
 
@@ -42,8 +42,8 @@ services:
       - payments-backend
     volumes:
       - /var/lib/docker/containers:/var/lib/docker/containers:ro
-      - ./data:/var/embody/data:ro
-      - ./data/audit:/var/embody/audit:ro
+      - ${PAYMENTS_DATA_DIR:-./data}:/var/embody/data:ro
+      - ${PAYMENTS_DATA_DIR:-./data}/audit:/var/embody/audit:ro
       - ./ops/fluent-bit.conf:/fluent-bit/etc/fluent-bit.conf:ro
     command: ["fluent-bit", "-c", "/fluent-bit/etc/fluent-bit.conf"]
     logging:
@@ -62,7 +62,7 @@ services:
     depends_on:
       - payments-backend
     env_file:
-      - .env
+      - ${PAYMENTS_ENV_FILE:-.env}
     command:
       [
         "python",
