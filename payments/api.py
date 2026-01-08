@@ -53,6 +53,7 @@ from .orchestrator_credentials import (
     normalize_nonce,
 )
 from .sessions import SessionStore
+from .power_meter import PowerMeterStore
 from .signer import Signer, SignerError
 from .tee_core_client import TeeCoreClient, TeeCoreError
 from .merkle import inclusion_proof, tree_root_for_size, verify_inclusion_proof
@@ -922,6 +923,7 @@ def create_app(
     )
     job_store = JobStore(settings.jobs_path)
     session_store = SessionStore(Path(getattr(settings, "sessions_path", data_dir / "sessions.json")))
+    power_meter = PowerMeterStore(Path(getattr(settings, "power_meter_path", data_dir / "power_meter.json")))
     activity_leases = ActivityLeaseStore(
         Path(getattr(settings, "activity_leases_path", data_dir / "activity_leases.json"))
     )
@@ -985,6 +987,14 @@ def create_app(
     autosleep_enabled = bool(getattr(settings, "autosleep_enabled", False))
     autosleep_idle_seconds = int(getattr(settings, "autosleep_idle_seconds", 600) or 600)
     autosleep_poll_seconds = int(getattr(settings, "autosleep_poll_seconds", 60) or 60)
+    power_metering_enabled = bool(getattr(settings, "power_metering_enabled", False))
+    power_credit_eth_per_minute = Decimal(
+        str(getattr(settings, "power_credit_eth_per_minute", "0") or "0")
+    )
+    power_poll_seconds = int(getattr(settings, "power_poll_seconds", 60) or 60)
+    power_max_gap_seconds = int(
+        getattr(settings, "power_max_gap_seconds", max(10, power_poll_seconds * 2)) or 0
+    )
     license_invite_default_ttl_seconds = int(getattr(settings, "license_invite_default_ttl_seconds", 7 * 24 * 60 * 60))
     license_audit_log_path = Path(
         getattr(settings, "license_audit_log_path", data_dir / "audit" / "license.log")
@@ -1257,10 +1267,58 @@ def create_app(
                 logger.warning("autosleep loop error: %s", exc)
             await asyncio.sleep(max(5, autosleep_poll_seconds))
 
+    async def _power_meter_once() -> None:
+        if not power_metering_enabled:
+            return
+        now = datetime.now(timezone.utc)
+        timeout = httpx.Timeout(5.0, connect=3.0)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            for orch_id in registry.all_records().keys():
+                host = _orchestrator_public_host(orch_id)
+                if not host:
+                    continue
+                power_url = f"http://{host}:9090/power"
+                state = "unknown"
+                try:
+                    resp = await client.get(power_url)
+                    if resp.status_code == 200:
+                        state = str(resp.json().get("state") or "").strip().lower() or "unknown"
+                except Exception:
+                    state = "unknown"
+                eligible = registry.is_eligible(orch_id)
+                ledger_sink = ledger if eligible and power_credit_eth_per_minute > 0 else None
+                power_meter.record_state(
+                    orch_id,
+                    state=state,
+                    now=now,
+                    credit_eth_per_minute=power_credit_eth_per_minute,
+                    ledger=ledger_sink,
+                    max_gap_seconds=power_max_gap_seconds,
+                )
+
+    async def _power_meter_loop() -> None:
+        logger = logging.getLogger(__name__)
+        if not power_metering_enabled:
+            return
+        logger.info(
+            "power metering enabled: rate=%s/min poll=%ss gap=%ss",
+            power_credit_eth_per_minute,
+            power_poll_seconds,
+            power_max_gap_seconds,
+        )
+        while True:
+            try:
+                await _power_meter_once()
+            except Exception as exc:  # pragma: no cover - best-effort background loop
+                logger.warning("power meter loop error: %s", exc)
+            await asyncio.sleep(max(5, power_poll_seconds))
+
     @app.on_event("startup")
     async def _startup_tasks() -> None:
         if autosleep_enabled:
             asyncio.create_task(_autosleep_loop())
+        if power_metering_enabled:
+            asyncio.create_task(_power_meter_loop())
 
     def log_license_event(event: str, payload: Dict[str, Any]) -> None:
         try:
@@ -2442,6 +2500,7 @@ def create_app(
             cursor += timedelta(days=1)
 
         session_credit = getattr(settings, "session_credit_eth_per_minute", Decimal("0")) or Decimal("0")
+        passive_credit = power_credit_eth_per_minute
         payout_strategy = str(getattr(settings, "payout_strategy", "eth_transfer") or "eth_transfer")
 
         return OrchestratorStatsResponse(
@@ -2456,7 +2515,7 @@ def create_app(
             total_net_delta_eth=str(totals["net_delta"]),
             daily=daily_models,
             session_credit_eth_per_minute=str(session_credit),
-            passive_credit_eth_per_minute="0",
+            passive_credit_eth_per_minute=str(passive_credit),
             payout_strategy=payout_strategy,
         )
 

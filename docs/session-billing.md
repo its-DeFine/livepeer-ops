@@ -49,3 +49,15 @@ curl -sS -H "X-Admin-Token: <token>" "http://<payments-ip>:8081/api/sessions?lim
 - Session records: `sessions.json` (path: `PAYMENTS_SESSIONS_PATH`)
 - Ledger journal: `PAYMENTS_LEDGER_JOURNAL_PATH` (look for `reason="session_time"`)
 
+## Power-state metering (optional)
+
+If you want to pay only while an orchestrator is **powered on**, enable the power-meter loop:
+
+- `PAYMENTS_POWER_METER_ENABLED=true`
+- `PAYMENTS_POWER_CREDIT_ETH_PER_MINUTE=<rate>`
+- `PAYMENTS_POWER_POLL_SECONDS=60` (poll cadence)
+- `PAYMENTS_POWER_MAX_GAP_SECONDS=180` (skip credit if poll gaps are too large)
+
+This mode credits the ledger with `reason="power_time"` when `/power` reports `state=awake`.
+It is intentionally conservative: if the poll loop misses a window or `state` is unknown, it skips credit.
+Set `PAYMENTS_SESSION_CREDIT_ETH_PER_MINUTE=0` if you want **power-only** payments.

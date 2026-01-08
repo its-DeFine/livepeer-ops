@@ -266,6 +266,10 @@ class PaymentSettings(BaseSettings):
         default=Path("/app/data/sessions.json"),
         validation_alias="PAYMENTS_SESSIONS_PATH",
     )
+    power_meter_path: Path = Field(
+        default=Path("/app/data/power_meter.json"),
+        validation_alias="PAYMENTS_POWER_METER_PATH",
+    )
     activity_leases_path: Path = Field(
         default=Path("/app/data/activity_leases.json"),
         validation_alias="PAYMENTS_ACTIVITY_LEASES_PATH",
@@ -285,6 +289,22 @@ class PaymentSettings(BaseSettings):
     session_credit_eth_per_minute: Decimal = Field(
         default=Decimal("0"),
         validation_alias="PAYMENTS_SESSION_CREDIT_ETH_PER_MINUTE",
+    )
+    power_metering_enabled: bool = Field(
+        default=False,
+        validation_alias="PAYMENTS_POWER_METER_ENABLED",
+    )
+    power_credit_eth_per_minute: Decimal = Field(
+        default=Decimal("0"),
+        validation_alias="PAYMENTS_POWER_CREDIT_ETH_PER_MINUTE",
+    )
+    power_poll_seconds: int = Field(
+        default=60,
+        validation_alias="PAYMENTS_POWER_POLL_SECONDS",
+    )
+    power_max_gap_seconds: int = Field(
+        default=180,
+        validation_alias="PAYMENTS_POWER_MAX_GAP_SECONDS",
     )
     session_segment_seconds: int = Field(
         default=2400,
@@ -678,6 +698,14 @@ class PaymentSettings(BaseSettings):
                     self.session_credit_eth_per_minute = Decimal(candidate)
                 except Exception as exc:
                     raise ValueError("PAYMENTS_SESSION_CREDIT_ETH_PER_MINUTE must be a decimal string") from exc
+        raw_power_rate = os.environ.get("PAYMENTS_POWER_CREDIT_ETH_PER_MINUTE")
+        if raw_power_rate is not None:
+            candidate = raw_power_rate.strip()
+            if candidate:
+                try:
+                    self.power_credit_eth_per_minute = Decimal(candidate)
+                except Exception as exc:
+                    raise ValueError("PAYMENTS_POWER_CREDIT_ETH_PER_MINUTE must be a decimal string") from exc
         if self.single_orchestrator_mode:
             if not self.orchestrator_id:
                 raise ValueError(
