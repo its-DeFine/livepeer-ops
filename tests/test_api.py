@@ -938,6 +938,81 @@ async def test_workload_offers_create_list_and_select(temp_paths):
 
 
 @pytest.mark.anyio("asyncio")
+async def test_workload_offers_reject_inactive_and_excess(temp_paths):
+    registry, ledger = build_registry(temp_paths)
+
+    address = "0xBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+    with patch.object(Registry, "_resolve_top_set", return_value={address.lower()}):
+        registry.register(orchestrator_id="orch-guards", address=address)
+
+    app_settings = build_settings(temp_paths, api_admin_token="secret", workload_subscription_max=1)
+    app = create_app(registry, ledger, app_settings)
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        for payload in (
+            {
+                "offer_id": "offer-active",
+                "title": "Active Offer",
+                "description": "Active",
+                "kind": "sla_gpu_benchmark",
+                "payout_amount_eth": "0.001",
+                "active": True,
+                "config": {},
+            },
+            {
+                "offer_id": "offer-active-2",
+                "title": "Second Active Offer",
+                "description": "Active",
+                "kind": "sla_transcode",
+                "payout_amount_eth": "0.002",
+                "active": True,
+                "config": {},
+            },
+            {
+                "offer_id": "offer-inactive",
+                "title": "Inactive Offer",
+                "description": "Inactive",
+                "kind": "sla_gpu_benchmark",
+                "payout_amount_eth": "0.001",
+                "active": False,
+                "config": {},
+            },
+        ):
+            response = await client.post(
+                "/api/workload-offers",
+                headers={"X-Admin-Token": "secret"},
+                json=payload,
+            )
+            assert response.status_code == 200
+
+        token_resp = await client.post(
+            "/api/licenses/orchestrators/orch-guards/tokens",
+            headers={"X-Admin-Token": "secret"},
+        )
+        assert token_resp.status_code == 200
+        token = token_resp.json()["token"]
+
+        inactive_select = await client.put(
+            "/api/orchestrators/me/workload-offers",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"offer_ids": ["offer-inactive"]},
+        )
+        assert inactive_select.status_code == 400
+        detail = inactive_select.json().get("detail", {})
+        assert detail.get("inactive") == ["offer-inactive"]
+
+        too_many = await client.put(
+            "/api/orchestrators/me/workload-offers",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"offer_ids": ["offer-active", "offer-active-2"]},
+        )
+        assert too_many.status_code == 400
+        detail = too_many.json().get("detail", {})
+        assert detail.get("max") == 1
+
+
+@pytest.mark.anyio("asyncio")
 async def test_ledger_proof_endpoint(temp_paths):
     balances_path, registry_path = temp_paths
     journal_path = balances_path.parent / "audit" / "ledger-events.log"

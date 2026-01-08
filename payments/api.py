@@ -2927,12 +2927,34 @@ def create_app(
         auth: Dict[str, str] = Depends(require_orchestrator_token),
     ) -> WorkloadOfferSelectionResponse:
         orchestrator_id = auth.get("orchestrator_id", "")
-        wanted = payload.offer_ids or []
-        missing = [offer_id for offer_id in wanted if not workload_offer_store.get(offer_id)]
-        if missing:
+        raw = payload.offer_ids or []
+        wanted: List[str] = []
+        seen: set[str] = set()
+        for value in raw:
+            candidate = (value or "").strip()
+            if not candidate or candidate in seen:
+                continue
+            seen.add(candidate)
+            wanted.append(candidate)
+
+        missing: List[str] = []
+        inactive: List[str] = []
+        for offer_id in wanted:
+            record = workload_offer_store.get(offer_id)
+            if record is None:
+                missing.append(offer_id)
+            elif not bool(record.get("active", False)):
+                inactive.append(offer_id)
+        if missing or inactive:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail={"error": "Unknown offer ids", "missing": missing},
+                detail={"error": "Invalid offer ids", "missing": missing, "inactive": inactive},
+            )
+        max_offers = getattr(workload_subscriptions, "max_offers", 50)
+        if len(wanted) > max_offers:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={"error": "Too many offer ids", "max": max_offers, "received": len(wanted)},
             )
         stored = workload_subscriptions.set(orchestrator_id, wanted)
         offer_ids = stored.get("offer_ids") if isinstance(stored, dict) else []
