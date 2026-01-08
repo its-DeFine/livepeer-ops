@@ -10,15 +10,17 @@ and the transparency log (append-only evidence).
 - Prove ledger transitions are correct (no negative balances, deterministic updates).
 - Require **signed credit events** from approved reporter keys.
 - Bind each payout to its **transaction hash** (tx hash commitment).
-- Publish **public balances** for auditability.
+- Publish aggregate totals and support per-orchestrator inclusion proofs for
+  authenticated orchestrators.
 
 ## Non-goals (v1)
 
-- Balance privacy (we explicitly publish balances).
+- Full public disclosure of all balances (per-orchestrator balances are private
+  by default).
 - On-chain verification of the ZK proof (optional later).
 - Proving tx inclusion on-chain (we bind to tx hash; receipts can be verified off-chain).
 
-## Statement (public balances)
+## Statement (aggregate + per-orchestrator proofs)
 
 Public inputs:
 - `R_prev`: previous ledger state root
@@ -29,12 +31,13 @@ Public inputs:
 - `reporter_pubkeys`: approved credit reporter keys
 - `chain_id`, `ticketbroker_contract`
 - `payout_commitment`: commitment to all payout tx hashes + amounts + recipients
-- `balances_prev_public`: list of (orchestrator_id, recipient, balance_wei)
-- `balances_next_public`: same list after transition
 - `total_supply_prev`, `total_supply_next`
+- Optional: `balances_prev_public` list of (orchestrator_id, recipient, balance_wei)
+- Optional: `balances_next_public` same list after transition
 
-Note: for full transparency publish all balances. If you publish a subset,
-`total_supply_*` still binds the aggregate but does not reveal distribution.
+Default mode publishes aggregate totals only. Per-orchestrator inclusion proofs
+are served privately using Merkle proofs from `R_prev`/`R_next` (see
+`docs/orchestrator-credential.md`).
 
 Private inputs (witness):
 - `S_prev`: full ledger state (balances + registered payout addresses)
@@ -44,20 +47,20 @@ Private inputs (witness):
 
 Constraints:
 1) `hash(S_prev) == R_prev`
-2) `balances_prev_public` entries match `S_prev`
-3) For each credit event:
+2) For each credit event:
    - signature verifies under `reporter_pubkeys`
    - event sequence is strictly increasing
-4) For each payout event:
+3) For each payout event:
    - recipient equals registered payout address in `S_prev`
    - amount <= available balance at debit time
    - payout item is included in `payout_commitment`
-5) Apply events in order to derive `S_next`
-6) All balances in `S_next` are non-negative
-7) `balances_next_public` entries match `S_next`
-8) `total_supply_next = total_supply_prev + sum(credits) - sum(payouts)`
-9) `hash(S_next) == R_next`
-10) Audit entries derived from events append `H_prev -> H_next`
+4) Apply events in order to derive `S_next`
+5) All balances in `S_next` are non-negative
+6) `total_supply_next = total_supply_prev + sum(credits) - sum(payouts)`
+7) `hash(S_next) == R_next`
+8) Audit entries derived from events append `H_prev -> H_next`
+9) Optional: `balances_prev_public` entries match `S_prev`
+10) Optional: `balances_next_public` entries match `S_next`
 
 ## Canonical data model + hashing
 
@@ -178,12 +181,6 @@ This format is designed to be forward-compatible and JSON-friendly.
     "chain_id": 42161,
     "ticketbroker_contract": "0x..."
   },
-  "balances_prev_public": [
-    {"orchestrator_id": "orch_1", "recipient": "0x...", "balance_wei": "123"}
-  ],
-  "balances_next_public": [
-    {"orchestrator_id": "orch_1", "recipient": "0x...", "balance_wei": "456"}
-  ],
   "total_supply_prev": "123",
   "total_supply_next": "456",
   "payouts": [
@@ -196,6 +193,11 @@ This format is designed to be forward-compatible and JSON-friendly.
   }
 }
 ```
+
+Optional fields (if publishing explicit balances):
+
+- `balances_prev_public`
+- `balances_next_public`
 
 Suggested endpoints:
 - `GET /api/transparency/tee-core/zk/status` (latest proof metadata)

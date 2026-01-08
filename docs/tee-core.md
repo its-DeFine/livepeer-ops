@@ -41,6 +41,14 @@ Note: a TEE core can prove “this code ran”, but it cannot prove inputs are t
     - the Ethereum transaction(s) that redeem tickets
   - returns **signed raw tx** to host for broadcast
 
+## Orchestrator credential (auth + privacy)
+
+Private endpoints (per-orchestrator ledger proofs, payout detail views) should
+be gated by a non-transferable orchestrator credential minted on-chain. The
+credential is owned by the orchestrator address and includes a delegate hot
+wallet for authentication; the owner can rotate/revoke at any time. See
+`docs/orchestrator-credential.md`.
+
 ## State + sealing
 
 The enclave needs persistence across restarts (balances, pending tx hashes, last processed event id).
