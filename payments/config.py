@@ -65,6 +65,7 @@ class PaymentSettings(BaseSettings):
     payout_threshold_eth: Decimal = Field(
         default=Decimal("0.001"), validation_alias="PAYMENT_PAYOUT_THRESHOLD_ETH"
     )
+    credit_unit: str = Field(default="eth", validation_alias="PAYMENTS_CREDIT_UNIT")
 
     eth_rpc_url: str = Field(default="http://localhost:8545", validation_alias="ETH_RPC_URL")
     chain_id: int = Field(default=42161, validation_alias="ETH_CHAIN_ID")
@@ -175,6 +176,27 @@ class PaymentSettings(BaseSettings):
     top_contract_abi_json: Optional[str] = Field(default=None, validation_alias="TOP_CONTRACT_ABI_JSON")
     top_cache_ttl_seconds: int = Field(default=300, validation_alias="TOP_CACHE_TTL_SECONDS")
 
+    orchestrator_credential_contract_address: Optional[str] = Field(
+        default=None,
+        validation_alias="PAYMENTS_ORCHESTRATOR_CREDENTIAL_CONTRACT_ADDRESS",
+    )
+    orchestrator_credential_tokens_path: Path = Field(
+        default=Path("/app/data/orchestrator_credential_tokens.json"),
+        validation_alias="PAYMENTS_ORCHESTRATOR_CREDENTIAL_TOKENS_PATH",
+    )
+    orchestrator_credential_nonces_path: Path = Field(
+        default=Path("/app/data/orchestrator_credential_nonces.json"),
+        validation_alias="PAYMENTS_ORCHESTRATOR_CREDENTIAL_NONCES_PATH",
+    )
+    orchestrator_credential_nonce_ttl_seconds: int = Field(
+        default=300,
+        validation_alias="PAYMENTS_ORCHESTRATOR_CREDENTIAL_NONCE_TTL_SECONDS",
+    )
+    orchestrator_credential_token_ttl_seconds: int = Field(
+        default=900,
+        validation_alias="PAYMENTS_ORCHESTRATOR_CREDENTIAL_TOKEN_TTL_SECONDS",
+    )
+
     api_host: str = Field(default="0.0.0.0", validation_alias="PAYMENTS_API_HOST")
     api_port: int = Field(default=8081, validation_alias="PAYMENTS_API_PORT")
     api_root_path: str = Field(default="", validation_alias="PAYMENTS_API_ROOT_PATH")
@@ -225,6 +247,18 @@ class PaymentSettings(BaseSettings):
         default=Path("/app/data/workloads.json"),
         validation_alias="PAYMENTS_WORKLOADS_PATH",
     )
+    workload_offers_path: Path = Field(
+        default=Path("/app/data/workload_offers.json"),
+        validation_alias="PAYMENTS_WORKLOAD_OFFERS_PATH",
+    )
+    workload_subscriptions_path: Path = Field(
+        default=Path("/app/data/workload_subscriptions.json"),
+        validation_alias="PAYMENTS_WORKLOAD_SUBSCRIPTIONS_PATH",
+    )
+    workload_subscription_max: int = Field(
+        default=50,
+        validation_alias="PAYMENTS_WORKLOAD_SUBSCRIPTION_MAX",
+    )
     jobs_path: Path = Field(
         default=Path("/app/data/jobs.json"),
         validation_alias="PAYMENTS_JOBS_PATH",
@@ -232,6 +266,10 @@ class PaymentSettings(BaseSettings):
     sessions_path: Path = Field(
         default=Path("/app/data/sessions.json"),
         validation_alias="PAYMENTS_SESSIONS_PATH",
+    )
+    power_meter_path: Path = Field(
+        default=Path("/app/data/power_meter.json"),
+        validation_alias="PAYMENTS_POWER_METER_PATH",
     )
     activity_leases_path: Path = Field(
         default=Path("/app/data/activity_leases.json"),
@@ -252,6 +290,22 @@ class PaymentSettings(BaseSettings):
     session_credit_eth_per_minute: Decimal = Field(
         default=Decimal("0"),
         validation_alias="PAYMENTS_SESSION_CREDIT_ETH_PER_MINUTE",
+    )
+    power_metering_enabled: bool = Field(
+        default=False,
+        validation_alias="PAYMENTS_POWER_METER_ENABLED",
+    )
+    power_credit_eth_per_minute: Decimal = Field(
+        default=Decimal("0"),
+        validation_alias="PAYMENTS_POWER_CREDIT_ETH_PER_MINUTE",
+    )
+    power_poll_seconds: int = Field(
+        default=60,
+        validation_alias="PAYMENTS_POWER_POLL_SECONDS",
+    )
+    power_max_gap_seconds: int = Field(
+        default=180,
+        validation_alias="PAYMENTS_POWER_MAX_GAP_SECONDS",
     )
     session_segment_seconds: int = Field(
         default=2400,
@@ -637,6 +691,9 @@ class PaymentSettings(BaseSettings):
                 candidate = raw_session_token.strip()
                 if candidate:
                     self.session_reporter_token = candidate
+        if self.credit_unit:
+            candidate = self.credit_unit.strip().lower()
+            self.credit_unit = candidate or "eth"
         raw_session_rate = os.environ.get("PAYMENTS_SESSION_CREDIT_ETH_PER_MINUTE")
         if raw_session_rate is not None:
             candidate = raw_session_rate.strip()
@@ -645,6 +702,14 @@ class PaymentSettings(BaseSettings):
                     self.session_credit_eth_per_minute = Decimal(candidate)
                 except Exception as exc:
                     raise ValueError("PAYMENTS_SESSION_CREDIT_ETH_PER_MINUTE must be a decimal string") from exc
+        raw_power_rate = os.environ.get("PAYMENTS_POWER_CREDIT_ETH_PER_MINUTE")
+        if raw_power_rate is not None:
+            candidate = raw_power_rate.strip()
+            if candidate:
+                try:
+                    self.power_credit_eth_per_minute = Decimal(candidate)
+                except Exception as exc:
+                    raise ValueError("PAYMENTS_POWER_CREDIT_ETH_PER_MINUTE must be a decimal string") from exc
         if self.single_orchestrator_mode:
             if not self.orchestrator_id:
                 raise ValueError(

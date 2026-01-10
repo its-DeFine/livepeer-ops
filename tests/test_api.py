@@ -9,10 +9,15 @@ from datetime import datetime, timedelta, timezone
 
 import httpx
 import pytest
+from eth_account import Account
+from eth_account.messages import encode_defunct
 
 from payments.api import create_app
 from payments.ledger import Ledger
 from payments.registry import Registry
+from payments.orchestrator_credentials import credential_message_hash
+from payments.ledger_proofs import build_proof as build_ledger_proof
+from payments.merkle import verify_inclusion_proof
 
 
 @pytest.fixture()
@@ -771,6 +776,305 @@ async def test_orchestrator_token_can_view_self_and_stats(temp_paths):
         assert body["days"] == 1
         assert body["daily"]
 
+
+@pytest.mark.anyio("asyncio")
+async def test_orchestrator_credential_token_flow(temp_paths):
+    balances_path, registry_path = temp_paths
+    ledger = Ledger(balances_path)
+    registry_settings = SimpleNamespace(
+        top_contract_address=None,
+        top_contract_function="getTop",
+        top_contract_abi_json=None,
+        top_contract_abi_path=None,
+        registration_rate_limit_per_minute=5,
+        registration_rate_limit_burst=5,
+        api_admin_token=None,
+        audit_log_path=registry_path.with_name("registry-audit.log"),
+    )
+    registry = Registry(
+        path=registry_path,
+        settings=registry_settings,
+        ledger=ledger,
+        web3=object(),
+    )
+
+    owner_address = "0xEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE"
+    with patch.object(Registry, "_resolve_top_set", return_value={owner_address.lower()}):
+        registry.register(orchestrator_id="orch-self", address=owner_address)
+
+    base_dir = balances_path.parent
+    app_settings = build_settings(
+        temp_paths,
+        orchestrator_credential_contract_address="0x" + "11" * 20,
+        orchestrator_credential_tokens_path=base_dir / "credential_tokens.json",
+        orchestrator_credential_nonces_path=base_dir / "credential_nonces.json",
+        orchestrator_credential_nonce_ttl_seconds=300,
+    )
+
+    class FakeCredentialVerifier:
+        def __init__(self, web3, contract_address):  # noqa: ANN001
+            self.web3 = web3
+            self.contract_address = contract_address
+
+        def verify(self, owner, delegate):  # noqa: ANN001
+            return True
+
+    with patch("payments.api.OrchestratorCredentialVerifier", FakeCredentialVerifier):
+        app = create_app(registry, ledger, app_settings)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        nonce_resp = await client.post("/api/orchestrators/orch-self/credential/nonce")
+        assert nonce_resp.status_code == 200
+        nonce_payload = nonce_resp.json()
+
+        delegate = Account.create()
+        msg_hash = credential_message_hash(
+            orchestrator_id="orch-self",
+            owner=owner_address,
+            delegate=delegate.address,
+            nonce=nonce_payload["nonce"],
+            expires_at=nonce_payload["expires_at"],
+        )
+        signature = delegate.sign_message(encode_defunct(primitive=msg_hash)).signature
+
+        token_resp = await client.post(
+            "/api/orchestrators/orch-self/credential/token",
+            json={
+                "delegate_address": delegate.address,
+                "nonce": nonce_payload["nonce"],
+                "expires_at": nonce_payload["expires_at"],
+                "signature": "0x" + signature.hex(),
+            },
+        )
+        assert token_resp.status_code == 200
+        token = token_resp.json()["token"]
+
+        me = await client.get(
+            "/api/orchestrators/me",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert me.status_code == 200
+        assert me.json()["orchestrator_id"] == "orch-self"
+
+
+@pytest.mark.anyio("asyncio")
+async def test_workload_offers_create_list_and_select(temp_paths):
+    registry, ledger = build_registry(temp_paths)
+
+    address = "0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    with patch.object(Registry, "_resolve_top_set", return_value={address.lower()}):
+        registry.register(orchestrator_id="orch-offers", address=address)
+
+    app_settings = build_settings(temp_paths, api_admin_token="secret")
+    app = create_app(registry, ledger, app_settings)
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        create_offer = await client.post(
+            "/api/workload-offers",
+            headers={"X-Admin-Token": "secret"},
+            json={
+                "offer_id": "offer-gpu-bench",
+                "title": "GPU Benchmark",
+                "description": "Run a quick GPU benchmark",
+                "kind": "sla_gpu_benchmark",
+                "payout_amount_eth": "0.001",
+                "active": True,
+                "config": {"benchmark_type": "matrix_4096"},
+            },
+        )
+        assert create_offer.status_code == 200
+
+        offers = await client.get(
+            "/api/workload-offers",
+            headers={"X-Admin-Token": "secret"},
+        )
+        assert offers.status_code == 200
+        body = offers.json()
+        assert len(body["offers"]) == 1
+        assert body["offers"][0]["offer_id"] == "offer-gpu-bench"
+
+        token_resp = await client.post(
+            "/api/licenses/orchestrators/orch-offers/tokens",
+            headers={"X-Admin-Token": "secret"},
+        )
+        assert token_resp.status_code == 200
+        token = token_resp.json()["token"]
+
+        bad_select = await client.put(
+            "/api/orchestrators/me/workload-offers",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"offer_ids": ["missing-offer"]},
+        )
+        assert bad_select.status_code == 400
+
+        select = await client.put(
+            "/api/orchestrators/me/workload-offers",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"offer_ids": ["offer-gpu-bench"]},
+        )
+        assert select.status_code == 200
+        selection = select.json()
+        assert selection["orchestrator_id"] == "orch-offers"
+        assert selection["offer_ids"] == ["offer-gpu-bench"]
+        assert selection["offers"][0]["offer_id"] == "offer-gpu-bench"
+
+        get_sel = await client.get(
+            "/api/orchestrators/me/workload-offers",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert get_sel.status_code == 200
+        get_body = get_sel.json()
+        assert get_body["offer_ids"] == ["offer-gpu-bench"]
+
+        available = await client.get(
+            "/api/orchestrators/me/workload-offers/available",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert available.status_code == 200
+        available_body = available.json()
+        assert available_body["offers"][0]["offer_id"] == "offer-gpu-bench"
+
+
+@pytest.mark.anyio("asyncio")
+async def test_workload_offers_reject_inactive_and_excess(temp_paths):
+    registry, ledger = build_registry(temp_paths)
+
+    address = "0xBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+    with patch.object(Registry, "_resolve_top_set", return_value={address.lower()}):
+        registry.register(orchestrator_id="orch-guards", address=address)
+
+    app_settings = build_settings(temp_paths, api_admin_token="secret", workload_subscription_max=1)
+    app = create_app(registry, ledger, app_settings)
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        for payload in (
+            {
+                "offer_id": "offer-active",
+                "title": "Active Offer",
+                "description": "Active",
+                "kind": "sla_gpu_benchmark",
+                "payout_amount_eth": "0.001",
+                "active": True,
+                "config": {},
+            },
+            {
+                "offer_id": "offer-active-2",
+                "title": "Second Active Offer",
+                "description": "Active",
+                "kind": "sla_transcode",
+                "payout_amount_eth": "0.002",
+                "active": True,
+                "config": {},
+            },
+            {
+                "offer_id": "offer-inactive",
+                "title": "Inactive Offer",
+                "description": "Inactive",
+                "kind": "sla_gpu_benchmark",
+                "payout_amount_eth": "0.001",
+                "active": False,
+                "config": {},
+            },
+        ):
+            response = await client.post(
+                "/api/workload-offers",
+                headers={"X-Admin-Token": "secret"},
+                json=payload,
+            )
+            assert response.status_code == 200
+
+        token_resp = await client.post(
+            "/api/licenses/orchestrators/orch-guards/tokens",
+            headers={"X-Admin-Token": "secret"},
+        )
+        assert token_resp.status_code == 200
+        token = token_resp.json()["token"]
+
+        inactive_select = await client.put(
+            "/api/orchestrators/me/workload-offers",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"offer_ids": ["offer-inactive"]},
+        )
+        assert inactive_select.status_code == 400
+        detail = inactive_select.json().get("detail", {})
+        assert detail.get("inactive") == ["offer-inactive"]
+
+        too_many = await client.put(
+            "/api/orchestrators/me/workload-offers",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"offer_ids": ["offer-active", "offer-active-2"]},
+        )
+        assert too_many.status_code == 400
+        detail = too_many.json().get("detail", {})
+        assert detail.get("max") == 1
+
+
+@pytest.mark.anyio("asyncio")
+async def test_ledger_proof_endpoint(temp_paths):
+    balances_path, registry_path = temp_paths
+    journal_path = balances_path.parent / "audit" / "ledger-events.log"
+    ledger = Ledger(balances_path, journal_path=journal_path)
+    registry_settings = SimpleNamespace(
+        top_contract_address=None,
+        top_contract_function="getTop",
+        top_contract_abi_json=None,
+        top_contract_abi_path=None,
+        registration_rate_limit_per_minute=5,
+        registration_rate_limit_burst=5,
+        api_admin_token=None,
+        audit_log_path=registry_path.with_name("registry-audit.log"),
+    )
+    registry = Registry(
+        path=registry_path,
+        settings=registry_settings,
+        ledger=ledger,
+        web3=None,
+    )
+
+    address = "0xEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE"
+    with patch.object(Registry, "_resolve_top_set", return_value={address.lower()}):
+        registry.register(orchestrator_id="orch-proof", address=address)
+
+    ledger.credit("orch-proof", Decimal("0.05"), reason="workload")
+
+    app_settings = build_settings(temp_paths, api_admin_token="secret")
+    app = create_app(registry, ledger, app_settings)
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        token_resp = await client.post(
+            "/api/licenses/orchestrators/orch-proof/tokens",
+            headers={"X-Admin-Token": "secret"},
+        )
+        assert token_resp.status_code == 200
+        token = token_resp.json()["token"]
+
+        proof_resp = await client.get(
+            "/api/transparency/tee-core/ledger-proof",
+            params={"orchestrator_id": "orch-proof"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert proof_resp.status_code == 200
+        payload = proof_resp.json()
+
+        entry, leaf_index, tree_size, root, proof = build_ledger_proof(
+            ledger, registry, "orch-proof"
+        )
+        assert payload["ledger_root"].lower() == ("0x" + root.hex())
+        assert payload["leaf_index"] == leaf_index
+        assert payload["tree_size"] == tree_size
+
+        proof_bytes = [bytes.fromhex(item[2:]) for item in payload["proof"]]
+        assert verify_inclusion_proof(
+            leaf=entry.leaf_hash,
+            leaf_index=leaf_index,
+            tree_size=tree_size,
+            proof=proof_bytes,
+            expected_root=root,
+        )
 
 @pytest.mark.anyio("asyncio")
 async def test_ledger_adjustment_requires_admin(temp_paths):

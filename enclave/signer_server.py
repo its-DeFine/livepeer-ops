@@ -183,9 +183,8 @@ def _kms_decrypt_via_kmstool(
         text=True,
     )
     if proc.returncode != 0:
-        stderr = (proc.stderr or "").strip()
-        stdout = (proc.stdout or "").strip()
-        raise RuntimeError(f"kmstool decrypt failed: {stderr or stdout or proc.returncode}")
+        # Do not surface kmstool output: it can include sensitive AWS auth headers/tokens.
+        raise RuntimeError(f"kmstool decrypt failed (exit {proc.returncode})")
 
     plaintext_b64: Optional[str] = None
     for line in (proc.stdout or "").splitlines():
@@ -237,9 +236,8 @@ def _kms_genkey_via_kmstool(
         text=True,
     )
     if proc.returncode != 0:
-        stderr = (proc.stderr or "").strip()
-        stdout = (proc.stdout or "").strip()
-        raise RuntimeError(f"kmstool genkey failed: {stderr or stdout or proc.returncode}")
+        # Do not surface kmstool output: it can include sensitive AWS auth headers/tokens.
+        raise RuntimeError(f"kmstool genkey failed (exit {proc.returncode})")
 
     ciphertext_b64: Optional[str] = None
     plaintext_b64: Optional[str] = None

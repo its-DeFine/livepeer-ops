@@ -3,6 +3,7 @@
 This doc defines the next step beyond “TEE signer”: make the **enclave the final authority** for ledger updates + payouts, so we can attest not just *where the key lives*, but *what payout logic ran*.
 
 For transparency endpoints + on-chain checkpointing + verifier tooling, see `docs/tee-transparency.md`.
+For the ZK ledger proof statement and protocol, see `docs/tee-zk-proof.md`.
 
 ## Problem this solves
 
@@ -39,6 +40,14 @@ Note: a TEE core can prove “this code ran”, but it cannot prove inputs are t
     - EIP-191 ticket signatures
     - the Ethereum transaction(s) that redeem tickets
   - returns **signed raw tx** to host for broadcast
+
+## Orchestrator credential (auth + privacy)
+
+Private endpoints (per-orchestrator ledger proofs, payout detail views) should
+be gated by a non-transferable orchestrator credential minted on-chain. The
+credential is owned by the orchestrator address and includes a delegate hot
+wallet for authentication; the owner can rotate/revoke at any time. See
+`docs/orchestrator-credential.md`.
 
 ## State + sealing
 

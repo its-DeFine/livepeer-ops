@@ -34,6 +34,7 @@ from .activity import ActivityLeaseStore, parse_iso8601 as parse_activity_iso860
 from .config import PaymentSettings
 from .jobs import JobStore
 from .ledger import Ledger
+from .ledger_proofs import build_proof as build_ledger_proof
 from .registry import Registry, RegistryError
 from .licenses import (
     ImageAccessStore,
@@ -45,13 +46,21 @@ from .licenses import (
     parse_s3_uri,
     parse_iso8601 as parse_license_iso8601,
 )
+from .orchestrator_credentials import (
+    CredentialNonceStore,
+    OrchestratorCredentialVerifier,
+    recover_delegate,
+    normalize_nonce,
+)
 from .sessions import SessionStore
+from .power_meter import PowerMeterStore
 from .signer import Signer, SignerError
 from .tee_core_client import TeeCoreClient, TeeCoreError
 from .merkle import inclusion_proof, tree_root_for_size, verify_inclusion_proof
 from .policy import hash_snapshot as policy_hash_snapshot, snapshot as policy_snapshot
 from .transparency import TeeCoreTransparencyLog
 from .workloads import WorkloadStore
+from .workload_offers import WorkloadOfferStore, WorkloadSubscriptionStore
 
 
 class RateLimiter:
@@ -227,6 +236,7 @@ class OrchestratorRecord(BaseModel):
     orchestrator_id: str
     address: str
     balance_eth: str
+    credit_unit: str = "eth"
     eligible_for_payments: bool
     is_top_100: bool
     denylisted: bool
@@ -398,6 +408,51 @@ class WorkloadSummaryResponse(BaseModel):
     orchestrators: List[WorkloadSummaryItem]
 
 
+class WorkloadOfferCreatePayload(BaseModel):
+    offer_id: str = Field(min_length=1, max_length=64)
+    title: str = Field(min_length=1, max_length=128)
+    description: Optional[str] = Field(default=None, max_length=1024)
+    kind: str = Field(min_length=1, max_length=64)
+    payout_amount_eth: Decimal = Field(gt=Decimal("0"))
+    active: bool = True
+    config: Dict[str, Any] = Field(default_factory=dict)
+
+
+class WorkloadOfferUpdatePayload(BaseModel):
+    title: Optional[str] = Field(default=None, max_length=128)
+    description: Optional[str] = Field(default=None, max_length=1024)
+    kind: Optional[str] = Field(default=None, max_length=64)
+    payout_amount_eth: Optional[Decimal] = Field(default=None, gt=Decimal("0"))
+    active: Optional[bool] = None
+    config: Optional[Dict[str, Any]] = None
+
+
+class WorkloadOfferRecord(BaseModel):
+    offer_id: str
+    title: str
+    description: Optional[str]
+    kind: str
+    payout_amount_eth: str
+    active: bool
+    config: Dict[str, Any]
+    created_at: str
+    updated_at: str
+
+
+class WorkloadOfferListResponse(BaseModel):
+    offers: List[WorkloadOfferRecord]
+
+
+class WorkloadOfferSelectionPayload(BaseModel):
+    offer_ids: List[str] = Field(default_factory=list)
+
+
+class WorkloadOfferSelectionResponse(BaseModel):
+    orchestrator_id: str
+    offer_ids: List[str]
+    offers: List[WorkloadOfferRecord]
+
+
 class RecordingPresignResponse(BaseModel):
     s3_uri: str
     url: str
@@ -508,10 +563,76 @@ class LicenseTokenCreateResponse(BaseModel):
     token: str
 
 
+class OrchestratorCredentialNonceResponse(BaseModel):
+    nonce: str
+    expires_at: int
+    owner_address: str
+    contract_address: Optional[str] = None
+
+
+class OrchestratorCredentialTokenPayload(BaseModel):
+    delegate_address: str = Field(pattern=r"^0x[a-fA-F0-9]{40}$")
+    nonce: str
+    expires_at: int
+    signature: str
+
+    @field_validator("nonce")
+    @classmethod
+    def validate_nonce(cls, value: str) -> str:
+        normalize_nonce(value)
+        return value
+
+    @field_validator("expires_at")
+    @classmethod
+    def validate_expires_at(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("expires_at must be a unix timestamp")
+        return value
+
+    @field_validator("signature")
+    @classmethod
+    def validate_signature(cls, value: str) -> str:
+        candidate = value.strip()
+        if not candidate.startswith("0x"):
+            raise ValueError("signature must be 0x hex")
+        return candidate
+
+
+class OrchestratorCredentialTokenResponse(BaseModel):
+    token_id: str
+    token: str
+    expires_at: Optional[str] = None
+
+
+class LedgerProofEntry(BaseModel):
+    orchestrator_id: str
+    recipient: str
+    balance_eth: str
+    balance_wei: str
+    orch_hash: str
+    leaf_hash: str
+
+
+class LedgerEntryResponse(BaseModel):
+    ledger_root: str
+    leaf_index: int
+    tree_size: int
+    entry: LedgerProofEntry
+
+
+class LedgerProofResponse(BaseModel):
+    ledger_root: str
+    leaf_index: int
+    tree_size: int
+    entry: LedgerProofEntry
+    proof: List[str]
+
+
 class LicenseTokenRecord(BaseModel):
     token_id: str
     orchestrator_id: str
     created_at: str
+    expires_at: Optional[str] = None
     revoked_at: Optional[str]
     last_seen_at: Optional[str]
 
@@ -769,6 +890,7 @@ class OrchestratorDailyStats(BaseModel):
 class OrchestratorStatsResponse(BaseModel):
     orchestrator_id: str
     balance_eth: str
+    credit_unit: str = "eth"
     days: int
     total_credits_eth: str
     total_payouts_eth: str
@@ -790,11 +912,20 @@ def create_app(
     tee_core: Optional[TeeCoreClient] = None,
 ) -> FastAPI:
     app = FastAPI(title="Embody Payments", version="1.0.0")
+    logger = logging.getLogger(__name__)
 
-    workload_store = WorkloadStore(settings.workloads_path)
-    job_store = JobStore(settings.jobs_path)
     data_dir = Path(getattr(settings, "workloads_path", Path("/app/data/workloads.json"))).parent
+    workload_store = WorkloadStore(settings.workloads_path)
+    workload_offer_store = WorkloadOfferStore(
+        Path(getattr(settings, "workload_offers_path", data_dir / "workload_offers.json"))
+    )
+    workload_subscriptions = WorkloadSubscriptionStore(
+        Path(getattr(settings, "workload_subscriptions_path", data_dir / "workload_subscriptions.json")),
+        max_offers=int(getattr(settings, "workload_subscription_max", 50) or 50),
+    )
+    job_store = JobStore(settings.jobs_path)
     session_store = SessionStore(Path(getattr(settings, "sessions_path", data_dir / "sessions.json")))
+    power_meter = PowerMeterStore(Path(getattr(settings, "power_meter_path", data_dir / "power_meter.json")))
     activity_leases = ActivityLeaseStore(
         Path(getattr(settings, "activity_leases_path", data_dir / "activity_leases.json"))
     )
@@ -803,6 +934,37 @@ def create_app(
     license_tokens = OrchestratorTokenStore(
         Path(getattr(settings, "license_tokens_path", data_dir / "license_tokens.json"))
     )
+    credential_tokens = OrchestratorTokenStore(
+        Path(
+            getattr(
+                settings,
+                "orchestrator_credential_tokens_path",
+                data_dir / "orchestrator_credential_tokens.json",
+            )
+        )
+    )
+    credential_nonces = CredentialNonceStore(
+        Path(
+            getattr(
+                settings,
+                "orchestrator_credential_nonces_path",
+                data_dir / "orchestrator_credential_nonces.json",
+            )
+        ),
+        ttl_seconds=int(getattr(settings, "orchestrator_credential_nonce_ttl_seconds", 300) or 300),
+    )
+    credential_contract_address = (
+        getattr(settings, "orchestrator_credential_contract_address", None) or ""
+    ).strip() or None
+    credential_verifier: Optional[OrchestratorCredentialVerifier] = None
+    if credential_contract_address and getattr(registry, "web3", None):
+        try:
+            credential_verifier = OrchestratorCredentialVerifier(
+                registry.web3,  # type: ignore[arg-type]
+                credential_contract_address,
+            )
+        except Exception as exc:  # pragma: no cover - depends on web3 provider state
+            logger.warning("Failed to configure credential verifier: %s", exc)
     license_images = ImageKeyStore(
         Path(getattr(settings, "license_images_path", data_dir / "license_images.json"))
     )
@@ -827,6 +989,14 @@ def create_app(
     autosleep_enabled = bool(getattr(settings, "autosleep_enabled", False))
     autosleep_idle_seconds = int(getattr(settings, "autosleep_idle_seconds", 600) or 600)
     autosleep_poll_seconds = int(getattr(settings, "autosleep_poll_seconds", 60) or 60)
+    power_metering_enabled = bool(getattr(settings, "power_metering_enabled", False))
+    power_credit_eth_per_minute = Decimal(
+        str(getattr(settings, "power_credit_eth_per_minute", "0") or "0")
+    )
+    power_poll_seconds = int(getattr(settings, "power_poll_seconds", 60) or 60)
+    power_max_gap_seconds = int(
+        getattr(settings, "power_max_gap_seconds", max(10, power_poll_seconds * 2)) or 0
+    )
     license_invite_default_ttl_seconds = int(getattr(settings, "license_invite_default_ttl_seconds", 7 * 24 * 60 * 60))
     license_audit_log_path = Path(
         getattr(settings, "license_audit_log_path", data_dir / "audit" / "license.log")
@@ -1099,10 +1269,59 @@ def create_app(
                 logger.warning("autosleep loop error: %s", exc)
             await asyncio.sleep(max(5, autosleep_poll_seconds))
 
+    async def _power_meter_once() -> None:
+        if not power_metering_enabled:
+            return
+        now = datetime.now(timezone.utc)
+        timeout = httpx.Timeout(5.0, connect=3.0)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            for orch_id in registry.all_records().keys():
+                host = _orchestrator_public_host(orch_id)
+                if not host:
+                    continue
+                power_url = f"http://{host}:9090/power"
+                state = "unknown"
+                try:
+                    resp = await client.get(power_url)
+                    if resp.status_code == 200:
+                        state = str(resp.json().get("state") or "").strip().lower() or "unknown"
+                except Exception:
+                    state = "unknown"
+                eligible = registry.is_eligible(orch_id)
+                ledger_sink = ledger if eligible and power_credit_eth_per_minute > 0 else None
+                power_meter.record_state(
+                    orch_id,
+                    state=state,
+                    now=now,
+                    credit_eth_per_minute=power_credit_eth_per_minute,
+                    credit_unit=str(getattr(settings, "credit_unit", "eth") or "eth"),
+                    ledger=ledger_sink,
+                    max_gap_seconds=power_max_gap_seconds,
+                )
+
+    async def _power_meter_loop() -> None:
+        logger = logging.getLogger(__name__)
+        if not power_metering_enabled:
+            return
+        logger.info(
+            "power metering enabled: rate=%s/min poll=%ss gap=%ss",
+            power_credit_eth_per_minute,
+            power_poll_seconds,
+            power_max_gap_seconds,
+        )
+        while True:
+            try:
+                await _power_meter_once()
+            except Exception as exc:  # pragma: no cover - best-effort background loop
+                logger.warning("power meter loop error: %s", exc)
+            await asyncio.sleep(max(5, power_poll_seconds))
+
     @app.on_event("startup")
     async def _startup_tasks() -> None:
         if autosleep_enabled:
             asyncio.create_task(_autosleep_loop())
+        if power_metering_enabled:
+            asyncio.create_task(_power_meter_loop())
 
     def log_license_event(event: str, payload: Dict[str, Any]) -> None:
         try:
@@ -1175,7 +1394,7 @@ def create_app(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Orchestrator token required",
             )
-        info = license_tokens.authenticate(provided)
+        info = credential_tokens.authenticate(provided) or license_tokens.authenticate(provided)
         if not info or not info.get("orchestrator_id"):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
@@ -1795,6 +2014,69 @@ def create_app(
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Receipt not found")
         return entry
 
+    @app.get(
+        "/api/transparency/tee-core/ledger-entry",
+        response_model=LedgerEntryResponse,
+    )
+    async def tee_core_ledger_entry(
+        orchestrator_id: str = Query(min_length=1, max_length=128),
+        _: Dict[str, str] = Depends(require_orchestrator_token),
+    ) -> LedgerEntryResponse:
+        try:
+            entry, leaf_index, tree_size, root, _ = build_ledger_proof(
+                ledger,
+                registry,
+                orchestrator_id,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+
+        return LedgerEntryResponse(
+            ledger_root="0x" + root.hex(),
+            leaf_index=int(leaf_index),
+            tree_size=int(tree_size),
+            entry=LedgerProofEntry(
+                orchestrator_id=entry.orchestrator_id,
+                recipient=entry.recipient,
+                balance_eth=entry.balance_eth,
+                balance_wei=str(entry.balance_wei),
+                orch_hash="0x" + entry.orch_hash.hex(),
+                leaf_hash="0x" + entry.leaf_hash.hex(),
+            ),
+        )
+
+    @app.get(
+        "/api/transparency/tee-core/ledger-proof",
+        response_model=LedgerProofResponse,
+    )
+    async def tee_core_ledger_proof(
+        orchestrator_id: str = Query(min_length=1, max_length=128),
+        _: Dict[str, str] = Depends(require_orchestrator_token),
+    ) -> LedgerProofResponse:
+        try:
+            entry, leaf_index, tree_size, root, proof = build_ledger_proof(
+                ledger,
+                registry,
+                orchestrator_id,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+
+        return LedgerProofResponse(
+            ledger_root="0x" + root.hex(),
+            leaf_index=int(leaf_index),
+            tree_size=int(tree_size),
+            entry=LedgerProofEntry(
+                orchestrator_id=entry.orchestrator_id,
+                recipient=entry.recipient,
+                balance_eth=entry.balance_eth,
+                balance_wei=str(entry.balance_wei),
+                orch_hash="0x" + entry.orch_hash.hex(),
+                leaf_hash="0x" + entry.leaf_hash.hex(),
+            ),
+            proof=["0x" + item.hex() for item in proof],
+        )
+
     @app.post("/api/orchestrators/register", response_model=RegistrationResponse)
     async def register(payload: RegistrationPayload, request: Request) -> RegistrationResponse:
         client_ip = request.client.host if request.client else None
@@ -1859,6 +2141,93 @@ def create_app(
             edge_config_url=edge_config_url,
             edge_config_token=edge_config_token,
         )
+
+    @app.post(
+        "/api/orchestrators/{orchestrator_id}/credential/nonce",
+        response_model=OrchestratorCredentialNonceResponse,
+    )
+    async def credential_nonce(orchestrator_id: str) -> OrchestratorCredentialNonceResponse:
+        if not credential_verifier or not credential_contract_address:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Credential contract not configured",
+            )
+        record = registry.get_record(orchestrator_id)
+        if not record:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Orchestrator not found")
+        if record.get("denylisted"):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Orchestrator is denylisted")
+        owner_address = str(record.get("address") or "").strip()
+        if not owner_address:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Orchestrator address missing")
+        try:
+            owner_norm = normalize_eth_address(owner_address)
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+        minted = credential_nonces.mint()
+        return OrchestratorCredentialNonceResponse(
+            nonce=str(minted["nonce"]),
+            expires_at=int(minted["expires_at"]),
+            owner_address=owner_norm,
+            contract_address=credential_contract_address,
+        )
+
+    @app.post(
+        "/api/orchestrators/{orchestrator_id}/credential/token",
+        response_model=OrchestratorCredentialTokenResponse,
+    )
+    async def credential_token(
+        orchestrator_id: str,
+        payload: OrchestratorCredentialTokenPayload,
+    ) -> OrchestratorCredentialTokenResponse:
+        if not credential_verifier or not credential_contract_address:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Credential contract not configured",
+            )
+        record = registry.get_record(orchestrator_id)
+        if not record:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Orchestrator not found")
+        if record.get("denylisted"):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Orchestrator is denylisted")
+        owner_address = str(record.get("address") or "").strip()
+        if not owner_address:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Orchestrator address missing")
+        try:
+            owner_norm = normalize_eth_address(owner_address)
+            delegate_norm = normalize_eth_address(payload.delegate_address)
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+        now_ts = int(time.time())
+        max_expires = now_ts + int(
+            getattr(settings, "orchestrator_credential_nonce_ttl_seconds", 300) or 300
+        )
+        if payload.expires_at < now_ts or payload.expires_at > max_expires:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Credential expired")
+
+        if not credential_nonces.consume(payload.nonce):
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credential nonce")
+
+        recovered = recover_delegate(
+            orchestrator_id=orchestrator_id,
+            owner=owner_norm,
+            delegate=delegate_norm,
+            nonce=payload.nonce,
+            expires_at=payload.expires_at,
+            signature=payload.signature,
+        )
+        if recovered != delegate_norm.lower():
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credential signature")
+
+        if not credential_verifier.verify(owner_norm, delegate_norm):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Credential not valid on-chain")
+
+        ttl_seconds = int(
+            getattr(settings, "orchestrator_credential_token_ttl_seconds", 900) or 900
+        )
+        minted = credential_tokens.mint(orchestrator_id, ttl_seconds=ttl_seconds)
+        return OrchestratorCredentialTokenResponse(**minted)
 
     @app.get("/api/orchestrator-edge", response_model=EdgeConfigResponse)
     async def get_orchestrator_edge(
@@ -2005,6 +2374,7 @@ def create_app(
             orchestrator_id=orchestrator_id,
             address=record.get("address", ""),
             balance_eth=str(balance),
+            credit_unit=str(getattr(settings, "credit_unit", "eth") or "eth"),
             eligible_for_payments=bool(record.get("eligible_for_payments", False)),
             is_top_100=bool(record.get("is_top_100", False)),
             denylisted=bool(record.get("denylisted", False)),
@@ -2134,11 +2504,13 @@ def create_app(
             cursor += timedelta(days=1)
 
         session_credit = getattr(settings, "session_credit_eth_per_minute", Decimal("0")) or Decimal("0")
+        passive_credit = power_credit_eth_per_minute
         payout_strategy = str(getattr(settings, "payout_strategy", "eth_transfer") or "eth_transfer")
 
         return OrchestratorStatsResponse(
             orchestrator_id=orchestrator_id,
             balance_eth=str(orchestrator_balance(orchestrator_id)),
+            credit_unit=str(getattr(settings, "credit_unit", "eth") or "eth"),
             days=days,
             total_credits_eth=str(totals["credits"]),
             total_payouts_eth=str(totals["payouts"]),
@@ -2148,7 +2520,7 @@ def create_app(
             total_net_delta_eth=str(totals["net_delta"]),
             daily=daily_models,
             session_credit_eth_per_minute=str(session_credit),
-            passive_credit_eth_per_minute="0",
+            passive_credit_eth_per_minute=str(passive_credit),
             payout_strategy=payout_strategy,
         )
 
@@ -2292,6 +2664,7 @@ def create_app(
 
         credit_rate = getattr(settings, "workload_time_credit_eth_per_minute", Decimal("0"))
         amount = (Decimal(payload.duration_ms) * Decimal(credit_rate)) / Decimal(60_000)
+        credit_unit = str(getattr(settings, "credit_unit", "eth") or "eth")
 
         record = {
             "orchestrator_id": payload.orchestrator_id,
@@ -2309,6 +2682,7 @@ def create_app(
                 "kind": "workload_time",
                 "duration_ms": int(payload.duration_ms),
                 "credit_eth_per_minute": str(credit_rate),
+                "credit_unit": credit_unit,
                 "computed_at": datetime.utcnow().isoformat() + "Z",
             },
         }
@@ -2324,6 +2698,7 @@ def create_app(
                 "artifact_hash": payload.artifact_hash,
                 "duration_ms": str(payload.duration_ms),
                 "credit_eth_per_minute": str(credit_rate),
+                "credit_unit": credit_unit,
             }
             if tee_core_authority:
                 _tee_core_credit(
@@ -2485,6 +2860,181 @@ def create_app(
             range_start=since,
             range_end=until,
             orchestrators=summary,
+        )
+
+    # ======================================================
+    # WORKLOAD OFFERS (catalog + orchestrator opt-in)
+    # ======================================================
+
+    def _offer_to_model(offer_id: str, payload: Dict[str, Any]) -> WorkloadOfferRecord:
+        cfg = payload.get("config")
+        return WorkloadOfferRecord(
+            offer_id=offer_id,
+            title=str(payload.get("title") or ""),
+            description=payload.get("description"),
+            kind=str(payload.get("kind") or ""),
+            payout_amount_eth=str(payload.get("payout_amount_eth") or "0"),
+            active=bool(payload.get("active", False)),
+            config=cfg if isinstance(cfg, dict) else {},
+            created_at=str(payload.get("created_at") or ""),
+            updated_at=str(payload.get("updated_at") or ""),
+        )
+
+    @app.post("/api/workload-offers", response_model=WorkloadOfferRecord)
+    async def create_workload_offer(
+        payload: WorkloadOfferCreatePayload,
+        _: Any = Depends(require_admin),
+    ) -> WorkloadOfferRecord:
+        if workload_offer_store.get(payload.offer_id):
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Offer already exists")
+        record = workload_offer_store.create(
+            payload.offer_id,
+            {
+                "title": payload.title,
+                "description": payload.description,
+                "kind": payload.kind,
+                "payout_amount_eth": str(payload.payout_amount_eth),
+                "active": bool(payload.active),
+                "config": payload.config or {},
+            },
+        )
+        return _offer_to_model(payload.offer_id, record)
+
+    @app.patch("/api/workload-offers/{offer_id}", response_model=WorkloadOfferRecord)
+    async def update_workload_offer(
+        offer_id: str,
+        payload: WorkloadOfferUpdatePayload,
+        _: Any = Depends(require_admin),
+    ) -> WorkloadOfferRecord:
+        record = workload_offer_store.get(offer_id)
+        if record is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Offer not found")
+        updates: Dict[str, Any] = {}
+        if payload.title is not None:
+            updates["title"] = payload.title
+        if payload.description is not None:
+            updates["description"] = payload.description
+        if payload.kind is not None:
+            updates["kind"] = payload.kind
+        if payload.payout_amount_eth is not None:
+            updates["payout_amount_eth"] = str(payload.payout_amount_eth)
+        if payload.active is not None:
+            updates["active"] = bool(payload.active)
+        if payload.config is not None:
+            updates["config"] = payload.config
+        updated = workload_offer_store.update(offer_id, updates) if updates else record
+        if updated is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Offer not found")
+        return _offer_to_model(offer_id, updated)
+
+    @app.get("/api/workload-offers", response_model=WorkloadOfferListResponse)
+    async def list_workload_offers(
+        active_only: bool = Query(default=True),
+        _: Any = Depends(require_view_access),
+    ) -> WorkloadOfferListResponse:
+        offers: List[WorkloadOfferRecord] = []
+        for offer_id, payload in workload_offer_store.iter_with_ids():
+            if active_only and not bool(payload.get("active", False)):
+                continue
+            offers.append(_offer_to_model(offer_id, payload))
+        offers.sort(key=lambda entry: entry.offer_id)
+        return WorkloadOfferListResponse(offers=offers)
+
+    @app.get("/api/workload-offers/subscriptions")
+    async def list_workload_offer_subscriptions(
+        _: Any = Depends(require_view_access),
+    ) -> Dict[str, Any]:
+        return {
+            "subscriptions": {
+                orchestrator_id: (payload.get("offer_ids") if isinstance(payload, dict) else [])
+                for orchestrator_id, payload in workload_subscriptions.iter_with_ids()
+            }
+        }
+
+    @app.get("/api/orchestrators/me/workload-offers", response_model=WorkloadOfferSelectionResponse)
+    async def get_orchestrator_workload_offers(
+        auth: Dict[str, str] = Depends(require_orchestrator_token),
+    ) -> WorkloadOfferSelectionResponse:
+        orchestrator_id = auth.get("orchestrator_id", "")
+        offer_ids = workload_subscriptions.get(orchestrator_id)
+        offers: List[WorkloadOfferRecord] = []
+        for offer_id in offer_ids:
+            record = workload_offer_store.get(offer_id)
+            if record is None:
+                continue
+            offers.append(_offer_to_model(offer_id, record))
+        return WorkloadOfferSelectionResponse(
+            orchestrator_id=orchestrator_id,
+            offer_ids=offer_ids,
+            offers=offers,
+        )
+
+    @app.get(
+        "/api/orchestrators/me/workload-offers/available",
+        response_model=WorkloadOfferListResponse,
+    )
+    async def list_available_workload_offers(
+        active_only: bool = Query(default=True),
+        auth: Dict[str, str] = Depends(require_orchestrator_token),
+    ) -> WorkloadOfferListResponse:
+        orchestrator_id = auth.get("orchestrator_id", "")
+        if not orchestrator_id:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Orchestrator token required")
+        offers: List[WorkloadOfferRecord] = []
+        for offer_id, payload in workload_offer_store.iter_with_ids():
+            if active_only and not bool(payload.get("active", False)):
+                continue
+            offers.append(_offer_to_model(offer_id, payload))
+        offers.sort(key=lambda entry: entry.offer_id)
+        return WorkloadOfferListResponse(offers=offers)
+
+    @app.put("/api/orchestrators/me/workload-offers", response_model=WorkloadOfferSelectionResponse)
+    async def set_orchestrator_workload_offers(
+        payload: WorkloadOfferSelectionPayload,
+        auth: Dict[str, str] = Depends(require_orchestrator_token),
+    ) -> WorkloadOfferSelectionResponse:
+        orchestrator_id = auth.get("orchestrator_id", "")
+        raw = payload.offer_ids or []
+        wanted: List[str] = []
+        seen: set[str] = set()
+        for value in raw:
+            candidate = (value or "").strip()
+            if not candidate or candidate in seen:
+                continue
+            seen.add(candidate)
+            wanted.append(candidate)
+
+        missing: List[str] = []
+        inactive: List[str] = []
+        for offer_id in wanted:
+            record = workload_offer_store.get(offer_id)
+            if record is None:
+                missing.append(offer_id)
+            elif not bool(record.get("active", False)):
+                inactive.append(offer_id)
+        if missing or inactive:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={"error": "Invalid offer ids", "missing": missing, "inactive": inactive},
+            )
+        max_offers = getattr(workload_subscriptions, "max_offers", 50)
+        if len(wanted) > max_offers:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={"error": "Too many offer ids", "max": max_offers, "received": len(wanted)},
+            )
+        stored = workload_subscriptions.set(orchestrator_id, wanted)
+        offer_ids = stored.get("offer_ids") if isinstance(stored, dict) else []
+        offers: List[WorkloadOfferRecord] = []
+        for offer_id in offer_ids:
+            record = workload_offer_store.get(offer_id)
+            if record is None:
+                continue
+            offers.append(_offer_to_model(offer_id, record))
+        return WorkloadOfferSelectionResponse(
+            orchestrator_id=orchestrator_id,
+            offer_ids=offer_ids if isinstance(offer_ids, list) else [],
+            offers=offers,
         )
 
     # ======================================================
@@ -3120,6 +3670,7 @@ def create_app(
             edge_id=payload.edge_id,
             segment_seconds=segment_seconds,
             credit_eth_per_minute=credit_rate,
+            credit_unit=str(getattr(settings, "credit_unit", "eth") or "eth"),
             ledger=ledger_sink,
         )
 
