@@ -108,7 +108,13 @@ class OrchestratorTokenStore:
             json.dump(self._tokens, handle, indent=2, sort_keys=True)
         tmp.replace(self.path)
 
-    def mint(self, orchestrator_id: str, *, ttl_seconds: Optional[int] = None) -> Dict[str, str]:
+    def mint(
+        self,
+        orchestrator_id: str,
+        *,
+        ttl_seconds: Optional[int] = None,
+        rotate: bool = False,
+    ) -> Dict[str, str]:
         token_value = secrets.token_urlsafe(32)
         token_hash = _sha256_hex(token_value)
         token_id = uuid.uuid4().hex
@@ -117,15 +123,25 @@ class OrchestratorTokenStore:
             ttl = int(ttl_seconds)
             if ttl > 0:
                 expires_at = isoformat(utcnow() + timedelta(seconds=ttl))
+        created_at = isoformat(utcnow())
         record = {
             "orchestrator_id": orchestrator_id,
             "token_hash": token_hash,
-            "created_at": isoformat(utcnow()),
+            "created_at": created_at,
             "expires_at": expires_at,
             "revoked_at": None,
             "last_seen_at": None,
         }
         with self._lock:
+            if rotate:
+                for existing_token_id, existing in list(self._tokens.items()):
+                    if existing.get("orchestrator_id") != orchestrator_id:
+                        continue
+                    if existing.get("revoked_at"):
+                        continue
+                    updated = dict(existing)
+                    updated["revoked_at"] = created_at
+                    self._tokens[existing_token_id] = updated
             self._tokens[token_id] = record
             self._persist()
         result = {"token_id": token_id, "token": token_value}
