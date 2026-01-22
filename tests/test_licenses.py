@@ -322,6 +322,71 @@ async def test_license_invite_redeem_mints_token_and_grants_access(temp_paths):
 
 
 @pytest.mark.anyio("asyncio")
+async def test_license_token_rotation_revokes_previous_token(temp_paths):
+    registry, ledger = build_registry(temp_paths)
+    app_settings = build_settings(temp_paths, license_lease_seconds=30)
+    app = create_app(registry, ledger, app_settings)
+
+    orchestrator_id = "orch-rotate"
+    address = "0x1111111111111111111111111111111111111111"
+    with patch.object(Registry, "_resolve_top_set", return_value={address.lower()}):
+        registry.register(orchestrator_id=orchestrator_id, address=address)
+
+    image_ref = "ghcr.io/its-define/unreal_vtuber/embody-ue-ps:enc-v1"
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        image = await client.put(
+            "/api/licenses/images",
+            json={"image_ref": image_ref},
+            headers={"X-Admin-Token": "secret"},
+        )
+        assert image.status_code == 200
+
+        grant = await client.post(
+            "/api/licenses/access/grant",
+            json={"orchestrator_id": orchestrator_id, "image_ref": image_ref},
+            headers={"X-Admin-Token": "secret"},
+        )
+        assert grant.status_code == 200
+
+        minted_1 = await client.post(
+            f"/api/licenses/orchestrators/{orchestrator_id}/tokens",
+            headers={"X-Admin-Token": "secret"},
+        )
+        assert minted_1.status_code == 200
+        token_1 = minted_1.json()["token"]
+
+        lease_1 = await client.post(
+            "/api/licenses/lease",
+            json={"image_ref": image_ref},
+            headers={"Authorization": f"Bearer {token_1}"},
+        )
+        assert lease_1.status_code == 200
+
+        minted_2 = await client.post(
+            f"/api/licenses/orchestrators/{orchestrator_id}/tokens",
+            headers={"X-Admin-Token": "secret"},
+        )
+        assert minted_2.status_code == 200
+        token_2 = minted_2.json()["token"]
+
+        lease_old = await client.post(
+            "/api/licenses/lease",
+            json={"image_ref": image_ref},
+            headers={"Authorization": f"Bearer {token_1}"},
+        )
+        assert lease_old.status_code == 401
+
+        lease_new = await client.post(
+            "/api/licenses/lease",
+            json={"image_ref": image_ref},
+            headers={"Authorization": f"Bearer {token_2}"},
+        )
+        assert lease_new.status_code == 200
+
+
+@pytest.mark.anyio("asyncio")
 async def test_orchestrator_bootstrap_returns_edge_config(temp_paths):
     registry, ledger = build_registry(temp_paths)
     app_settings = build_settings(

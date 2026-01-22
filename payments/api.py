@@ -3756,7 +3756,7 @@ def create_app(
         _: Any = Depends(require_admin),
     ) -> LicenseTokenCreateResponse:
         _ensure_orchestrator_exists(orchestrator_id)
-        minted = license_tokens.mint(orchestrator_id)
+        minted = license_tokens.mint(orchestrator_id, rotate=True)
         log_license_event(
             "token_minted",
             {"orchestrator_id": orchestrator_id, "token_id": minted["token_id"]},
@@ -4025,7 +4025,7 @@ def create_app(
             )
 
             license_access.grant(payload.orchestrator_id, image_ref)
-            minted = license_tokens.mint(payload.orchestrator_id)
+            minted = license_tokens.mint(payload.orchestrator_id, rotate=True)
             license_invites.commit(
                 invite_id=invite_id,
                 orchestrator_id=payload.orchestrator_id,
