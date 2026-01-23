@@ -275,6 +275,55 @@ class ForwarderHealthReportPayload(BaseModel):
     data: Dict[str, Any]
 
 
+class OrchestratorOpsRolloutCommandPayload(BaseModel):
+    image_ref: str = Field(min_length=1, max_length=512)
+    orchestrator_id: Optional[str] = Field(default=None, min_length=1, max_length=128)
+    orchestrator_ids: Optional[List[str]] = Field(default=None)
+    payments_api_url: Optional[str] = Field(default=None, max_length=512)
+    recreate_stopped: bool = Field(
+        default=False,
+        description="Forwarded to the orchestrator /ops/rollout endpoint when true.",
+    )
+    timeout_seconds: float = Field(default=300.0, ge=1.0, le=3600.0)
+
+    @field_validator("orchestrator_ids")
+    @classmethod
+    def validate_orchestrator_ids(cls, value: Optional[List[str]]) -> Optional[List[str]]:
+        if value is None:
+            return None
+        cleaned: List[str] = []
+        for item in value:
+            candidate = (item or "").strip()
+            if not candidate:
+                continue
+            cleaned.append(candidate)
+        if not cleaned:
+            return None
+        return cleaned
+
+    @model_validator(mode="after")
+    def validate_targets(self):  # type: ignore[override]
+        if not self.orchestrator_id and not self.orchestrator_ids:
+            raise ValueError("orchestrator_id or orchestrator_ids required")
+        return self
+
+
+class OrchestratorOpsRolloutResult(BaseModel):
+    orchestrator_id: str
+    host: Optional[str] = None
+    url: Optional[str] = None
+    ok: bool
+    http_status: Optional[int] = None
+    response_snippet: Optional[str] = None
+    error: Optional[str] = None
+
+
+class OrchestratorOpsRolloutResponse(BaseModel):
+    image_ref: str
+    payments_api_url: str
+    results: List[OrchestratorOpsRolloutResult]
+
+
 class OrchestratorsResponse(BaseModel):
     orchestrators: List[OrchestratorRecord]
 
@@ -2605,6 +2654,158 @@ def create_app(
         except Exception:
             pass
         return {"ok": True}
+
+    def _resolve_payments_api_url_for_rollout(request: Request, override: Optional[str]) -> str:
+        candidate = (override or "").strip().rstrip("/")
+        if candidate:
+            return candidate
+        forwarded_proto = request.headers.get("X-Forwarded-Proto") or ""
+        forwarded_host = request.headers.get("X-Forwarded-Host") or ""
+        if forwarded_proto and forwarded_host:
+            proto = forwarded_proto.split(",", 1)[0].strip()
+            host = forwarded_host.split(",", 1)[0].strip()
+            if proto and host:
+                return f"{proto}://{host}".rstrip("/")
+        return str(request.base_url).rstrip("/")
+
+    def _redact_rollout_payload(value: Any, *, depth: int = 0) -> Any:
+        if depth >= 6:
+            return "...(truncated)..."
+        if isinstance(value, dict):
+            output: Dict[str, Any] = {}
+            for key, item in value.items():
+                key_str = str(key)
+                key_lower = key_str.lower()
+                if key_lower in {"stdout", "stderr", "before", "after"}:
+                    continue
+                if any(
+                    token in key_lower
+                    for token in (
+                        "secret",
+                        "token",
+                        "password",
+                        "private",
+                        "credential",
+                        "signature",
+                        "key",
+                    )
+                ):
+                    output[key_str] = "[redacted]"
+                    continue
+                output[key_str] = _redact_rollout_payload(item, depth=depth + 1)
+            return output
+        if isinstance(value, list):
+            if len(value) > 50:
+                return [_redact_rollout_payload(item, depth=depth + 1) for item in value[:50]] + ["..."]
+            return [_redact_rollout_payload(item, depth=depth + 1) for item in value]
+        if isinstance(value, str):
+            cleaned = value.strip()
+            if len(cleaned) > 512:
+                return cleaned[:512] + "...(truncated)..."
+            return cleaned
+        return value
+
+    def _rollout_response_snippet(resp: httpx.Response) -> Optional[str]:
+        try:
+            payload = resp.json()
+        except Exception:
+            text = (resp.text or "").strip()
+            if not text:
+                return None
+            return text[:1024] + ("...(truncated)..." if len(text) > 1024 else "")
+        try:
+            safe = _redact_rollout_payload(payload)
+            serialized = json.dumps(safe, sort_keys=True)
+        except Exception:
+            serialized = str(payload)
+        if len(serialized) > 2048:
+            return serialized[:2048] + "...(truncated)..."
+        return serialized
+
+    @app.post("/api/orchestrators/ops/rollout", response_model=OrchestratorOpsRolloutResponse)
+    async def orchestrator_ops_rollout(
+        payload: OrchestratorOpsRolloutCommandPayload,
+        request: Request,
+        _: Any = Depends(require_admin),
+    ) -> OrchestratorOpsRolloutResponse:
+        payments_api_url = _resolve_payments_api_url_for_rollout(request, payload.payments_api_url)
+        image_ref = payload.image_ref.strip()
+
+        targets: List[str] = []
+        if payload.orchestrator_ids:
+            targets.extend(payload.orchestrator_ids)
+        if payload.orchestrator_id:
+            targets.append(payload.orchestrator_id.strip())
+
+        seen: set[str] = set()
+        deduped: List[str] = []
+        for orch_id in targets:
+            cleaned = orch_id.strip()
+            if not cleaned or cleaned in seen:
+                continue
+            seen.add(cleaned)
+            deduped.append(cleaned)
+
+        timeout = httpx.Timeout(float(payload.timeout_seconds), connect=5.0)
+        results: List[OrchestratorOpsRolloutResult] = []
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            for orch_id in deduped:
+                if not registry.get_record(orch_id):
+                    results.append(
+                        OrchestratorOpsRolloutResult(
+                            orchestrator_id=orch_id,
+                            ok=False,
+                            error="Unknown orchestrator",
+                        )
+                    )
+                    continue
+                host = _orchestrator_public_host(orch_id)
+                if not host:
+                    results.append(
+                        OrchestratorOpsRolloutResult(
+                            orchestrator_id=orch_id,
+                            ok=False,
+                            error="Orchestrator host missing from registry",
+                        )
+                    )
+                    continue
+
+                url = f"http://{host}:9090/ops/rollout"
+                rollout_payload: Dict[str, Any] = {
+                    "image_ref": image_ref,
+                    "payments_api_url": payments_api_url,
+                }
+                if payload.recreate_stopped:
+                    rollout_payload["recreate_stopped"] = True
+
+                try:
+                    resp = await client.post(url, json=rollout_payload)
+                    results.append(
+                        OrchestratorOpsRolloutResult(
+                            orchestrator_id=orch_id,
+                            host=host,
+                            url=url,
+                            ok=200 <= resp.status_code < 300,
+                            http_status=resp.status_code,
+                            response_snippet=_rollout_response_snippet(resp),
+                        )
+                    )
+                except httpx.RequestError as exc:
+                    results.append(
+                        OrchestratorOpsRolloutResult(
+                            orchestrator_id=orch_id,
+                            host=host,
+                            url=url,
+                            ok=False,
+                            error=str(exc),
+                        )
+                    )
+
+        return OrchestratorOpsRolloutResponse(
+            image_ref=image_ref,
+            payments_api_url=payments_api_url,
+            results=results,
+        )
 
     def _ensure_orchestrator_exists(orchestrator_id: str) -> None:
         if not registry.get_record(orchestrator_id):
