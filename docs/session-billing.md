@@ -9,8 +9,17 @@ This backend can credit orchestrators based on **connected Pixel Streaming sessi
   - `heartbeat` (periodic while connected)
   - `end` (WS disconnected)
 - Payments stores session state in `sessions.json` and credits the orchestrator ledger with `reason="session_time"` using the elapsed time since the last billed event (`delta_ms`).
+- Session events may include `streamer_id` (avatar id). When present, Payments stores it on the session record and includes it in any `session_time` ledger metadata.
 
 Orchestrator attribution is done by matching `upstream_addr` (the game host IP) to the registry record field `host_public_ip`.
+
+## Credit gating (sleep-aware)
+
+Session events are always recorded for observability, but `session_time` credits are only issued when:
+
+- the orchestrator can be resolved from `upstream_addr`
+- the orchestrator is eligible (`registry.is_eligible(orchestrator_id)`)
+- `/power` reports `state=awake` (unknown/error states are treated as not-awake)
 
 ## Enable
 
@@ -35,7 +44,7 @@ Send a session event (replace values):
 curl -sS -X POST \
   -H "Content-Type: application/json" \
   -H "X-Session-Token: <PAYMENTS_SESSION_REPORTER_TOKEN>" \
-  -d '{"session_id":"test-1","upstream_addr":"203.0.113.10","upstream_port":8888,"edge_id":"edge-a","event":"start"}' \
+  -d '{"session_id":"test-1","upstream_addr":"203.0.113.10","upstream_port":8888,"edge_id":"edge-a","streamer_id":"avatar-1","event":"start"}' \
   "http://<payments-ip>:8081/api/sessions/events"
 ```
 

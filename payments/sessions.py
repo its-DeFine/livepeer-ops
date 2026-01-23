@@ -90,6 +90,7 @@ class SessionStore:
         upstream_addr: str,
         upstream_port: int,
         edge_id: Optional[str],
+        streamer_id: Optional[str],
         segment_seconds: int,
         credit_eth_per_minute: Decimal,
         credit_unit: str = "eth",
@@ -101,10 +102,21 @@ class SessionStore:
 
         now_iso = isoformat(now)
         segment_ms = max(1, int(segment_seconds) * 1000)
+        streamer_norm: Optional[str] = None
+        if isinstance(streamer_id, str):
+            candidate = streamer_id.strip()
+            if candidate:
+                streamer_norm = candidate
 
         with self._lock:
             existing = self._sessions.get(session_id)
             record: Dict[str, Any] = dict(existing) if isinstance(existing, dict) else {}
+            if not streamer_norm:
+                prior = record.get("streamer_id")
+                if isinstance(prior, str):
+                    candidate = prior.strip()
+                    if candidate:
+                        streamer_norm = candidate
 
             if event_norm == "start" and record.get("ended_at"):
                 # Treat a new start after an end as a fresh session (avoid mixing billing windows).
@@ -140,6 +152,8 @@ class SessionStore:
             record["upstream_port"] = upstream_port
             if edge_id:
                 record["edge_id"] = edge_id
+            if streamer_norm:
+                record["streamer_id"] = streamer_norm
 
             record["session_id"] = session_id
             record["started_at"] = started_at
@@ -178,59 +192,60 @@ class SessionStore:
 
                 segment_start_iso = isoformat(segment_start_dt)
                 segment_end_iso = isoformat(end_dt)
-                proof = _session_proof_hash(
-                    {
-                        "session_id": session_id,
-                        "orchestrator_id": orchestrator_id,
-                        "edge_id": edge_id,
-                        "segment_index": segment_index,
-                        "segment_start": segment_start_iso,
-                        "segment_end": segment_end_iso,
-                        "duration_ms": duration_ms,
-                    }
-                )
-                last_proof = proof
                 metered_ms += duration_ms
 
-                amount = Decimal("0")
-                if orchestrator_id and credit_eth_per_minute > 0:
+                if orchestrator_id and credit_eth_per_minute > 0 and ledger is not None:
                     amount = (Decimal(duration_ms) * credit_eth_per_minute) / Decimal(60_000)
-                    if amount > 0 and ledger is not None:
+                    if amount > 0:
+                        proof_payload: Dict[str, Any] = {
+                            "session_id": session_id,
+                            "orchestrator_id": orchestrator_id,
+                            "edge_id": edge_id,
+                            "segment_index": segment_index,
+                            "segment_start": segment_start_iso,
+                            "segment_end": segment_end_iso,
+                            "duration_ms": duration_ms,
+                        }
+                        if streamer_norm:
+                            proof_payload["streamer_id"] = streamer_norm
+                        proof = _session_proof_hash(proof_payload)
+                        last_proof = proof
+                        metadata: Dict[str, Any] = {
+                            "session_id": session_id,
+                            "event": event_norm,
+                            "trigger": trigger,
+                            "segment_index": str(segment_index),
+                            "segment_start": segment_start_iso,
+                            "segment_end": segment_end_iso,
+                            "duration_ms": str(duration_ms),
+                            "proof_hash": proof,
+                            "upstream_addr": upstream_addr,
+                            "upstream_port": upstream_port,
+                            "edge_id": edge_id,
+                            "credit_unit": credit_unit,
+                        }
+                        if streamer_norm:
+                            metadata["streamer_id"] = streamer_norm
                         ledger.credit(
                             orchestrator_id,
                             amount,
                             reason="session_time",
-                            metadata={
-                                "session_id": session_id,
-                                "event": event_norm,
-                                "trigger": trigger,
-                                "segment_index": str(segment_index),
-                                "segment_start": segment_start_iso,
-                                "segment_end": segment_end_iso,
-                                "duration_ms": str(duration_ms),
-                                "proof_hash": proof,
-                                "upstream_addr": upstream_addr,
-                                "upstream_port": upstream_port,
-                                "edge_id": edge_id,
-                                "credit_unit": credit_unit,
-                            },
+                            metadata=metadata,
                         )
                         billed_ms += duration_ms
                         billed_eth += amount
                         credited_amount += amount
-
-                if amount > 0:
-                    segments.append(
-                        {
-                            "segment_index": segment_index,
-                            "start_at": segment_start_iso,
-                            "end_at": segment_end_iso,
-                            "duration_ms": duration_ms,
-                            "credited_eth": str(amount),
-                            "proof_hash": proof,
-                            "trigger": trigger,
-                        }
-                    )
+                        segments.append(
+                            {
+                                "segment_index": segment_index,
+                                "start_at": segment_start_iso,
+                                "end_at": segment_end_iso,
+                                "duration_ms": duration_ms,
+                                "credited_eth": str(amount),
+                                "proof_hash": proof,
+                                "trigger": trigger,
+                            }
+                        )
 
                 segment_index += 1
                 segment_start_dt = end_dt

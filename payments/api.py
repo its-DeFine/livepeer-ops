@@ -85,6 +85,24 @@ class RateLimiter:
             return True
 
 
+async def fetch_orchestrator_power_state(host: str, *, timeout: httpx.Timeout) -> str:
+    """Fetch orchestrator power state from /power.
+
+    Returns a normalized state string (e.g., "awake", "sleeping") or "unknown".
+    """
+
+    try:
+        url = f"http://{host}:9090/power"
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.get(url)
+        if resp.status_code != 200:
+            return "unknown"
+        state = str(resp.json().get("state") or "").strip().lower()
+        return state or "unknown"
+    except Exception:
+        return "unknown"
+
+
 class RegistrationPayload(BaseModel):
     orchestrator_id: str = Field(min_length=1, max_length=128)
     address: str = Field(pattern=r"^0x[a-fA-F0-9]{40}$")
@@ -850,7 +868,16 @@ class SessionEventPayload(BaseModel):
     upstream_addr: str = Field(min_length=1, max_length=255)
     upstream_port: int = Field(ge=1, le=65535)
     edge_id: Optional[str] = Field(default=None, max_length=64)
+    streamer_id: Optional[str] = Field(default=None, max_length=128)
     event: str = Field(default="heartbeat", max_length=32)
+
+    @field_validator("streamer_id")
+    @classmethod
+    def validate_streamer_id(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        candidate = value.strip()
+        return candidate if candidate else None
 
     @field_validator("event")
     @classmethod
@@ -880,6 +907,7 @@ class SessionRecord(BaseModel):
     upstream_addr: str
     upstream_port: int
     edge_id: Optional[str] = None
+    streamer_id: Optional[str] = None
     started_at: str
     last_seen_at: str
     ended_at: Optional[str]
@@ -1087,6 +1115,35 @@ def create_app(
     tee_core_transparency_log = TeeCoreTransparencyLog(
         Path(getattr(settings, "tee_core_transparency_log_path", data_dir / "audit" / "tee-core-transparency.log"))
     )
+
+    session_power_state_cache: Dict[str, Dict[str, Any]] = {}
+    session_power_state_cache_lock = threading.Lock()
+    session_power_state_cache_ttl_seconds = 5.0
+
+    async def _session_power_state(orchestrator_id: str, host: str) -> str:
+        if power_metering_enabled:
+            record = power_meter.get(orchestrator_id)
+            if isinstance(record, dict):
+                state = record.get("state")
+                if isinstance(state, str) and state.strip():
+                    return state.strip().lower()
+            return "unknown"
+
+        now = time.monotonic()
+        with session_power_state_cache_lock:
+            cached = session_power_state_cache.get(orchestrator_id)
+            if isinstance(cached, dict):
+                cached_state = cached.get("state")
+                cached_at = cached.get("checked_at")
+                if isinstance(cached_state, str) and isinstance(cached_at, (float, int)):
+                    if now - float(cached_at) <= session_power_state_cache_ttl_seconds:
+                        return cached_state
+
+        timeout = httpx.Timeout(1.0, connect=0.5)
+        state = await fetch_orchestrator_power_state(host, timeout=timeout)
+        with session_power_state_cache_lock:
+            session_power_state_cache[orchestrator_id] = {"state": state, "checked_at": now}
+        return state
 
     def normalize_ip(value: Optional[str]) -> Optional[str]:
         if not value:
@@ -3833,33 +3890,42 @@ def create_app(
         credit_rate = Decimal(str(getattr(settings, "session_credit_eth_per_minute", "0") or "0"))
         segment_seconds = int(getattr(settings, "session_segment_seconds", 2400) or 2400)
 
-        ledger_sink: Optional[Any] = ledger
-        if tee_core_authority and credit_rate > 0:
-            if tee_core is None:
-                raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="TEE core unavailable")
+        ledger_sink: Optional[Any] = None
+        if orch_id and credit_rate > 0:
+            eligible = registry.is_eligible(orch_id)
+            awake = False
+            if eligible:
+                state = await _session_power_state(orch_id, upstream_addr)
+                awake = state == "awake"
 
-            class TeeCoreLedgerAdapter:
-                def credit(
-                    self,
-                    orchestrator_id: str,
-                    amount: Decimal,
-                    *,
-                    reason: Optional[str] = None,
-                    metadata: Optional[Dict[str, Any]] = None,
-                ) -> Decimal:
-                    meta = dict(metadata) if isinstance(metadata, dict) else None
-                    proof_hash = meta.get("proof_hash") if meta else None
-                    event_id = f"session:{proof_hash}" if isinstance(proof_hash, str) and proof_hash else f"session:{uuid.uuid4().hex}"
-                    return _tee_core_credit(
-                        orchestrator_id=orchestrator_id,
-                        amount_eth=amount,
-                        event_id=event_id,
-                        reason=reason,
-                        metadata=meta,
-                        source="session_time",
-                    )
+            if eligible and awake:
+                ledger_sink = ledger
+                if tee_core_authority:
+                    if tee_core is None:
+                        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="TEE core unavailable")
 
-            ledger_sink = TeeCoreLedgerAdapter()
+                    class TeeCoreLedgerAdapter:
+                        def credit(
+                            self,
+                            orchestrator_id: str,
+                            amount: Decimal,
+                            *,
+                            reason: Optional[str] = None,
+                            metadata: Optional[Dict[str, Any]] = None,
+                        ) -> Decimal:
+                            meta = dict(metadata) if isinstance(metadata, dict) else None
+                            proof_hash = meta.get("proof_hash") if meta else None
+                            event_id = f"session:{proof_hash}" if isinstance(proof_hash, str) and proof_hash else f"session:{uuid.uuid4().hex}"
+                            return _tee_core_credit(
+                                orchestrator_id=orchestrator_id,
+                                amount_eth=amount,
+                                event_id=event_id,
+                                reason=reason,
+                                metadata=meta,
+                                source="session_time",
+                            )
+
+                    ledger_sink = TeeCoreLedgerAdapter()
 
         stored = session_store.apply_event(
             session_id=payload.session_id,
@@ -3869,6 +3935,7 @@ def create_app(
             upstream_addr=payload.upstream_addr,
             upstream_port=payload.upstream_port,
             edge_id=payload.edge_id,
+            streamer_id=payload.streamer_id,
             segment_seconds=segment_seconds,
             credit_eth_per_minute=credit_rate,
             credit_unit=str(getattr(settings, "credit_unit", "eth") or "eth"),
@@ -3893,6 +3960,7 @@ def create_app(
                         metadata={
                             "session_id": payload.session_id,
                             "edge_id": payload.edge_id,
+                            "streamer_id": payload.streamer_id,
                             "upstream_addr": payload.upstream_addr,
                             "upstream_port": payload.upstream_port,
                         },

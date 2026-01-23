@@ -34,9 +34,9 @@ def anyio_backend():
     return "asyncio"
 
 
-def build_registry(temp_paths):
+def build_registry(temp_paths, *, ledger_journal_path=None):
     balances_path, registry_path = temp_paths
-    ledger = Ledger(balances_path)
+    ledger = Ledger(balances_path, journal_path=ledger_journal_path)
     settings = SimpleNamespace(
         top_contract_address=None,
         top_contract_function="getTop",
@@ -1222,6 +1222,9 @@ async def test_session_events_credit_by_time_delta(temp_paths):
         def now(cls, _tz=None):  # noqa: ANN001 - test stub
             return times.pop(0)
 
+    async def fake_power_state(_host, *, timeout):  # noqa: ANN001 - test stub
+        return "awake"
+
     payload = {
         "session_id": "sess-credit-1",
         "upstream_addr": upstream_ip,
@@ -1231,7 +1234,10 @@ async def test_session_events_credit_by_time_delta(temp_paths):
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        with patch("payments.api.datetime", FakeDateTime):
+        with patch("payments.api.datetime", FakeDateTime), patch(
+            "payments.api.fetch_orchestrator_power_state",
+            fake_power_state,
+        ):
             start = await client.post("/api/sessions/events", json={**payload, "event": "start"})
             heartbeat = await client.post("/api/sessions/events", json={**payload, "event": "heartbeat"})
             ended = await client.post("/api/sessions/events", json={**payload, "event": "end"})
@@ -1243,6 +1249,121 @@ async def test_session_events_credit_by_time_delta(temp_paths):
     body = ended.json()
     assert body["billed_ms"] == 10_000
     assert body["billed_eth"] == "0.01"
+
+
+@pytest.mark.anyio("asyncio")
+async def test_session_events_no_credit_when_sleeping(temp_paths):
+    registry, ledger = build_registry(temp_paths)
+
+    upstream_ip = "203.0.113.10"
+    registry.register(
+        orchestrator_id="orch-session",
+        address="0x" + "D" * 40,
+        metadata={"host_public_ip": upstream_ip},
+        skip_rank_validation=True,
+    )
+
+    app_settings = build_settings(
+        temp_paths,
+        session_credit_eth_per_minute=Decimal("0.06"),  # 0.001 ETH/sec
+    )
+    app = create_app(registry, ledger, app_settings)
+
+    t0 = datetime(2025, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+    t1 = t0 + timedelta(seconds=10)
+    times = [t0, t1]
+
+    class FakeDateTime:
+        @classmethod
+        def now(cls, _tz=None):  # noqa: ANN001 - test stub
+            return times.pop(0)
+
+    async def fake_power_state(_host, *, timeout):  # noqa: ANN001 - test stub
+        return "sleeping"
+
+    payload = {
+        "session_id": "sess-sleeping-1",
+        "upstream_addr": upstream_ip,
+        "upstream_port": 8080,
+        "edge_id": "a",
+    }
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        with patch("payments.api.datetime", FakeDateTime), patch(
+            "payments.api.fetch_orchestrator_power_state",
+            fake_power_state,
+        ):
+            await client.post("/api/sessions/events", json={**payload, "event": "start"})
+            ended = await client.post("/api/sessions/events", json={**payload, "event": "end"})
+
+    assert ended.status_code == 200
+    assert ledger.get_balance("orch-session") == Decimal("0")
+    body = ended.json()
+    assert body["billed_ms"] == 0
+    assert body["billed_eth"] == "0"
+
+
+@pytest.mark.anyio("asyncio")
+async def test_session_events_streamer_id_persisted_and_in_ledger_metadata(temp_paths):
+    balances_path, _ = temp_paths
+    journal_path = balances_path.with_name("ledger.journal")
+    registry, ledger = build_registry(temp_paths, ledger_journal_path=journal_path)
+
+    upstream_ip = "203.0.113.10"
+    registry.register(
+        orchestrator_id="orch-session",
+        address="0x" + "D" * 40,
+        metadata={"host_public_ip": upstream_ip},
+        skip_rank_validation=True,
+    )
+
+    app_settings = build_settings(
+        temp_paths,
+        session_credit_eth_per_minute=Decimal("0.06"),  # 0.001 ETH/sec
+    )
+    app = create_app(registry, ledger, app_settings)
+
+    t0 = datetime(2025, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+    t1 = t0 + timedelta(seconds=10)
+    times = [t0, t1]
+
+    class FakeDateTime:
+        @classmethod
+        def now(cls, _tz=None):  # noqa: ANN001 - test stub
+            return times.pop(0)
+
+    async def fake_power_state(_host, *, timeout):  # noqa: ANN001 - test stub
+        return "awake"
+
+    payload = {
+        "session_id": "sess-streamer-1",
+        "upstream_addr": upstream_ip,
+        "upstream_port": 8080,
+        "edge_id": "a",
+        "streamer_id": "avatar-1",
+    }
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        with patch("payments.api.datetime", FakeDateTime), patch(
+            "payments.api.fetch_orchestrator_power_state",
+            fake_power_state,
+        ):
+            start = await client.post("/api/sessions/events", json={**payload, "event": "start"})
+            ended = await client.post("/api/sessions/events", json={**payload, "event": "end"})
+
+    assert start.status_code == 200
+    assert ended.status_code == 200
+    assert ended.json()["streamer_id"] == "avatar-1"
+    assert ledger.get_balance("orch-session") == Decimal("0.01")
+
+    lines = journal_path.read_text().strip().splitlines()
+    assert lines
+    entry = json.loads(lines[-1])
+    assert entry["event"] == "credit"
+    assert entry["reason"] == "session_time"
+    assert entry["metadata"]["streamer_id"] == "avatar-1"
 
 
 @pytest.mark.anyio("asyncio")
