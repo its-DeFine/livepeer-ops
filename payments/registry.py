@@ -521,6 +521,51 @@ class Registry:
                 record["last_session_edge_id"] = edge_id
             self._persist()
 
+    def set_desired_pin(
+        self,
+        orchestrator_id: str,
+        *,
+        ref: Optional[str] = None,
+        service_image_tag: Optional[str] = None,
+    ) -> None:
+        """Persist the desired version pin for an orchestrator (admin-only action)."""
+        with self._lock:
+            record = self._records.get(orchestrator_id)
+            if not record:
+                return
+            now_iso = datetime.now(timezone.utc).isoformat()
+            record["desired_pin"] = {
+                "ref": ref,
+                "service_image_tag": service_image_tag,
+                "updated_at": now_iso,
+            }
+            self._persist()
+        self._write_audit_event(
+            "desired_pin_set",
+            orchestrator_id,
+            {
+                "ref": ref,
+                "service_image_tag": service_image_tag,
+            },
+        )
+
+    def record_ops_upgrade_result(self, orchestrator_id: str, payload: Dict[str, Any]) -> None:
+        """Persist the last /ops/upgrade attempt result for visibility/debugging."""
+        with self._lock:
+            record = self._records.get(orchestrator_id)
+            if not record:
+                return
+            record["last_ops_upgrade"] = {
+                "recorded_at": datetime.now(timezone.utc).isoformat(),
+                **payload,
+            }
+            self._persist()
+        self._write_audit_event(
+            "ops_upgrade_recorded",
+            orchestrator_id,
+            payload,
+        )
+
     def get_record(self, orchestrator_id: str) -> Optional[Dict[str, Any]]:
         with self._lock:
             record = self._records.get(orchestrator_id)

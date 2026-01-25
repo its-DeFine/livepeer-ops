@@ -280,6 +280,8 @@ class OrchestratorRecord(BaseModel):
     last_session_upstream_addr: Optional[str] = None
     last_session_seen_at: Optional[str] = None
     last_session_edge_id: Optional[str] = None
+    desired_pin: Optional[Dict[str, Any]] = None
+    last_ops_upgrade: Optional[Dict[str, Any]] = None
     active: bool = False
     active_reason: Optional[str] = None
     in_use: bool = False
@@ -340,6 +342,36 @@ class OrchestratorOpsRolloutResponse(BaseModel):
     image_ref: str
     payments_api_url: str
     results: List[OrchestratorOpsRolloutResult]
+
+
+class OrchestratorOpsUpgradeCommandPayload(BaseModel):
+    orchestrator_id: str = Field(min_length=1, max_length=128)
+    ref: Optional[str] = Field(default=None, max_length=200)
+    service_image_tag: Optional[str] = Field(default=None, max_length=128)
+    apply: bool = Field(
+        default=True,
+        description="When true, call /power sleep then /ops/upgrade with apply=true (and optionally wake).",
+    )
+    wake_ttl_seconds: Optional[int] = Field(
+        default=None,
+        ge=0,
+        le=60 * 60 * 24,
+        description="If provided, wake the orchestrator after the upgrade and auto-sleep after this many seconds.",
+    )
+    timeout_seconds: float = Field(default=300.0, ge=1.0, le=3600.0)
+
+
+class OrchestratorOpsUpgradeResponse(BaseModel):
+    orchestrator_id: str
+    host: Optional[str] = None
+    power_url: Optional[str] = None
+    upgrade_url: Optional[str] = None
+    ok: bool
+    sleep_http_status: Optional[int] = None
+    upgrade_http_status: Optional[int] = None
+    wake_http_status: Optional[int] = None
+    upgrade_response_snippet: Optional[str] = None
+    error: Optional[str] = None
 
 
 class OrchestratorsResponse(BaseModel):
@@ -2506,6 +2538,8 @@ def create_app(
             last_session_upstream_addr=record.get("last_session_upstream_addr"),
             last_session_seen_at=record.get("last_session_seen_at"),
             last_session_edge_id=record.get("last_session_edge_id"),
+            desired_pin=record.get("desired_pin"),
+            last_ops_upgrade=record.get("last_ops_upgrade"),
             **fields,
         )
 
@@ -2863,6 +2897,138 @@ def create_app(
             payments_api_url=payments_api_url,
             results=results,
         )
+
+    @app.post("/api/orchestrators/ops/upgrade", response_model=OrchestratorOpsUpgradeResponse)
+    async def orchestrator_ops_upgrade(
+        payload: OrchestratorOpsUpgradeCommandPayload,
+        _: Any = Depends(require_strict_admin),
+    ) -> OrchestratorOpsUpgradeResponse:
+        orchestrator_id = payload.orchestrator_id.strip()
+        if not registry.get_record(orchestrator_id):
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unknown orchestrator")
+
+        host = _orchestrator_public_host(orchestrator_id)
+        if not host:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Orchestrator host missing from registry",
+            )
+
+        desired_ref = (payload.ref or "").strip() or None
+        desired_tag = (payload.service_image_tag or "").strip() or None
+        registry.set_desired_pin(orchestrator_id, ref=desired_ref, service_image_tag=desired_tag)
+
+        power_url = f"http://{host}:9090/power"
+        upgrade_url = f"http://{host}:9090/ops/upgrade"
+        result: Dict[str, Any] = {
+            "ref": desired_ref,
+            "service_image_tag": desired_tag,
+        }
+
+        if not payload.apply:
+            result["ok"] = True
+            result["skipped_apply"] = True
+            registry.record_ops_upgrade_result(orchestrator_id, result)
+            return OrchestratorOpsUpgradeResponse(
+                orchestrator_id=orchestrator_id,
+                host=host,
+                power_url=power_url,
+                upgrade_url=upgrade_url,
+                ok=True,
+            )
+
+        timeout = httpx.Timeout(float(payload.timeout_seconds), connect=5.0)
+        sleep_status: Optional[int] = None
+        upgrade_status: Optional[int] = None
+        wake_status: Optional[int] = None
+        upgrade_snippet: Optional[str] = None
+
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                sleep_resp = await client.post(
+                    power_url,
+                    json={"action": "sleep", "reason": "payments /ops/upgrade"},
+                )
+                sleep_status = sleep_resp.status_code
+                result["sleep_http_status"] = sleep_status
+                if not (200 <= sleep_status < 300):
+                    result["ok"] = False
+                    result["error"] = "sleep failed"
+                    registry.record_ops_upgrade_result(orchestrator_id, result)
+                    return OrchestratorOpsUpgradeResponse(
+                        orchestrator_id=orchestrator_id,
+                        host=host,
+                        power_url=power_url,
+                        upgrade_url=upgrade_url,
+                        ok=False,
+                        sleep_http_status=sleep_status,
+                        error="sleep failed",
+                    )
+
+                upgrade_payload: Dict[str, Any] = {"apply": True}
+                if desired_ref:
+                    upgrade_payload["ref"] = desired_ref
+                if desired_tag:
+                    upgrade_payload["service_image_tag"] = desired_tag
+
+                upgrade_resp = await client.post(upgrade_url, json=upgrade_payload)
+                upgrade_status = upgrade_resp.status_code
+                upgrade_snippet = _rollout_response_snippet(upgrade_resp)
+                result["upgrade_http_status"] = upgrade_status
+                result["upgrade_response_snippet"] = upgrade_snippet
+
+                upgrade_ok = 200 <= upgrade_status < 300
+                if upgrade_ok:
+                    try:
+                        upgrade_json = upgrade_resp.json()
+                    except Exception:
+                        upgrade_json = None
+                    if isinstance(upgrade_json, dict) and upgrade_json.get("ok") is False:
+                        upgrade_ok = False
+
+                if payload.wake_ttl_seconds is not None:
+                    wake_resp = await client.post(
+                        power_url,
+                        json={
+                            "action": "wake",
+                            "reason": "payments /ops/upgrade done",
+                            "awake_seconds": int(payload.wake_ttl_seconds),
+                        },
+                    )
+                    wake_status = wake_resp.status_code
+                    result["wake_http_status"] = wake_status
+                    if not (200 <= wake_status < 300):
+                        upgrade_ok = False
+
+                result["ok"] = upgrade_ok
+                registry.record_ops_upgrade_result(orchestrator_id, result)
+                return OrchestratorOpsUpgradeResponse(
+                    orchestrator_id=orchestrator_id,
+                    host=host,
+                    power_url=power_url,
+                    upgrade_url=upgrade_url,
+                    ok=upgrade_ok,
+                    sleep_http_status=sleep_status,
+                    upgrade_http_status=upgrade_status,
+                    wake_http_status=wake_status,
+                    upgrade_response_snippet=upgrade_snippet,
+                )
+        except httpx.RequestError as exc:
+            result["ok"] = False
+            result["error"] = str(exc)
+            registry.record_ops_upgrade_result(orchestrator_id, result)
+            return OrchestratorOpsUpgradeResponse(
+                orchestrator_id=orchestrator_id,
+                host=host,
+                power_url=power_url,
+                upgrade_url=upgrade_url,
+                ok=False,
+                sleep_http_status=sleep_status,
+                upgrade_http_status=upgrade_status,
+                wake_http_status=wake_status,
+                upgrade_response_snippet=upgrade_snippet,
+                error=str(exc),
+            )
 
     def _ensure_orchestrator_exists(orchestrator_id: str) -> None:
         if not registry.get_record(orchestrator_id):
