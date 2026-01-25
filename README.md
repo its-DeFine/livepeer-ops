@@ -2,6 +2,10 @@
 
 FastAPI service that tracks orchestrator registrations, balances, and workload credits.
 
+## Security / secrets
+
+This repo should not contain production secrets. Configure keys/tokens via environment variables (see `.env.example`) and keep private keys in secret stores or mounted files (never committed).
+
 ## Run (local)
 
 1. Copy `.env.example` to `.env` and fill in required values.
