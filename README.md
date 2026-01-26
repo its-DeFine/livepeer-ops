@@ -2,6 +2,31 @@
 
 FastAPI service that tracks orchestrator registrations, balances, and workload credits.
 
+## What this enables
+
+This repo is a self-hosted ops backend for Livepeer participants. It can be used to:
+
+- Onboard orchestrators (registry + optional health metadata)
+- Track credits/balances (workloads, sessions, manual adjustments)
+- Pay out on-chain (ETH transfers or Livepeer TicketBroker redemption)
+- Provide auditability (append-only audit log + optional TEE attestation + optional on-chain checkpoints)
+- Support “bring-your-own-artifact” workloads (optional image licensing + encrypted artifact leases)
+
+## Architecture (at a glance)
+
+- Clients (edges/watchers) post usage events → the backend credits a local ledger.
+- A payment loop settles balances on-chain (or via TicketBroker) when configured.
+- Optional: TEE signer/core can attest to key custody and/or payout logic; witnesses can publish checkpoints on-chain.
+
+Deep dives:
+
+- Orchestrator credential (non-transferable credential + delegate auth): `docs/orchestrator-credential.md`
+- TEE signer + attestation: `docs/tee-attestation.md`
+- TEE core roadmap + current implementation notes: `docs/tee-core.md`
+- Transparency + on-chain checkpoints + verifier: `docs/tee-transparency.md`
+- Session billing (Pixel Streaming usage events): `docs/session-billing.md`
+- One-page overview: `docs/overview.md`
+
 ## Security / secrets
 
 This repo should not contain production secrets. Configure keys/tokens via environment variables (see `.env.example`) and keep private keys in secret stores or mounted files (never committed).
@@ -75,6 +100,13 @@ docker compose up -d
 ## Backups
 
 See `docs/backups.md`.
+
+## On-chain contracts (optional)
+
+This repo includes minimal on-chain helpers used by some deployments:
+
+- `contracts/OrchestratorCredential.sol`: a non-transferable “credential” NFT for orchestrators (owner = cold wallet, delegate = hot wallet). Used to gate private API endpoints without repeated wallet signatures. See `docs/orchestrator-credential.md`.
+- `contracts/TeeCoreCheckpointRegistry.sol`: stores the latest signed transparency checkpoint for a given audit signer address. Used by third-party witnesses to publish a canonical “latest state” pointer on-chain. See `docs/tee-transparency.md`.
 
 ## Livepeer TicketBroker payouts (experimental)
 

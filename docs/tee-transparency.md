@@ -60,6 +60,8 @@ keccak(encodePacked(
 
 The minimal contract verifies that signature and stores the latest checkpoint.
 
+Reference implementation: `contracts/TeeCoreCheckpointRegistry.sol`.
+
 ## Witness publishing (recommended)
 
 ### One-shot publish
