@@ -35,6 +35,7 @@ services:
       - vtuber_network
 
   payments-log-collector:
+    profiles: ["ops"]
     image: fluent/fluent-bit:2.2
     container_name: payments-log-collector
     restart: unless-stopped

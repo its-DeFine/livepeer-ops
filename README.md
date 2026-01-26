@@ -6,6 +6,29 @@ FastAPI service that tracks orchestrator registrations, balances, and workload c
 
 This repo should not contain production secrets. Configure keys/tokens via environment variables (see `.env.example`) and keep private keys in secret stores or mounted files (never committed).
 
+## Livepeer community use cases
+
+This backend can be used by Livepeer participants who want a self-hosted “credits ledger + payout engine” for orchestrators:
+
+- **Onboard orchestrators**: accept orchestrator self-registration (id + payout address + optional health metadata).
+- **Track credits/balances**: credit a simple ledger from workloads (jobs/clips) and/or session events.
+- **Pay out on-chain**: settle balances with ETH transfers or Livepeer TicketBroker redemption (experimental).
+- **Provide auditability**: append-only event logs, plus optional TEE attestation + transparency endpoints for third-party witnesses.
+
+## Minimal community deploy
+
+For a minimal, community-friendly deployment (with optional services gated behind Compose profiles), see `docs/community-minimal-deploy.md`.
+
+Quick deploy (single host):
+
+```bash
+cp .env.example .env
+# Set PAYMENTS_API_ADMIN_TOKEN in .env (recommended for any non-localhost deployment)
+docker compose pull payments-backend
+docker compose up -d
+curl -sS http://127.0.0.1:8081/docs >/dev/null
+```
+
 ## Run (local)
 
 1. Copy `.env.example` to `.env` and fill in required values.
@@ -15,6 +38,11 @@ This repo should not contain production secrets. Configure keys/tokens via envir
 docker compose up -d
 ```
 
+Optional profiles:
+
+- `ops`: log collection sidecar
+- `witness`: checkpoint witness loop
+
 ## Metrics environment (Livepeer SLA / synthetic workloads)
 
 If you need a separate **devops + stage** environment for workload verification and payouts, see `docs/metrics-environment.md`.
@@ -22,6 +50,12 @@ If you need a separate **devops + stage** environment for workload verification 
 ## Deploy (recommended: GHCR image)
 
 This repo publishes a Docker image to GHCR on every `main` push.
+
+Typical host settings (in `.env`):
+
+- `PAYMENTS_API_ADMIN_TOKEN` (recommended if the API is reachable beyond localhost)
+- `PAYMENTS_DATA_DIR=./data` (optional; persistent state directory)
+- `PAYMENTS_PORT=8081` (optional; host port mapping)
 
 1. Set `PAYMENTS_IMAGE` in your `.env` (tag or digest), for example:
 
