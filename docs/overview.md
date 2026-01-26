@@ -14,6 +14,7 @@ The default deployment is intentionally minimal: local JSON state on disk, dry-r
 - **HTTP API (FastAPI)**: orchestrator registry + workload/session ingestion + ledger views.
 - **Ledger + payout loop**: credits balances and (when enabled) performs on-chain settlement.
 - **Audit log (append-only)**: emits balance-changing events and can be verified offline.
+- **Optional fleet ops**: sleep idle stacks via `/power` and trigger rollouts/upgrades via orchestrator manager endpoints.
 - **Optional TEE signer/core**:
   - signer mode: keeps the transaction signing key outside the network-facing API process
   - core mode: makes the enclave the final authority for ledger + payout policy
@@ -52,6 +53,13 @@ If using a signer/core enclave, the backend can expose:
 - attestation documents (`/api/tee/*`) so partners can verify the enclave identity
 - transparency endpoints so partners can verify append-only audit history
 - on-chain checkpoints so a third party can witness the latest state pointer
+
+### 5) Fleet ops (optional)
+
+If your orchestrators expose a small “manager” API (for `/power` and `/ops/*`), the backend can:
+
+- sleep idle stacks based on activity leases + recent sessions
+- trigger rollouts/upgrades across an orchestrator set (admin-only)
 
 ## Deep dives
 

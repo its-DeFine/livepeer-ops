@@ -11,12 +11,14 @@ This repo is a self-hosted ops backend for Livepeer participants. It can be used
 - Pay out on-chain (ETH transfers or Livepeer TicketBroker redemption)
 - Provide auditability (append-only audit log + optional TEE attestation + optional on-chain checkpoints)
 - Support “bring-your-own-artifact” workloads (optional image licensing + encrypted artifact leases)
+- Operate fleets (optional): autosleep idle stacks via `/power` and trigger rollouts/upgrades via orchestrator manager endpoints
 
 ## Architecture (at a glance)
 
 - Clients (edges/watchers) post usage events → the backend credits a local ledger.
 - A payment loop settles balances on-chain (or via TicketBroker) when configured.
 - Optional: TEE signer/core can attest to key custody and/or payout logic; witnesses can publish checkpoints on-chain.
+  Optional: orchestrator fleet ops uses `/power` + `/ops/*` endpoints exposed by the orchestrator host.
 
 Deep dives:
 
