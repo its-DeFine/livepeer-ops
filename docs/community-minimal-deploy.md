@@ -6,7 +6,7 @@ This guide is for operators who want to run the Payments backend as a small, sel
 - a lightweight ledger of credits/balances
 - optional payouts (dry-run by default)
 
-It intentionally keeps the stack minimal and leaves Embody-specific/advanced modules **disabled by default**.
+It intentionally keeps the stack minimal and leaves optional/advanced modules **disabled by default**.
 
 ## What runs in the minimal stack
 
@@ -65,9 +65,9 @@ Or set `COMPOSE_PROFILES`:
 COMPOSE_PROFILES=ops,witness docker compose up -d
 ```
 
-## What’s “Embody-specific” (and stays off by default)
+## What’s optional (and stays off by default)
 
-The codebase includes optional modules used in Embody deployments that you can ignore unless you need them:
+The codebase includes optional modules used in some deployments that you can ignore unless you need them:
 
 - Pixel Streaming session-billing (`/api/sessions/events`) and `/power` gating
 - autosleep polling/crediting

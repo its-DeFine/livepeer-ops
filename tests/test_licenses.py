@@ -89,7 +89,7 @@ async def test_license_token_mint_and_lease_flow(temp_paths):
     with patch.object(Registry, "_resolve_top_set", return_value={address.lower()}):
         registry.register(orchestrator_id=orchestrator_id, address=address)
 
-    image_ref = "ghcr.io/its-define/unreal_vtuber/embody-ue-ps:enc-v1"
+    image_ref = "ghcr.io/its-define/unreal_vtuber/ue-ps:enc-v1"
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -109,7 +109,7 @@ async def test_license_token_mint_and_lease_flow(temp_paths):
             # Admin: register image secret
             image = await client.put(
                 "/api/licenses/images",
-                json={"image_ref": image_ref, "artifact_s3_uri": "s3://embody-test/artifacts/game.enc.zst"},
+                json={"image_ref": image_ref, "artifact_s3_uri": "s3://livepeer-ops-test/artifacts/game.enc.zst"},
                 headers={"X-Admin-Token": "secret"},
             )
             assert image.status_code == 200
@@ -140,7 +140,7 @@ async def test_license_token_mint_and_lease_flow(temp_paths):
             mocked_boto3.client.assert_called_with("s3", region_name="us-east-2")
             mocked_boto3.client.return_value.generate_presigned_url.assert_called_with(
                 "get_object",
-                Params={"Bucket": "embody-test", "Key": "artifacts/game.enc.zst"},
+                Params={"Bucket": "livepeer-ops-test", "Key": "artifacts/game.enc.zst"},
                 ExpiresIn=55,
             )
 
@@ -181,7 +181,7 @@ async def test_license_access_revocation_blocks_heartbeat(temp_paths):
     with patch.object(Registry, "_resolve_top_set", return_value={address.lower()}):
         registry.register(orchestrator_id=orchestrator_id, address=address)
 
-    image_ref = "ghcr.io/its-define/unreal_vtuber/embody-ue-ps:enc-v1"
+    image_ref = "ghcr.io/its-define/unreal_vtuber/ue-ps:enc-v1"
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -233,7 +233,7 @@ async def test_license_invite_redeem_mints_token_and_grants_access(temp_paths):
     )
     app = create_app(registry, ledger, app_settings)
 
-    image_ref = "ghcr.io/its-define/unreal_vtuber/embody-ue-ps:enc-v1"
+    image_ref = "ghcr.io/its-define/unreal_vtuber/ue-ps:enc-v1"
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -332,7 +332,7 @@ async def test_license_token_rotation_revokes_previous_token(temp_paths):
     with patch.object(Registry, "_resolve_top_set", return_value={address.lower()}):
         registry.register(orchestrator_id=orchestrator_id, address=address)
 
-    image_ref = "ghcr.io/its-define/unreal_vtuber/embody-ue-ps:enc-v1"
+    image_ref = "ghcr.io/its-define/unreal_vtuber/ue-ps:enc-v1"
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
