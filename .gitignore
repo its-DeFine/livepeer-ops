@@ -16,6 +16,9 @@ __pycache__/
 *.log
 *.pid
 
+# Ops inventory (keep local-only; contains hostnames/IPs/paths)
+ops/inventory.json
+
 # Enclave build artifacts (never commit)
 enclave/kmstool_enclave_cli
 enclave/libnsm.so

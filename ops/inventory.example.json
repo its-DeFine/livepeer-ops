@@ -1,0 +1,7 @@
+{
+  "prod": {
+    "host": "payments.example.com",
+    "user": "ubuntu",
+    "remote_path": "/home/ubuntu/payments/backend"
+  }
+}

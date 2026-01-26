@@ -72,6 +72,8 @@ python3 ops/deploy_payments_backend_ssh.py \
   --expect-openapi-path /health
 ```
 
+Create `ops/inventory.json` locally (copy `ops/inventory.example.json`) and keep it private (it contains hostnames/IPs).
+
 Clean-state reset (destructive; archives the old `data/` under `backups/<timestamp>/data` on the host):
 
 ```bash
