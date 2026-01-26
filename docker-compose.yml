@@ -43,8 +43,8 @@ services:
       - payments-backend
     volumes:
       - /var/lib/docker/containers:/var/lib/docker/containers:ro
-      - ${PAYMENTS_DATA_DIR:-./data}:/var/embody/data:ro
-      - ${PAYMENTS_DATA_DIR:-./data}/audit:/var/embody/audit:ro
+      - ${PAYMENTS_DATA_DIR:-./data}:/var/livepeer-ops/data:ro
+      - ${PAYMENTS_DATA_DIR:-./data}/audit:/var/livepeer-ops/audit:ro
       - ./ops/fluent-bit.conf:/fluent-bit/etc/fluent-bit.conf:ro
     command: ["fluent-bit", "-c", "/fluent-bit/etc/fluent-bit.conf"]
     logging:

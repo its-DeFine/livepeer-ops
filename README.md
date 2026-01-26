@@ -1,4 +1,4 @@
-# Embody Payments Backend
+# Livepeer Ops Backend
 
 FastAPI service that tracks orchestrator registrations, balances, and workload credits.
 
@@ -129,13 +129,13 @@ This backend can act as a minimal “license/key + lease” service for containe
 1. Register an image secret (used to decrypt the payload) and an artifact location (so Payments can presign per lease):
 
 ```bash
-IMAGE_REF="ghcr.io/its-define/unreal_vtuber/embody-ue-ps:enc-v1"
-ARTIFACT_S3_URI="s3://<bucket>/<path>/embody-ue-ps.tar.zst.age"
+IMAGE_REF="ghcr.io/<org>/<package>:enc-v1"
+ARTIFACT_S3_URI="s3://<bucket>/<path>/ue-ps.tar.zst.age"
 
 # secret_b64 is expected to be base64(age-identity-file-bytes)
 SECRET_B64="$(python3 - <<'PY'
 import base64, pathlib
-print(base64.b64encode(pathlib.Path("embody-ue-ps-enc-v1.agekey").read_bytes()).decode("ascii"))
+print(base64.b64encode(pathlib.Path("ue-ps-enc-v1.agekey").read_bytes()).decode("ascii"))
 PY
 )"
 
@@ -207,7 +207,7 @@ Edges can report “session connected / heartbeat / disconnected” events to th
 For non-interactive content generation, prefer creating **time-based** workloads so the ledger is fully auditable (no opaque backfills).
 
 - Configure the rate:
-  - `PAYMENTS_WORKLOAD_TIME_CREDIT_ETH_PER_MINUTE=0.000005353596` (default aligns with `Embody-Inc/cost-model.md`)
+  - `PAYMENTS_WORKLOAD_TIME_CREDIT_ETH_PER_MINUTE=0.000005353596` (example default; tune for your economics)
 - Create a workload and credit the ledger immediately (admin token):
 
 ```bash

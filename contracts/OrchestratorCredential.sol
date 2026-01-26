@@ -9,8 +9,8 @@ interface IBondingManager {
 }
 
 contract OrchestratorCredential {
-    string public constant name = "Embody Orchestrator Credential";
-    string public constant symbol = "EOC";
+    string public constant name = "Livepeer Orchestrator Credential";
+    string public constant symbol = "LPOC";
 
     address public owner;
     address public registry;

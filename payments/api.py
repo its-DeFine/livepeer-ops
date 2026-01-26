@@ -883,7 +883,7 @@ class LicenseInviteRedeemResponse(BaseModel):
     image_ref: str
     token_id: str
     token: str
-    # Optional: allow Embody-managed orchestrators to auto-configure edge rotation
+    # Optional: allow operator-managed orchestrators to auto-configure edge rotation
     # during onboarding (so they don't need to edit .env).
     edge_config_url: Optional[str] = None
     edge_config_token: Optional[str] = None
@@ -1020,7 +1020,7 @@ def create_app(
     signer: Optional[Signer] = None,
     tee_core: Optional[TeeCoreClient] = None,
 ) -> FastAPI:
-    app = FastAPI(title="Embody Payments", version="1.0.0")
+    app = FastAPI(title="Livepeer Ops Backend", version="1.0.0")
     logger = logging.getLogger(__name__)
 
     data_dir = Path(getattr(settings, "workloads_path", Path("/app/data/workloads.json"))).parent
