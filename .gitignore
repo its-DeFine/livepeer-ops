@@ -1,6 +1,7 @@
 # Env & secrets
 .env
 *.env
+.env.minio.local
 
 # Virtual environments & deps cache
 .venv/
@@ -9,6 +10,7 @@ __pycache__/
 
 # Runtime data
 /data/
+/minio-data/
 /logs/
 *.sqlite
 

@@ -365,9 +365,17 @@ class PaymentSettings(BaseSettings):
         default=None,
         validation_alias="PAYMENTS_LICENSE_ARTIFACT_REGION",
     )
+    license_artifact_s3_endpoint_url: Optional[str] = Field(
+        default=None,
+        validation_alias="PAYMENTS_LICENSE_ARTIFACT_S3_ENDPOINT_URL",
+    )
     license_artifact_presign_seconds: int = Field(
         default=900,
         validation_alias="PAYMENTS_LICENSE_ARTIFACT_PRESIGN_SECONDS",
+    )
+    s3_force_path_style: bool = Field(
+        default=False,
+        validation_alias="PAYMENTS_S3_FORCE_PATH_STYLE",
     )
     recordings_bucket: Optional[str] = Field(
         default=None,
@@ -380,6 +388,10 @@ class PaymentSettings(BaseSettings):
     recordings_region: Optional[str] = Field(
         default=None,
         validation_alias="PAYMENTS_RECORDINGS_REGION",
+    )
+    recordings_s3_endpoint_url: Optional[str] = Field(
+        default=None,
+        validation_alias="PAYMENTS_RECORDINGS_S3_ENDPOINT_URL",
     )
     recordings_presign_seconds: int = Field(
         default=3600,

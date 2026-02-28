@@ -213,7 +213,12 @@ curl -sS -X POST \
 
 The lease response includes:
 - `secret_b64` (age identity bytes, base64)
-- `artifact_url` (fresh presigned URL per lease when `artifact_s3_uri` is configured and Payments has AWS creds/region)
+- `artifact_url` (fresh presigned URL per lease when `artifact_s3_uri` is configured and Payments has S3 credentials/region)
+
+S3 compatibility notes:
+- `PAYMENTS_LICENSE_ARTIFACT_REGION`: region used for artifact presign client.
+- `PAYMENTS_LICENSE_ARTIFACT_S3_ENDPOINT_URL` (optional): custom S3 endpoint (for example MinIO).
+- `PAYMENTS_S3_FORCE_PATH_STYLE=true` (optional): recommended for MinIO/local endpoints.
 
 Then periodically renew:
 
@@ -267,10 +272,28 @@ For API-driven recording workloads (runner → recorder → upload), configure a
   - `PAYMENTS_RECORDINGS_BUCKET=<bucket>`
   - `PAYMENTS_RECORDINGS_PREFIX=recordings` (default)
   - `PAYMENTS_RECORDINGS_REGION=<optional>`
+  - `PAYMENTS_RECORDINGS_S3_ENDPOINT_URL=<optional custom endpoint>`
+  - `PAYMENTS_S3_FORCE_PATH_STYLE=<optional; recommended for MinIO>`
   - `PAYMENTS_RECORDINGS_PRESIGN_SECONDS=3600` (default)
 - Start a job (admin token): `POST /api/jobs/record`
 - Get status (viewer/admin token): `GET /api/jobs/{job_id}`
 - Get a fresh download URL (viewer/admin token): `GET /api/recordings/presign?s3_uri=s3://...`
+
+## Local object storage (MinIO) for full local migration
+
+To run Payments fully local (no AWS S3 dependency for licensing artifacts), use the bundled `payments-minio` service:
+
+- `docker compose up -d payments-minio payments-backend`
+- Configure Payments:
+  - `PAYMENTS_LICENSE_ARTIFACT_S3_ENDPOINT_URL=http://payments-minio:9000` (or reachable host/IP endpoint)
+  - `PAYMENTS_S3_FORCE_PATH_STYLE=true`
+  - Set credentials via:
+    - `PAYMENTS_MINIO_ROOT_USER`
+    - `PAYMENTS_MINIO_ROOT_PASSWORD`
+  - Keep `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` aligned to the MinIO credentials used by the backend process.
+
+MinIO console:
+- `http://<host>:9001`
 
 ## Autosleep (optional)
 

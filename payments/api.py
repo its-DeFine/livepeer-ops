@@ -21,6 +21,11 @@ try:
 except Exception:  # pragma: no cover
     boto3 = None  # type: ignore
 
+try:
+    from botocore.config import Config as BotoConfig  # type: ignore
+except Exception:  # pragma: no cover
+    BotoConfig = None  # type: ignore
+
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
 import httpx
@@ -1088,12 +1093,19 @@ def create_app(
     )
     license_lease_seconds = int(getattr(settings, "license_lease_seconds", 900))
     license_artifact_region = getattr(settings, "license_artifact_region", None)
+    license_artifact_s3_endpoint_url = (
+        getattr(settings, "license_artifact_s3_endpoint_url", None) or ""
+    ).strip() or None
     license_artifact_presign_seconds = int(
         getattr(settings, "license_artifact_presign_seconds", license_lease_seconds)
     )
     recordings_bucket = (getattr(settings, "recordings_bucket", None) or "").strip() or None
     recordings_prefix = (getattr(settings, "recordings_prefix", "recordings") or "recordings").strip().strip("/")
     recordings_region = getattr(settings, "recordings_region", None)
+    recordings_s3_endpoint_url = (
+        getattr(settings, "recordings_s3_endpoint_url", None) or ""
+    ).strip() or None
+    s3_force_path_style = bool(getattr(settings, "s3_force_path_style", False))
     recordings_presign_seconds = int(getattr(settings, "recordings_presign_seconds", 3600) or 3600)
     autosleep_enabled = bool(getattr(settings, "autosleep_enabled", False))
     autosleep_idle_seconds = int(getattr(settings, "autosleep_idle_seconds", 600) or 600)
@@ -1230,6 +1242,16 @@ def create_app(
             return last_seen_ip
         return None
 
+    def _s3_client(*, region_name: Optional[str], endpoint_url: Optional[str]) -> Any:
+        client_kwargs: Dict[str, Any] = {}
+        if region_name:
+            client_kwargs["region_name"] = region_name
+        if endpoint_url:
+            client_kwargs["endpoint_url"] = endpoint_url
+        if s3_force_path_style and BotoConfig is not None:
+            client_kwargs["config"] = BotoConfig(s3={"addressing_style": "path"})
+        return boto3.client("s3", **client_kwargs)
+
     def presign_artifact_url(image_ref: str, image: Dict[str, Any]) -> Optional[str]:
         artifact_s3_uri = image.get("artifact_s3_uri")
         if not artifact_s3_uri:
@@ -1243,7 +1265,10 @@ def create_app(
             logging.getLogger(__name__).warning("invalid artifact_s3_uri for %s: %s", image_ref, artifact_s3_uri)
             return None
         try:
-            client = boto3.client("s3", region_name=license_artifact_region)
+            client = _s3_client(
+                region_name=license_artifact_region,
+                endpoint_url=license_artifact_s3_endpoint_url,
+            )
             return client.generate_presigned_url(
                 "get_object",
                 Params={"Bucket": bucket, "Key": key},
@@ -1258,7 +1283,10 @@ def create_app(
             logging.getLogger(__name__).warning("boto3 unavailable; cannot presign recordings upload")
             return None
         try:
-            client = boto3.client("s3", region_name=recordings_region)
+            client = _s3_client(
+                region_name=recordings_region,
+                endpoint_url=recordings_s3_endpoint_url,
+            )
             return client.generate_presigned_url(
                 "put_object",
                 Params={"Bucket": bucket, "Key": key},
@@ -1277,7 +1305,10 @@ def create_app(
         except ValueError:
             return None
         try:
-            client = boto3.client("s3", region_name=recordings_region)
+            client = _s3_client(
+                region_name=recordings_region,
+                endpoint_url=recordings_s3_endpoint_url,
+            )
             return client.generate_presigned_url(
                 "get_object",
                 Params={"Bucket": bucket, "Key": key},
