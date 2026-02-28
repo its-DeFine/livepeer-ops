@@ -238,7 +238,14 @@ async def test_license_invite_redeem_mints_token_and_grants_access(temp_paths):
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         orchestrator_id = "orch-invite"
+        orchestrator_owner = "0x1234567890abcdef1234567890abcdef12345678"
         address = "0xCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+        with patch.object(Registry, "_resolve_top_set", return_value={orchestrator_owner.lower()}):
+            registry.register(
+                orchestrator_id=orchestrator_id,
+                address=orchestrator_owner,
+                metadata={"host_public_ip": "44.228.103.176"},
+            )
 
         # Admin: register image secret (required to create invites)
         image = await client.put(
@@ -263,23 +270,27 @@ async def test_license_invite_redeem_mints_token_and_grants_access(temp_paths):
         bad_address = "0xDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD"
         wrong_wallet = await client.post(
             "/api/licenses/invites/redeem",
-            json={"code": code, "orchestrator_id": orchestrator_id, "address": bad_address},
+            json={"code": code, "address": bad_address},
         )
         assert wrong_wallet.status_code == 403
 
         # Orchestrator: redeem invite -> token
         redeemed = await client.post(
             "/api/licenses/invites/redeem",
-            json={"code": code, "orchestrator_id": orchestrator_id, "address": address},
+            json={"code": code, "address": address},
         )
         assert redeemed.status_code == 200
         redeemed_body = redeemed.json()
         token = redeemed_body["token"]
         assert token
+        assert redeemed_body["orchestrator_id"] == orchestrator_id
         assert redeemed_body["token_id"]
         assert redeemed_body["image_ref"] == image_ref
+        assert redeemed_body["expires_at"]
         assert redeemed_body["edge_config_url"] == "https://example.com/orchestrator-edge"
         assert redeemed_body["edge_config_token"] == "edge-config-read-token"
+        expires_seconds = (parse_iso8601(redeemed_body["expires_at"]) - datetime.now(timezone.utc)).total_seconds()
+        assert 1 <= expires_seconds <= 40
 
         # Orchestrator: lease now works (invite redeem granted access)
         lease = await client.post(
@@ -295,14 +306,14 @@ async def test_license_invite_redeem_mints_token_and_grants_access(temp_paths):
         # Redeeming the same code again is rejected
         redeemed_again = await client.post(
             "/api/licenses/invites/redeem",
-            json={"code": code, "orchestrator_id": orchestrator_id, "address": address},
+            json={"code": code, "address": address},
         )
         assert redeemed_again.status_code == 409
 
         # Unknown code => 404
         missing = await client.post(
             "/api/licenses/invites/redeem",
-            json={"code": "NOT-A-REAL-CODE", "orchestrator_id": "x", "address": address},
+            json={"code": "NOT-A-REAL-CODE", "address": address},
         )
         assert missing.status_code == 404
 
@@ -316,9 +327,87 @@ async def test_license_invite_redeem_mints_token_and_grants_access(temp_paths):
         expired_code = expired.json()["code"]
         expired_redeem = await client.post(
             "/api/licenses/invites/redeem",
-            json={"code": expired_code, "orchestrator_id": "orch-expired", "address": address},
+            json={"code": expired_code, "address": address},
         )
         assert expired_redeem.status_code == 410
+
+
+@pytest.mark.anyio("asyncio")
+async def test_license_invite_redeem_auto_allocates_nearest_available(temp_paths):
+    registry, ledger = build_registry(temp_paths)
+    app_settings = build_settings(
+        temp_paths,
+        license_lease_seconds=24 * 60 * 60,
+        trusted_proxy_cidrs=["127.0.0.1/32"],
+        ip_geo_overrides={
+            "203.0.113.10": {"lat": 37.7749, "lon": -122.4194},
+            "44.228.103.176": {"lat": 37.7749, "lon": -122.4194},
+            "141.95.18.28": {"lat": 48.8566, "lon": 2.3522},
+        },
+    )
+    app = create_app(registry, ledger, app_settings)
+
+    owner_west = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    owner_eu = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    with patch.object(Registry, "_resolve_top_set", return_value={owner_west, owner_eu}):
+        registry.register(
+            orchestrator_id="orch-west",
+            address=owner_west,
+            metadata={"host_public_ip": "44.228.103.176"},
+        )
+        registry.register(
+            orchestrator_id="orch-eu",
+            address=owner_eu,
+            metadata={"host_public_ip": "141.95.18.28"},
+        )
+
+    image_ref = "ghcr.io/its-define/unreal_vtuber/ue-ps:enc-v1"
+    user_one = "0x1111111111111111111111111111111111111111"
+    user_two = "0x2222222222222222222222222222222222222222"
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        image = await client.put(
+            "/api/licenses/images",
+            json={"image_ref": image_ref},
+            headers={"X-Admin-Token": "secret"},
+        )
+        assert image.status_code == 200
+
+        invite_one = await client.post(
+            "/api/licenses/invites",
+            json={"image_ref": image_ref, "bound_address": user_one, "ttl_seconds": 3600},
+            headers={"X-Admin-Token": "secret"},
+        )
+        assert invite_one.status_code == 200
+
+        redeem_one = await client.post(
+            "/api/licenses/invites/redeem",
+            json={"code": invite_one.json()["code"], "address": user_one},
+            headers={"X-Forwarded-For": "203.0.113.10"},
+        )
+        assert redeem_one.status_code == 200
+        body_one = redeem_one.json()
+        assert body_one["orchestrator_id"] == "orch-west"
+        assert body_one["expires_at"]
+        expires_seconds = (parse_iso8601(body_one["expires_at"]) - datetime.now(timezone.utc)).total_seconds()
+        assert (24 * 60 * 60) - 30 <= expires_seconds <= (24 * 60 * 60) + 30
+
+        invite_two = await client.post(
+            "/api/licenses/invites",
+            json={"image_ref": image_ref, "bound_address": user_two, "ttl_seconds": 3600},
+            headers={"X-Admin-Token": "secret"},
+        )
+        assert invite_two.status_code == 200
+
+        redeem_two = await client.post(
+            "/api/licenses/invites/redeem",
+            json={"code": invite_two.json()["code"], "address": user_two},
+            headers={"X-Forwarded-For": "203.0.113.10"},
+        )
+        assert redeem_two.status_code == 200
+        body_two = redeem_two.json()
+        assert body_two["orchestrator_id"] == "orch-eu"
 
 
 @pytest.mark.anyio("asyncio")

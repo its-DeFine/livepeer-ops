@@ -6,6 +6,7 @@ import base64
 import ipaddress
 import json
 import logging
+import math
 import re
 import threading
 import time
@@ -14,7 +15,7 @@ from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Deque, Dict, List, Literal, Optional
+from typing import Any, Deque, Dict, List, Literal, Optional, Tuple
 
 try:
     import boto3  # type: ignore
@@ -665,6 +666,7 @@ class WorkloadUpdatePayload(BaseModel):
 class LicenseTokenCreateResponse(BaseModel):
     token_id: str
     token: str
+    expires_at: Optional[str] = None
 
 
 class OrchestratorCredentialNonceResponse(BaseModel):
@@ -865,7 +867,7 @@ class LicenseInviteRevokePayload(BaseModel):
 
 class LicenseInviteRedeemPayload(BaseModel):
     code: str = Field(min_length=4, max_length=128)
-    orchestrator_id: str = Field(min_length=1, max_length=128)
+    orchestrator_id: Optional[str] = Field(default=None, min_length=1, max_length=128)
     address: str = Field(pattern=r"^0x[a-fA-F0-9]{40}$")
     capability: Optional[str] = Field(default=None, max_length=128)
     contact_email: Optional[str] = Field(default=None, max_length=255)
@@ -888,6 +890,7 @@ class LicenseInviteRedeemResponse(BaseModel):
     image_ref: str
     token_id: str
     token: str
+    expires_at: Optional[str] = None
     # Optional: allow operator-managed orchestrators to auto-configure edge rotation
     # during onboarding (so they don't need to edit .env).
     edge_config_url: Optional[str] = None
@@ -1091,7 +1094,7 @@ def create_app(
     license_invites = InviteCodeStore(
         Path(getattr(settings, "license_invites_path", data_dir / "license_invites.json"))
     )
-    license_lease_seconds = int(getattr(settings, "license_lease_seconds", 900))
+    license_lease_seconds = int(getattr(settings, "license_lease_seconds", 24 * 60 * 60))
     license_artifact_region = getattr(settings, "license_artifact_region", None)
     license_artifact_s3_endpoint_url = (
         getattr(settings, "license_artifact_s3_endpoint_url", None) or ""
@@ -1685,6 +1688,213 @@ def create_app(
             return EdgeConfigResponse.model_validate(record)
         except Exception as exc:
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc))
+
+    geo_lookup_timeout_seconds = float(getattr(settings, "geo_lookup_timeout_seconds", 1.5) or 1.5)
+    raw_ip_geo_overrides = getattr(settings, "ip_geo_overrides", None)
+    ip_geo_overrides = raw_ip_geo_overrides if isinstance(raw_ip_geo_overrides, dict) else {}
+    geo_cache: Dict[str, Optional[Tuple[float, float]]] = {}
+    geo_cache_lock = threading.Lock()
+
+    def _parse_coordinates(value: Any) -> Optional[Tuple[float, float]]:
+        lat_raw: Any = None
+        lon_raw: Any = None
+        if isinstance(value, dict):
+            lat_raw = value.get("lat")
+            if lat_raw is None:
+                lat_raw = value.get("latitude")
+            lon_raw = value.get("lon")
+            if lon_raw is None:
+                lon_raw = value.get("longitude")
+        elif isinstance(value, (list, tuple)) and len(value) >= 2:
+            lat_raw = value[0]
+            lon_raw = value[1]
+        elif isinstance(value, str):
+            parts = [segment.strip() for segment in value.split(",", 1)]
+            if len(parts) == 2:
+                lat_raw, lon_raw = parts[0], parts[1]
+        if lat_raw is None or lon_raw is None:
+            return None
+        try:
+            lat = float(lat_raw)
+            lon = float(lon_raw)
+        except (TypeError, ValueError):
+            return None
+        if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+            return None
+        return (lat, lon)
+
+    def _public_ip_or_none(value: Optional[str]) -> Optional[str]:
+        if not value:
+            return None
+        try:
+            candidate = ipaddress.ip_address(value)
+        except ValueError:
+            return None
+        if (
+            candidate.is_loopback
+            or candidate.is_private
+            or candidate.is_link_local
+            or candidate.is_multicast
+            or candidate.is_reserved
+            or candidate.is_unspecified
+        ):
+            return None
+        return str(candidate)
+
+    def _host_from_url(value: Any) -> Optional[str]:
+        if not isinstance(value, str) or not value:
+            return None
+        try:
+            from urllib.parse import urlparse
+
+            return urlparse(value).hostname
+        except Exception:
+            return None
+
+    async def _lookup_ip_coordinates(ip_value: Optional[str]) -> Optional[Tuple[float, float]]:
+        normalized = normalize_ip(ip_value)
+        if not normalized:
+            return None
+
+        override = _parse_coordinates(ip_geo_overrides.get(normalized))
+        if override is not None:
+            with geo_cache_lock:
+                geo_cache[normalized] = override
+            return override
+
+        ip = _public_ip_or_none(normalized)
+        if not ip:
+            return None
+
+        with geo_cache_lock:
+            if ip in geo_cache:
+                return geo_cache[ip]
+
+        timeout = httpx.Timeout(max(0.2, geo_lookup_timeout_seconds), connect=min(max(0.2, geo_lookup_timeout_seconds), 1.0))
+        providers = (
+            f"https://ipwho.is/{ip}",
+            f"https://ipapi.co/{ip}/json/",
+        )
+        resolved: Optional[Tuple[float, float]] = None
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            for url in providers:
+                try:
+                    response = await client.get(url, headers={"Accept": "application/json"})
+                    if response.status_code != 200:
+                        continue
+                    payload = response.json()
+                except Exception:
+                    continue
+                if not isinstance(payload, dict):
+                    continue
+                coords = _parse_coordinates(payload)
+                if coords is None:
+                    continue
+                resolved = coords
+                break
+
+        with geo_cache_lock:
+            geo_cache[ip] = resolved
+        return resolved
+
+    def _haversine_km(start: Tuple[float, float], end: Tuple[float, float]) -> float:
+        lat1, lon1 = start
+        lat2, lon2 = end
+        lat1_r = math.radians(lat1)
+        lat2_r = math.radians(lat2)
+        d_lat = math.radians(lat2 - lat1)
+        d_lon = math.radians(lon2 - lon1)
+        value = math.sin(d_lat / 2) ** 2 + math.cos(lat1_r) * math.cos(lat2_r) * math.sin(d_lon / 2) ** 2
+        return 6371.0 * (2 * math.atan2(math.sqrt(value), math.sqrt(max(0.0, 1.0 - value))))
+
+    def _has_active_timed_license_token(orchestrator_id: str) -> bool:
+        now = datetime.now(timezone.utc)
+        for token in license_tokens.list_for_orchestrator(orchestrator_id):
+            if not isinstance(token, dict):
+                continue
+            if token.get("revoked_at"):
+                continue
+            expires_at = token.get("expires_at")
+            if not isinstance(expires_at, str) or not expires_at:
+                continue
+            try:
+                if parse_license_iso8601(expires_at) > now:
+                    return True
+            except Exception:
+                continue
+        return False
+
+    async def _select_invite_orchestrator(
+        request: Request,
+        *,
+        preferred_orchestrator_id: Optional[str] = None,
+    ) -> str:
+        now = datetime.now(timezone.utc)
+        all_records = registry.all_records()
+        if preferred_orchestrator_id:
+            candidate_ids = [preferred_orchestrator_id]
+        else:
+            candidate_ids = sorted(all_records.keys())
+
+        candidates: List[Dict[str, Any]] = []
+        for orchestrator_id in candidate_ids:
+            record = all_records.get(orchestrator_id)
+            if not isinstance(record, dict):
+                continue
+            snapshot = _build_orchestrator_record(orchestrator_id, record, now=now)
+            if snapshot.denylisted or snapshot.cooldown_active or not snapshot.eligible_for_payments:
+                continue
+            if snapshot.in_use:
+                continue
+            if _has_active_timed_license_token(orchestrator_id):
+                continue
+
+            host = _orchestrator_public_host(orchestrator_id)
+            if not host:
+                host = _host_from_url(record.get("health_url"))
+            coords = await _lookup_ip_coordinates(host)
+
+            has_edge_assignment = True
+            try:
+                _edge_assignment_for(orchestrator_id)
+            except HTTPException:
+                has_edge_assignment = False
+
+            candidates.append(
+                {
+                    "orchestrator_id": orchestrator_id,
+                    "snapshot": snapshot,
+                    "coords": coords,
+                    "has_edge_assignment": has_edge_assignment,
+                }
+            )
+
+        if not candidates:
+            if preferred_orchestrator_id and registry.get_record(preferred_orchestrator_id) is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Orchestrator not found")
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="No orchestrator currently available")
+
+        client_coords = await _lookup_ip_coordinates(request_ip(request))
+
+        def rank(candidate: Dict[str, Any]) -> Tuple[int, float, int, int, str]:
+            snapshot = candidate["snapshot"]
+            orchestrator_id = str(candidate["orchestrator_id"])
+            coords = candidate.get("coords")
+            distance = float("inf")
+            has_distance = 1
+            if (
+                client_coords is not None
+                and isinstance(coords, tuple)
+                and len(coords) == 2
+            ):
+                distance = _haversine_km(client_coords, coords)
+                has_distance = 0
+            edge_rank = 0 if bool(candidate.get("has_edge_assignment")) else 1
+            active_rank = 0 if bool(snapshot.active) else 1
+            return (has_distance, distance, edge_rank, active_rank, orchestrator_id)
+
+        selected = min(candidates, key=rank)
+        return str(selected["orchestrator_id"])
 
     def parse_iso8601(value: Optional[str]) -> Optional[datetime]:
         if value is None:
@@ -4423,6 +4633,7 @@ def create_app(
         return {"ok": True}
 
     invite_redeem_limiter = RateLimiter(max_calls=30, window_seconds=60)
+    invite_allocation_lock = asyncio.Lock()
 
     @app.post("/api/licenses/invites/redeem", response_model=LicenseInviteRedeemResponse)
     async def redeem_license_invite(payload: LicenseInviteRedeemPayload, request: Request) -> LicenseInviteRedeemResponse:
@@ -4469,6 +4680,9 @@ def create_app(
                 detail="Wallet address does not match this invite code",
             )
 
+        requested_orchestrator_id = (payload.orchestrator_id or "").strip() or None
+        selected_orchestrator_id = ""
+
         try:
             image = license_images.get(image_ref)
             if image is None:
@@ -4476,29 +4690,44 @@ def create_app(
             if image.get("revoked_at"):
                 raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Image access revoked")
 
-            metadata = {
-                "capability": payload.capability,
-                "contact_email": payload.contact_email,
-                "request_ip": request_ip(request),
-                # Invite codes are admin-issued; treat as authorized for payouts.
-                "is_top_100": True,
-            }
-            registry.register(
-                orchestrator_id=payload.orchestrator_id,
-                address=payload.address,
-                metadata=metadata,
-                skip_rank_validation=True,
-            )
+            async with invite_allocation_lock:
+                if requested_orchestrator_id and registry.get_record(requested_orchestrator_id) is None:
+                    metadata = {
+                        "capability": payload.capability,
+                        "contact_email": payload.contact_email,
+                        "request_ip": request_ip(request),
+                        # Invite codes are admin-issued; treat as authorized for payouts.
+                        "is_top_100": True,
+                    }
+                    registry.register(
+                        orchestrator_id=requested_orchestrator_id,
+                        address=payload.address,
+                        metadata=metadata,
+                        skip_rank_validation=True,
+                    )
 
-            license_access.grant(payload.orchestrator_id, image_ref)
-            minted = license_tokens.mint(payload.orchestrator_id, rotate=True)
-            license_invites.commit(
-                invite_id=invite_id,
-                orchestrator_id=payload.orchestrator_id,
-                token_id=minted["token_id"],
-                address=payload.address,
-                client_ip=request_ip(request),
-            )
+                selected_orchestrator_id = await _select_invite_orchestrator(
+                    request,
+                    preferred_orchestrator_id=requested_orchestrator_id,
+                )
+                registry.record_contact(
+                    selected_orchestrator_id,
+                    source="invite_redeem",
+                    ip=request_ip(request),
+                )
+                license_access.grant(selected_orchestrator_id, image_ref)
+                minted = license_tokens.mint(
+                    selected_orchestrator_id,
+                    ttl_seconds=license_lease_seconds,
+                    rotate=True,
+                )
+                license_invites.commit(
+                    invite_id=invite_id,
+                    orchestrator_id=selected_orchestrator_id,
+                    token_id=minted["token_id"],
+                    address=payload.address,
+                    client_ip=request_ip(request),
+                )
         except Exception:
             license_invites.release(invite_id)
             raise
@@ -4507,7 +4736,7 @@ def create_app(
             "invite_redeemed",
             {
                 "invite_id": invite_id,
-                "orchestrator_id": payload.orchestrator_id,
+                "orchestrator_id": selected_orchestrator_id,
                 "image_ref": image_ref,
                 "token_id": minted.get("token_id"),
                 "request_ip": request_ip(request),
@@ -4516,10 +4745,11 @@ def create_app(
         edge_config_url = getattr(settings, "edge_config_url", None)
         edge_config_token = getattr(settings, "edge_config_token", None)
         return LicenseInviteRedeemResponse(
-            orchestrator_id=payload.orchestrator_id,
+            orchestrator_id=selected_orchestrator_id,
             image_ref=image_ref,
             token_id=minted["token_id"],
             token=minted["token"],
+            expires_at=minted.get("expires_at"),
             edge_config_url=edge_config_url,
             edge_config_token=edge_config_token,
         )
