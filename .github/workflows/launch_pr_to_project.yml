@@ -23,8 +23,8 @@ jobs:
           set -euo pipefail
 
           if [[ -z "${GH_TOKEN}" ]]; then
-            echo "Missing required secret LAUNCH_FACTORY_GH_TOKEN; cannot add PRs to Launch project." >&2
-            exit 1
+            echo "Skipping Launch project update: missing LAUNCH_FACTORY_GH_TOKEN"
+            exit 0
           fi
 
           ACTION="${{ github.event.action }}"
@@ -59,4 +59,3 @@ jobs:
             --single-select-option-id "${OPTION_ID}"
 
           echo "Set Status=${STATUS_NAME}."
-
