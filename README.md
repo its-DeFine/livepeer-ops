@@ -16,6 +16,7 @@ This repo is a self-hosted ops backend for Livepeer participants. It can be used
 ## Architecture (at a glance)
 
 - Clients (edges/watchers) post usage events → the backend credits a local ledger.
+
 - A payment loop settles balances on-chain (or via TicketBroker) when configured.
 - Optional: TEE signer/core can attest to key custody and/or payout logic; witnesses can publish checkpoints on-chain.
   Optional: orchestrator fleet ops uses `/power` + `/ops/*` endpoints exposed by the orchestrator host.
