@@ -358,7 +358,7 @@ class PaymentSettings(BaseSettings):
         validation_alias="PAYMENTS_LICENSE_INVITES_PATH",
     )
     license_lease_seconds: int = Field(
-        default=900,
+        default=24 * 60 * 60,
         validation_alias="PAYMENTS_LICENSE_LEASE_SECONDS",
     )
     license_artifact_region: Optional[str] = Field(
