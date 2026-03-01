@@ -37,7 +37,7 @@ def build_settings(tmp_path: Path, **overrides):
         registration_rate_limit_per_minute=5,
         registration_rate_limit_burst=5,
         api_admin_token=None,
-        manager_ip_allowlist=[],
+        manager_ip_allowlist=["127.0.0.1"],
         viewer_tokens=[],
         workloads_path=tmp_path / "workloads.json",
         jobs_path=tmp_path / "jobs.json",
@@ -114,6 +114,24 @@ def test_admin_orchestrator_rollout_requires_token():
 
     resp = client.post("/api/orchestrators/ops/rollout", json={"orchestrator_id": "orch-1", "image_ref": "enc-v1"})
     assert resp.status_code == 401
+    tmp.cleanup()
+
+
+def test_admin_orchestrator_rollout_requires_manager_allowlist():
+    tmp = tempfile.TemporaryDirectory()
+    tmp_path = Path(tmp.name)
+    registry, ledger = build_registry(tmp_path)
+    app_settings = build_settings(tmp_path, api_admin_token="secret", manager_ip_allowlist=[])
+    app = create_app(registry, ledger, app_settings)
+    client = TestClient(app)
+
+    resp = client.post(
+        "/api/orchestrators/ops/rollout",
+        headers={"X-Admin-Token": "secret"},
+        json={"orchestrator_id": "orch-1", "image_ref": "enc-v1"},
+    )
+    assert resp.status_code == 503
+    assert "allowlist" in (resp.json().get("detail") or "").lower()
     tmp.cleanup()
 
 
