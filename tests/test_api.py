@@ -1419,3 +1419,467 @@ async def test_tee_attestation_returns_base64_document(temp_paths):
         assert payload["address"] == StubSigner.address
         assert payload["nonce_hex"] == "0x01"
         assert base64.b64decode(payload["document_b64"]) == b"hello"
+
+
+@pytest.mark.anyio("asyncio")
+async def test_client_session_start_picks_nearest_allowed_orchestrator(temp_paths):
+    balances_path, registry_path = temp_paths
+    edge_assignments_path = balances_path.parent / "edge_assignments.json"
+    edge_assignments_path.write_text(
+        json.dumps(
+            {
+                "orch-near": {
+                    "edge_id": "edge-near",
+                    "matchmaker_host": "edge-near.example.com",
+                    "matchmaker_port": 443,
+                    "edge_cidrs": ["10.0.0.0/24"],
+                },
+                "orch-far": {
+                    "edge_id": "edge-far",
+                    "matchmaker_host": "edge-far.example.com",
+                    "matchmaker_port": 443,
+                    "edge_cidrs": ["10.0.1.0/24"],
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    registry, ledger = build_registry(temp_paths)
+    near_address = "0x" + "1" * 40
+    far_address = "0x" + "2" * 40
+    with patch.object(Registry, "_resolve_top_set", return_value={near_address.lower(), far_address.lower()}):
+        registry.register(
+            orchestrator_id="orch-near",
+            address=near_address,
+            metadata={"host_public_ip": "8.8.8.8"},
+        )
+        registry.register(
+            orchestrator_id="orch-far",
+            address=far_address,
+            metadata={"host_public_ip": "1.1.1.1"},
+        )
+
+    settings = build_settings(
+        temp_paths,
+        edge_assignments_path=edge_assignments_path,
+        client_session_allowed_orchestrators=["orch-near", "orch-far"],
+        client_session_seconds=86400,
+        ip_geo_overrides={
+            "198.51.100.50": {"lat": 0.0, "lon": 0.0},
+            "8.8.8.8": {"lat": 0.2, "lon": 0.2},
+            "1.1.1.1": {"lat": 22.0, "lon": 22.0},
+        },
+    )
+    app = create_app(registry, ledger, settings)
+    transport = httpx.ASGITransport(app=app, client=("198.51.100.50", 12345))
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        start = await client.post("/api/sessions/start", json={})
+        assert start.status_code == 200
+        body = start.json()
+        assert body["orchestrator_id"] == "orch-near"
+        assert body["token"]
+        assert body["control_url"].endswith("/api/sessions/tcp")
+
+        me = await client.get(
+            "/api/sessions/me",
+            headers={"Authorization": f"Bearer {body['token']}"},
+        )
+        assert me.status_code == 200
+        assert me.json()["orchestrator_id"] == "orch-near"
+
+    other_ip_transport = httpx.ASGITransport(app=app, client=("198.51.100.99", 321))
+    async with httpx.AsyncClient(transport=other_ip_transport, base_url="http://test") as client:
+        forbidden = await client.get(
+            "/api/sessions/me",
+            headers={"Authorization": f"Bearer {body['token']}"},
+        )
+    assert forbidden.status_code == 403
+
+
+@pytest.mark.anyio("asyncio")
+async def test_client_session_first_come_first_served(temp_paths):
+    balances_path, _ = temp_paths
+    edge_assignments_path = balances_path.parent / "edge_assignments.json"
+    edge_assignments_path.write_text(
+        json.dumps(
+            {
+                "orch-only": {
+                    "edge_id": "edge-one",
+                    "matchmaker_host": "edge-one.example.com",
+                    "matchmaker_port": 443,
+                    "edge_cidrs": ["10.0.0.0/24"],
+                }
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    registry, ledger = build_registry(temp_paths)
+    address = "0x" + "3" * 40
+    with patch.object(Registry, "_resolve_top_set", return_value={address.lower()}):
+        registry.register(
+            orchestrator_id="orch-only",
+            address=address,
+            metadata={"host_public_ip": "8.8.4.4"},
+        )
+
+    settings = build_settings(
+        temp_paths,
+        edge_assignments_path=edge_assignments_path,
+        client_session_allowed_orchestrators=["orch-only"],
+        client_session_seconds=86400,
+        ip_geo_overrides={
+            "203.0.113.10": {"lat": 1.0, "lon": 1.0},
+            "203.0.113.11": {"lat": 1.0, "lon": 1.0},
+            "8.8.4.4": {"lat": 1.0, "lon": 1.0},
+        },
+    )
+    app = create_app(registry, ledger, settings)
+
+    first_transport = httpx.ASGITransport(app=app, client=("203.0.113.10", 1000))
+    async with httpx.AsyncClient(transport=first_transport, base_url="http://test") as client:
+        first = await client.post("/api/sessions/start", json={})
+    assert first.status_code == 200
+
+    second_transport = httpx.ASGITransport(app=app, client=("203.0.113.11", 1001))
+    async with httpx.AsyncClient(transport=second_transport, base_url="http://test") as client:
+        second = await client.post("/api/sessions/start", json={})
+    assert second.status_code == 409
+    assert "available" in second.json()["detail"].lower()
+
+
+@pytest.mark.anyio("asyncio")
+async def test_client_session_reserved_orchestrator_by_ip(temp_paths):
+    balances_path, _ = temp_paths
+    edge_assignments_path = balances_path.parent / "edge_assignments.json"
+    edge_assignments_path.write_text(
+        json.dumps(
+            {
+                "orch-reserved": {
+                    "edge_id": "edge-reserved",
+                    "matchmaker_host": "edge-reserved.example.com",
+                    "matchmaker_port": 443,
+                    "edge_cidrs": ["10.10.0.0/24"],
+                },
+                "orch-open": {
+                    "edge_id": "edge-open",
+                    "matchmaker_host": "edge-open.example.com",
+                    "matchmaker_port": 443,
+                    "edge_cidrs": ["10.11.0.0/24"],
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    registry, ledger = build_registry(temp_paths)
+    reserved_address = "0x" + "4" * 40
+    open_address = "0x" + "5" * 40
+    with patch.object(Registry, "_resolve_top_set", return_value={reserved_address.lower(), open_address.lower()}):
+        registry.register(
+            orchestrator_id="orch-reserved",
+            address=reserved_address,
+            metadata={"host_public_ip": "9.9.9.9"},
+        )
+        registry.register(
+            orchestrator_id="orch-open",
+            address=open_address,
+            metadata={"host_public_ip": "8.8.8.8"},
+        )
+
+    settings = build_settings(
+        temp_paths,
+        edge_assignments_path=edge_assignments_path,
+        client_session_allowed_orchestrators=["orch-reserved", "orch-open"],
+        client_session_reserved_orchestrators={"orch-reserved": ["198.51.100.10/32"]},
+        ip_geo_overrides={
+            "198.51.100.20": {"lat": 0.0, "lon": 0.0},
+            "198.51.100.10": {"lat": 0.0, "lon": 0.0},
+            "9.9.9.9": {"lat": 0.2, "lon": 0.2},
+            "8.8.8.8": {"lat": 0.3, "lon": 0.3},
+        },
+    )
+    app = create_app(registry, ledger, settings)
+
+    non_reserved_transport = httpx.ASGITransport(app=app, client=("198.51.100.20", 1234))
+    async with httpx.AsyncClient(transport=non_reserved_transport, base_url="http://test") as client:
+        non_reserved = await client.post("/api/sessions/start", json={})
+    assert non_reserved.status_code == 200
+    assert non_reserved.json()["orchestrator_id"] == "orch-open"
+
+    reserved_transport = httpx.ASGITransport(app=app, client=("198.51.100.10", 1235))
+    async with httpx.AsyncClient(transport=reserved_transport, base_url="http://test") as client:
+        reserved = await client.post("/api/sessions/start", json={})
+    assert reserved.status_code == 200
+    assert reserved.json()["orchestrator_id"] == "orch-reserved"
+
+
+@pytest.mark.anyio("asyncio")
+async def test_client_session_tcp_command_proxy(temp_paths):
+    balances_path, _ = temp_paths
+    edge_assignments_path = balances_path.parent / "edge_assignments.json"
+    edge_assignments_path.write_text(
+        json.dumps(
+            {
+                "orch-tcp": {
+                    "edge_id": "edge-tcp",
+                    "matchmaker_host": "edge-tcp.example.com",
+                    "matchmaker_port": 443,
+                    "edge_cidrs": ["10.12.0.0/24"],
+                    "tcp_relay_url": "https://edge-tcp.example.com/api/tcp/relay",
+                }
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    registry, ledger = build_registry(temp_paths)
+    address = "0x" + "6" * 40
+    with patch.object(Registry, "_resolve_top_set", return_value={address.lower()}):
+        registry.register(
+            orchestrator_id="orch-tcp",
+            address=address,
+            metadata={"host_public_ip": "8.8.8.8"},
+        )
+
+    settings = build_settings(
+        temp_paths,
+        edge_assignments_path=edge_assignments_path,
+        client_session_allowed_orchestrators=["orch-tcp"],
+        ip_geo_overrides={
+            "198.51.100.40": {"lat": 0.0, "lon": 0.0},
+            "8.8.8.8": {"lat": 0.0, "lon": 0.0},
+        },
+    )
+    app = create_app(registry, ledger, settings)
+    transport = httpx.ASGITransport(app=app, client=("198.51.100.40", 9999))
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        start = await client.post("/api/sessions/start", json={})
+        assert start.status_code == 200
+        token = start.json()["token"]
+
+        class FakeAsyncClient:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def post(self, url, json=None):
+                assert url == "https://edge-tcp.example.com/api/tcp/relay"
+                if isinstance(json, dict):
+                    execution_id = json.get("execution_id") or json.get("session_id") or ""
+                else:
+                    execution_id = ""
+                return httpx.Response(200, json={"execution_id": execution_id, "state": "completed"})
+
+            async def get(self, url):
+                return httpx.Response(200, json={"state": "completed"})
+
+        with patch("payments.api.httpx.AsyncClient", FakeAsyncClient):
+            tcp_resp = await client.post(
+                "/api/sessions/tcp",
+                json={"command": "EMOTE_Wave"},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+    assert tcp_resp.status_code == 200
+    payload = tcp_resp.json()
+    assert payload["state"] == "completed"
+    assert payload["execution_id"]
+
+
+@pytest.mark.anyio("asyncio")
+async def test_client_session_tcp_command_requires_edge_relay_by_default(temp_paths):
+    balances_path, _ = temp_paths
+    edge_assignments_path = balances_path.parent / "edge_assignments.json"
+    edge_assignments_path.write_text(
+        json.dumps(
+            {
+                "orch-tcp": {
+                    "edge_id": "edge-tcp",
+                    "matchmaker_host": "edge-tcp.example.com",
+                    "matchmaker_port": 443,
+                    "edge_cidrs": ["10.12.0.0/24"],
+                }
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    registry, ledger = build_registry(temp_paths)
+    address = "0x" + "7" * 40
+    with patch.object(Registry, "_resolve_top_set", return_value={address.lower()}):
+        registry.register(
+            orchestrator_id="orch-tcp",
+            address=address,
+            metadata={"host_public_ip": "8.8.8.8"},
+        )
+
+    settings = build_settings(
+        temp_paths,
+        edge_assignments_path=edge_assignments_path,
+        client_session_allowed_orchestrators=["orch-tcp"],
+        ip_geo_overrides={
+            "198.51.100.41": {"lat": 0.0, "lon": 0.0},
+            "8.8.8.8": {"lat": 0.0, "lon": 0.0},
+        },
+    )
+    app = create_app(registry, ledger, settings)
+    transport = httpx.ASGITransport(app=app, client=("198.51.100.41", 9999))
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        start = await client.post("/api/sessions/start", json={})
+        assert start.status_code == 200
+        token = start.json()["token"]
+        tcp_resp = await client.post(
+            "/api/sessions/tcp",
+            json={"command": "EMOTE_Wave"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+    assert tcp_resp.status_code == 503
+    assert "Edge TCP relay not configured" in tcp_resp.json().get("detail", "")
+
+
+@pytest.mark.anyio("asyncio")
+async def test_client_session_end_does_not_release_orchestrator_until_expiry(temp_paths):
+    balances_path, _ = temp_paths
+    edge_assignments_path = balances_path.parent / "edge_assignments.json"
+    edge_assignments_path.write_text(
+        json.dumps(
+            {
+                "orch-only": {
+                    "edge_id": "edge-one",
+                    "matchmaker_host": "edge-one.example.com",
+                    "matchmaker_port": 443,
+                    "edge_cidrs": ["10.0.0.0/24"],
+                }
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    registry, ledger = build_registry(temp_paths)
+    address = "0x" + "8" * 40
+    with patch.object(Registry, "_resolve_top_set", return_value={address.lower()}):
+        registry.register(
+            orchestrator_id="orch-only",
+            address=address,
+            metadata={"host_public_ip": "8.8.4.4"},
+        )
+
+    settings = build_settings(
+        temp_paths,
+        edge_assignments_path=edge_assignments_path,
+        client_session_allowed_orchestrators=["orch-only"],
+        client_session_seconds=86400,
+        ip_geo_overrides={
+            "203.0.113.20": {"lat": 1.0, "lon": 1.0},
+            "203.0.113.21": {"lat": 1.0, "lon": 1.0},
+            "8.8.4.4": {"lat": 1.0, "lon": 1.0},
+        },
+    )
+    app = create_app(registry, ledger, settings)
+
+    first_transport = httpx.ASGITransport(app=app, client=("203.0.113.20", 1000))
+    async with httpx.AsyncClient(transport=first_transport, base_url="http://test") as client:
+        first = await client.post("/api/sessions/start", json={})
+        assert first.status_code == 200
+        token = first.json()["token"]
+        end = await client.post(
+            "/api/sessions/end",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert end.status_code == 200
+
+    second_transport = httpx.ASGITransport(app=app, client=("203.0.113.21", 1001))
+    async with httpx.AsyncClient(transport=second_transport, base_url="http://test") as client:
+        second = await client.post("/api/sessions/start", json={})
+    assert second.status_code == 409
+    assert "available" in second.json()["detail"].lower()
+
+
+@pytest.mark.anyio("asyncio")
+async def test_client_session_ip_remains_pinned_after_end(temp_paths):
+    balances_path, _ = temp_paths
+    edge_assignments_path = balances_path.parent / "edge_assignments.json"
+    edge_assignments_path.write_text(
+        json.dumps(
+            {
+                "orch-a": {
+                    "edge_id": "edge-a",
+                    "matchmaker_host": "edge-a.example.com",
+                    "matchmaker_port": 443,
+                    "edge_cidrs": ["10.0.0.0/24"],
+                },
+                "orch-b": {
+                    "edge_id": "edge-b",
+                    "matchmaker_host": "edge-b.example.com",
+                    "matchmaker_port": 443,
+                    "edge_cidrs": ["10.0.1.0/24"],
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    registry, ledger = build_registry(temp_paths)
+    a_addr = "0x" + "9" * 40
+    b_addr = "0x" + "a" * 40
+    with patch.object(Registry, "_resolve_top_set", return_value={a_addr.lower(), b_addr.lower()}):
+        registry.register(
+            orchestrator_id="orch-a",
+            address=a_addr,
+            metadata={"host_public_ip": "8.8.8.8"},
+        )
+        registry.register(
+            orchestrator_id="orch-b",
+            address=b_addr,
+            metadata={"host_public_ip": "1.1.1.1"},
+        )
+
+    settings = build_settings(
+        temp_paths,
+        edge_assignments_path=edge_assignments_path,
+        client_session_allowed_orchestrators=["orch-a", "orch-b"],
+        client_session_seconds=86400,
+        ip_geo_overrides={
+            "198.51.100.51": {"lat": 0.0, "lon": 0.0},
+            "8.8.8.8": {"lat": 0.1, "lon": 0.1},
+            "1.1.1.1": {"lat": 20.0, "lon": 20.0},
+        },
+    )
+    app = create_app(registry, ledger, settings)
+    transport = httpx.ASGITransport(app=app, client=("198.51.100.51", 12345))
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        first = await client.post("/api/sessions/start", json={})
+        assert first.status_code == 200
+        first_body = first.json()
+        first_orch = first_body["orchestrator_id"]
+        assert first_orch == "orch-a"
+
+        ended = await client.post(
+            "/api/sessions/end",
+            headers={"Authorization": f"Bearer {first_body['token']}"},
+        )
+        assert ended.status_code == 200
+
+        resumed = await client.post("/api/sessions/start", json={})
+        assert resumed.status_code == 200
+        resumed_body = resumed.json()
+        assert resumed_body["orchestrator_id"] == first_orch

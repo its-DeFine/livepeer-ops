@@ -8,7 +8,7 @@ import re
 from urllib.parse import urlparse
 from decimal import Decimal
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -266,6 +266,26 @@ class PaymentSettings(BaseSettings):
     sessions_path: Path = Field(
         default=Path("/app/data/sessions.json"),
         validation_alias="PAYMENTS_SESSIONS_PATH",
+    )
+    client_sessions_path: Path = Field(
+        default=Path("/app/data/client_sessions.json"),
+        validation_alias="PAYMENTS_CLIENT_SESSIONS_PATH",
+    )
+    client_session_seconds: int = Field(
+        default=24 * 60 * 60,
+        validation_alias="PAYMENTS_CLIENT_SESSION_SECONDS",
+    )
+    client_session_allowed_orchestrators: List[str] = Field(
+        default_factory=list,
+        validation_alias="PAYMENTS_CLIENT_SESSION_ALLOWED_ORCHESTRATORS",
+    )
+    client_session_reserved_orchestrators: Dict[str, List[str]] = Field(
+        default_factory=dict,
+        validation_alias="PAYMENTS_CLIENT_SESSION_RESERVED_ORCHESTRATORS",
+    )
+    client_session_tcp_allow_direct_orchestrator: bool = Field(
+        default=False,
+        validation_alias="PAYMENTS_CLIENT_SESSION_TCP_ALLOW_DIRECT_ORCHESTRATOR",
     )
     power_meter_path: Path = Field(
         default=Path("/app/data/power_meter.json"),
@@ -675,6 +695,97 @@ class PaymentSettings(BaseSettings):
             return [part for part in parts if part]
         return value
 
+    @field_validator("client_session_allowed_orchestrators", mode="before")
+    @classmethod
+    def parse_client_session_allowed_orchestrators(cls, value):  # type: ignore[override]
+        if value is None:
+            return []
+        if isinstance(value, str):
+            raw = value.strip()
+            if not raw:
+                return []
+            if raw.startswith("["):
+                try:
+                    parsed = json.loads(raw)
+                except Exception:
+                    parsed = None
+                if isinstance(parsed, list):
+                    return [str(item).strip() for item in parsed if str(item).strip()]
+            return [part for part in re.split(r"[\s,]+", raw) if part]
+        if isinstance(value, (list, tuple)):
+            return [str(item).strip() for item in value if str(item).strip()]
+        return value
+
+    @field_validator("client_session_allowed_orchestrators")
+    @classmethod
+    def normalize_client_session_allowed_orchestrators(cls, value: List[str]) -> List[str]:
+        normalized: List[str] = []
+        seen: set[str] = set()
+        for item in value:
+            candidate = str(item or "").strip()
+            if not candidate:
+                continue
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            normalized.append(candidate)
+        return normalized
+
+    @field_validator("client_session_reserved_orchestrators", mode="before")
+    @classmethod
+    def parse_client_session_reserved_orchestrators(cls, value):  # type: ignore[override]
+        if value is None:
+            return {}
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, str):
+            raw = value.strip()
+            if not raw:
+                return {}
+            try:
+                parsed = json.loads(raw)
+            except Exception as exc:
+                raise ValueError(
+                    "PAYMENTS_CLIENT_SESSION_RESERVED_ORCHESTRATORS must be a JSON object"
+                ) from exc
+            if not isinstance(parsed, dict):
+                raise ValueError(
+                    "PAYMENTS_CLIENT_SESSION_RESERVED_ORCHESTRATORS must be a JSON object"
+                )
+            return parsed
+        return value
+
+    @field_validator("client_session_reserved_orchestrators")
+    @classmethod
+    def normalize_client_session_reserved_orchestrators(
+        cls, value: Dict[str, List[str]]
+    ) -> Dict[str, List[str]]:
+        normalized: Dict[str, List[str]] = {}
+        for orchestrator_id, entries in (value or {}).items():
+            orch = str(orchestrator_id or "").strip()
+            if not orch:
+                continue
+            raw_entries: List[str]
+            if isinstance(entries, str):
+                raw_entries = [part for part in re.split(r"[\s,]+", entries.strip()) if part]
+            elif isinstance(entries, (list, tuple)):
+                raw_entries = [str(item).strip() for item in entries if str(item).strip()]
+            else:
+                continue
+            cleaned: List[str] = []
+            seen: set[str] = set()
+            for token in raw_entries:
+                candidate = str(token or "").strip()
+                if not candidate:
+                    continue
+                if candidate in seen:
+                    continue
+                seen.add(candidate)
+                cleaned.append(candidate)
+            if cleaned:
+                normalized[orch] = cleaned
+        return normalized
+
     @model_validator(mode="after")
     def populate_lists_and_validate(self) -> "PaymentSettings":
         if not self.api_admin_token:
@@ -697,6 +808,18 @@ class PaymentSettings(BaseSettings):
             raw_view = os.environ.get("PAYMENTS_VIEWER_TOKENS")
             if raw_view:
                 self.viewer_tokens = self.parse_viewer_tokens(raw_view)
+        if not self.client_session_allowed_orchestrators:
+            raw_allowed = os.environ.get("PAYMENTS_CLIENT_SESSION_ALLOWED_ORCHESTRATORS")
+            if raw_allowed:
+                parsed = self.parse_client_session_allowed_orchestrators(raw_allowed)
+                self.client_session_allowed_orchestrators = self.normalize_client_session_allowed_orchestrators(parsed)
+        if not self.client_session_reserved_orchestrators:
+            raw_reserved = os.environ.get("PAYMENTS_CLIENT_SESSION_RESERVED_ORCHESTRATORS")
+            if raw_reserved:
+                parsed_reserved = self.parse_client_session_reserved_orchestrators(raw_reserved)
+                self.client_session_reserved_orchestrators = self.normalize_client_session_reserved_orchestrators(
+                    parsed_reserved
+                )
         if not self.session_reporter_token:
             raw_session_token = os.environ.get("PAYMENTS_SESSION_REPORTER_TOKEN")
             if raw_session_token:

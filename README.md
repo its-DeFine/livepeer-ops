@@ -241,6 +241,15 @@ Edges can report “session connected / heartbeat / disconnected” events to th
 - Ledger entries use `reason="session_time"` with `session_id`, `edge_id`, `segment_index`, `duration_ms`, and `proof_hash` in metadata (credits are emitted on session close or segment rollover).
 - Each session event also updates an **activity lease** (`lease_id="session:<session_id>"`) so autosleep watchers can treat sessions and content jobs uniformly via `GET /api/activity/leases?active_only=true`.
 
+## Client Session TCP Control (Edge Relay)
+
+Client-facing avatar control should stay edge-routed.
+
+- `POST /api/sessions/tcp` now prefers an edge relay URL from `edge_assignments.json` (`tcp_relay_url`) and does not require orchestrator host IP access.
+- Optional status polling can be configured with `tcp_relay_status_url_template` (supports placeholders: `{execution_id}`, `{session_id}`, `{orchestrator_id}`, `{edge_id}`).
+- Default behavior is **secure/no-direct**: if `tcp_relay_url` is missing, `/api/sessions/tcp` returns `503`.
+- Emergency fallback (not recommended): set `PAYMENTS_CLIENT_SESSION_TCP_ALLOW_DIRECT_ORCHESTRATOR=true` to allow direct Payments -> orchestrator runner calls.
+
 ## Content Jobs (time-based workloads)
 
 For non-interactive content generation, prefer creating **time-based** workloads so the ledger is fully auditable (no opaque backfills).
