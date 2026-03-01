@@ -37,7 +37,7 @@ def build_settings(tmp_path: Path, **overrides):
         registration_rate_limit_per_minute=5,
         registration_rate_limit_burst=5,
         api_admin_token=None,
-        manager_ip_allowlist=[],
+        manager_ip_allowlist=["127.0.0.1"],
         viewer_tokens=[],
         workloads_path=tmp_path / "workloads.json",
         jobs_path=tmp_path / "jobs.json",
@@ -131,4 +131,3 @@ def test_admin_orchestrator_upgrade_requires_token():
     resp = client.post("/api/orchestrators/ops/upgrade", json={"orchestrator_id": "orch-1"})
     assert resp.status_code == 401
     tmp.cleanup()
-
