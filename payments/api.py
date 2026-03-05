@@ -39,7 +39,7 @@ from eth_utils import keccak, to_checksum_address
 
 from .activity import ActivityLeaseStore, parse_iso8601 as parse_activity_iso8601
 from .client_sessions import ClientSessionStore, parse_iso8601 as parse_client_session_iso8601
-from .config import PaymentSettings
+from .config import PaymentSettings, normalize_surface_host
 from .jobs import JobStore
 from .ledger import Ledger
 from .ledger_proofs import build_proof as build_ledger_proof
@@ -1303,6 +1303,9 @@ def create_app(
         "last_session_upstream_addr": None,
         "last_session_edge_id": None,
     }
+    enforce_split_surfaces = bool(getattr(settings, "enforce_split_surfaces", False))
+    public_edge_host = normalize_surface_host(getattr(settings, "public_edge_host", None))
+    public_ops_host = normalize_surface_host(getattr(settings, "public_ops_host", None))
 
     edge_assignments_path = Path(
         getattr(settings, "edge_assignments_path", data_dir / "edge_assignments.json")
@@ -1372,6 +1375,94 @@ def create_app(
                 if normalized:
                     return normalized
         return client_host
+
+    def request_host(request: Request) -> Optional[str]:
+        raw_client = request.client.host if request.client else None
+        if raw_client == "testclient":
+            raw_client = "127.0.0.1"
+        client_host = normalize_ip(raw_client)
+        if client_host and is_trusted_proxy(client_host):
+            forwarded_host = request.headers.get("X-Forwarded-Host")
+            if forwarded_host:
+                first = forwarded_host.split(",", 1)[0].strip()
+                normalized = normalize_surface_host(first)
+                if normalized:
+                    return normalized
+        host_header = request.headers.get("Host")
+        if host_header:
+            first = host_header.split(",", 1)[0].strip()
+            normalized = normalize_surface_host(first)
+            if normalized:
+                return normalized
+        return normalize_surface_host(getattr(request.url, "hostname", None))
+
+    _orchestrator_credential_path = re.compile(r"^/api/orchestrators/[^/]+/credential/(nonce|token)$")
+    _orchestrator_health_path = re.compile(r"^/api/orchestrators/[^/]+/health$")
+    _orchestrator_view_path = re.compile(r"^/api/orchestrators/[^/]+(?:/stats)?$")
+
+    def _surface_route_group(request: Request) -> Optional[str]:
+        path = str(request.url.path or "").strip() or "/"
+        if not path.startswith("/"):
+            path = "/" + path
+        if len(path) > 1 and path.endswith("/"):
+            path = path.rstrip("/")
+        method = request.method.upper()
+
+        # Ignore framework metadata routes.
+        if path in {"/openapi.json", "/docs", "/docs/oauth2-redirect", "/redoc"}:
+            return None
+
+        if path == "/api/orchestrators/register" or path == "/api/orchestrators/bootstrap":
+            return "edge"
+        if path.startswith("/api/orchestrators/me"):
+            return "edge"
+        if _orchestrator_credential_path.fullmatch(path):
+            return "edge"
+        if path.startswith("/api/orchestrators/ops/"):
+            return "ops"
+        if _orchestrator_health_path.fullmatch(path):
+            return "ops"
+        if path == "/api/orchestrators" or _orchestrator_view_path.fullmatch(path):
+            return "ops"
+
+        if path == "/api/orchestrator-edge":
+            if method == "GET":
+                return "edge"
+            if method == "PUT":
+                return "ops"
+            return None
+
+        if path.startswith("/api/sessions/"):
+            return "edge"
+        if path.startswith("/api/transparency/"):
+            return "edge"
+        if path in {"/api/tee/attestation", "/api/tee/core/attestation"}:
+            return "edge"
+
+        if path == "/api/licenses/invites/redeem":
+            return "edge"
+        if path.startswith("/api/licenses/invites"):
+            return "ops"
+        if path == "/api/licenses/lease" or path.startswith("/api/licenses/lease/"):
+            return "edge"
+        if path == "/api/licenses/leases":
+            return "ops"
+
+        for prefix in (
+            "/api/workloads",
+            "/api/workload-offers",
+            "/api/recordings/presign",
+            "/api/jobs/",
+            "/api/activity/leases",
+            "/api/licenses/orchestrators/",
+            "/api/licenses/images",
+            "/api/licenses/access",
+            "/api/ledger/",
+        ):
+            if path.startswith(prefix):
+                return "ops"
+
+        return None
 
     def _sanitize_s3_segment(raw: str) -> str:
         cleaned = re.sub(r"[^a-zA-Z0-9._-]+", "-", (raw or "").strip())
@@ -2256,6 +2347,26 @@ def create_app(
     @app.exception_handler(RegistryError)
     async def registry_error_handler(_: Request, exc: RegistryError) -> JSONResponse:
         return JSONResponse(status_code=exc.status_code, content={"detail": str(exc)})
+
+    @app.middleware("http")
+    async def enforce_surface_split_routes(request: Request, call_next: Any) -> Any:
+        if not enforce_split_surfaces or not public_edge_host or not public_ops_host:
+            return await call_next(request)
+        route_group = _surface_route_group(request)
+        if route_group is None:
+            return await call_next(request)
+        host = request_host(request)
+        if host == public_edge_host and route_group == "ops":
+            return JSONResponse(
+                status_code=status.HTTP_403_FORBIDDEN,
+                content={"detail": "Route is not available on EDGE surface"},
+            )
+        if host == public_ops_host and route_group == "edge":
+            return JSONResponse(
+                status_code=status.HTTP_403_FORBIDDEN,
+                content={"detail": "Route is not available on OPS surface"},
+            )
+        return await call_next(request)
 
     WEI_PER_ETH = Decimal(10) ** 18
     policy_payload = policy_snapshot(settings)
