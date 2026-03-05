@@ -201,6 +201,22 @@ class PaymentSettings(BaseSettings):
     api_port: int = Field(default=8081, validation_alias="PAYMENTS_API_PORT")
     api_root_path: str = Field(default="", validation_alias="PAYMENTS_API_ROOT_PATH")
     api_admin_token: Optional[str] = Field(default=None, validation_alias="PAYMENTS_API_ADMIN_TOKEN")
+    ops_approval_hmac_secret: Optional[str] = Field(
+        default=None,
+        validation_alias="PAYMENTS_OPS_APPROVAL_HMAC_SECRET",
+    )
+    ops_approval_required: bool = Field(
+        default=False,
+        validation_alias="PAYMENTS_OPS_APPROVAL_REQUIRED",
+    )
+    ops_approval_max_ttl_seconds: int = Field(
+        default=300,
+        validation_alias="PAYMENTS_OPS_APPROVAL_MAX_TTL_SECONDS",
+    )
+    ops_approval_nonces_path: Path = Field(
+        default=Path("/app/data/ops_approval_nonces.json"),
+        validation_alias="PAYMENTS_OPS_APPROVAL_NONCES_PATH",
+    )
 
     registration_rate_limit_per_minute: int = Field(
         default=5, validation_alias="PAYMENTS_REGISTRATION_PER_MINUTE"

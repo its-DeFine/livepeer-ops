@@ -60,6 +60,7 @@ from .orchestrator_credentials import (
     recover_delegate,
     normalize_nonce,
 )
+from .ops_approval import OpsApprovalNonceStore, OpsApprovalVerifier
 from .sessions import SessionStore
 from .power_meter import PowerMeterStore
 from .signer import Signer, SignerError
@@ -1209,6 +1210,15 @@ def create_app(
         ),
         ttl_seconds=int(getattr(settings, "orchestrator_credential_nonce_ttl_seconds", 300) or 300),
     )
+    ops_approval_nonce_store = OpsApprovalNonceStore(
+        Path(getattr(settings, "ops_approval_nonces_path", data_dir / "ops_approval_nonces.json"))
+    )
+    ops_approval_verifier = OpsApprovalVerifier(
+        hmac_secret=getattr(settings, "ops_approval_hmac_secret", None),
+        nonce_store=ops_approval_nonce_store,
+        max_ttl_seconds=int(getattr(settings, "ops_approval_max_ttl_seconds", 300) or 300),
+        required=bool(getattr(settings, "ops_approval_required", False)),
+    )
     credential_contract_address = (
         getattr(settings, "orchestrator_credential_contract_address", None) or ""
     ).strip() or None
@@ -1741,6 +1751,9 @@ def create_app(
         if provided != expected:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Session reporter token required")
 
+    async def require_ops_approval(request: Request) -> None:
+        await ops_approval_verifier.verify(request)
+
     async def require_admin(request: Request) -> None:
         token = settings.api_admin_token
         if not token:
@@ -1770,6 +1783,7 @@ def create_app(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Manager IP not allowlisted for ops endpoint",
             )
+        await require_ops_approval(request)
 
     async def require_edge_plane(request: Request) -> None:
         expected = (getattr(settings, "edge_config_token", None) or "").strip()
