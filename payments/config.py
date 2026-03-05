@@ -218,6 +218,19 @@ class PaymentSettings(BaseSettings):
         validation_alias="PAYMENTS_OPS_APPROVAL_NONCES_PATH",
     )
 
+    enforce_split_surfaces: bool = Field(
+        default=False,
+        validation_alias="PAYMENTS_ENFORCE_SPLIT_SURFACES",
+    )
+    public_edge_host: Optional[str] = Field(
+        default=None,
+        validation_alias="PAYMENTS_PUBLIC_EDGE_HOST",
+    )
+    public_ops_host: Optional[str] = Field(
+        default=None,
+        validation_alias="PAYMENTS_PUBLIC_OPS_HOST",
+    )
+
     registration_rate_limit_per_minute: int = Field(
         default=5, validation_alias="PAYMENTS_REGISTRATION_PER_MINUTE"
     )
@@ -885,6 +898,33 @@ class PaymentSettings(BaseSettings):
                 raise ValueError(
                     "PAYMENTS_LIVEPEER_DEPOSIT_LOW_WATERMARK_ETH must be <= PAYMENTS_LIVEPEER_DEPOSIT_TARGET_ETH"
                 )
+
+        def _normalize_surface_host(value: Optional[str]) -> Optional[str]:
+            candidate = str(value or "").strip()
+            if not candidate:
+                return None
+            if "://" in candidate:
+                parsed = urlparse(candidate)
+                host = (parsed.hostname or "").strip().lower()
+                return host or None
+            if "/" in candidate:
+                parsed = urlparse("https://" + candidate)
+                host = (parsed.hostname or "").strip().lower()
+                return host or None
+            return candidate.lower()
+
+        if self.enforce_split_surfaces:
+            edge_host = _normalize_surface_host(self.public_edge_host)
+            ops_host = _normalize_surface_host(self.public_ops_host)
+            if not edge_host or not ops_host:
+                raise ValueError(
+                    "PAYMENTS_PUBLIC_EDGE_HOST and PAYMENTS_PUBLIC_OPS_HOST must be set when PAYMENTS_ENFORCE_SPLIT_SURFACES=true"
+                )
+            if edge_host == ops_host:
+                raise ValueError(
+                    "PAYMENTS_PUBLIC_EDGE_HOST and PAYMENTS_PUBLIC_OPS_HOST must differ when PAYMENTS_ENFORCE_SPLIT_SURFACES=true"
+                )
+
         return self
 
 
