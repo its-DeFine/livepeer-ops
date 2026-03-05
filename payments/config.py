@@ -14,6 +14,22 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+def normalize_surface_host(value: Optional[str]) -> Optional[str]:
+    """Normalize a configured/request surface host value."""
+    candidate = str(value or "").strip()
+    if not candidate:
+        return None
+    if "://" in candidate:
+        parsed = urlparse(candidate)
+        host = (parsed.hostname or "").strip().lower()
+        return host or None
+    if "/" in candidate:
+        parsed = urlparse("https://" + candidate)
+        host = (parsed.hostname or "").strip().lower()
+        return host or None
+    return candidate.lower()
+
+
 class LedgerPaths(BaseModel):
     balances: Path = Field(default=Path("/app/data/balances.json"))
 
@@ -899,23 +915,9 @@ class PaymentSettings(BaseSettings):
                     "PAYMENTS_LIVEPEER_DEPOSIT_LOW_WATERMARK_ETH must be <= PAYMENTS_LIVEPEER_DEPOSIT_TARGET_ETH"
                 )
 
-        def _normalize_surface_host(value: Optional[str]) -> Optional[str]:
-            candidate = str(value or "").strip()
-            if not candidate:
-                return None
-            if "://" in candidate:
-                parsed = urlparse(candidate)
-                host = (parsed.hostname or "").strip().lower()
-                return host or None
-            if "/" in candidate:
-                parsed = urlparse("https://" + candidate)
-                host = (parsed.hostname or "").strip().lower()
-                return host or None
-            return candidate.lower()
-
         if self.enforce_split_surfaces:
-            edge_host = _normalize_surface_host(self.public_edge_host)
-            ops_host = _normalize_surface_host(self.public_ops_host)
+            edge_host = normalize_surface_host(self.public_edge_host)
+            ops_host = normalize_surface_host(self.public_ops_host)
             if not edge_host or not ops_host:
                 raise ValueError(
                     "PAYMENTS_PUBLIC_EDGE_HOST and PAYMENTS_PUBLIC_OPS_HOST must be set when PAYMENTS_ENFORCE_SPLIT_SURFACES=true"
