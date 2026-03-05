@@ -1,3 +1,4 @@
+import json
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -8,6 +9,7 @@ from fastapi.testclient import TestClient
 
 from payments.api import create_app
 from payments.ledger import Ledger
+from payments.ops_approval import mint_ops_approval_token
 from payments.registry import Registry
 
 
@@ -42,9 +44,29 @@ def build_settings(tmp_path: Path, **overrides):
         workloads_path=tmp_path / "workloads.json",
         jobs_path=tmp_path / "jobs.json",
         workload_archive_base=tmp_path / "recordings",
+        ops_approval_hmac_secret="ops-secret",
+        ops_approval_required=True,
+        ops_approval_max_ttl_seconds=300,
+        ops_approval_nonces_path=tmp_path / "ops_approval_nonces.json",
     )
     defaults.update(overrides)
     return SimpleNamespace(**defaults)
+
+
+def ops_headers(path: str, payload: dict, *, admin_token: str = "secret", secret: str = "ops-secret", nonce: str | None = None) -> dict:
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    token = mint_ops_approval_token(
+        hmac_secret=secret,
+        method="POST",
+        path=path,
+        raw_body=raw,
+        ttl_seconds=300,
+        nonce=nonce,
+    )
+    return {
+        "X-Admin-Token": admin_token,
+        "X-Ops-Approval-Token": token,
+    }
 
 
 def test_admin_orchestrator_upgrade_records_pin_and_redacts_output():
@@ -89,18 +111,20 @@ def test_admin_orchestrator_upgrade_records_pin_and_redacts_output():
                 )
             raise AssertionError(f"unexpected url: {url}")
 
+    payload = {
+        "orchestrator_id": "orch-1",
+        "ref": "v1.2.3",
+        "service_image_tag": "v1.2.3",
+        "apply": True,
+        "wake_ttl_seconds": 3600,
+    }
+
     with patch("payments.api.httpx.AsyncClient", DummyAsyncClient):
         client = TestClient(app)
         resp = client.post(
             "/api/orchestrators/ops/upgrade",
-            headers={"X-Admin-Token": "secret"},
-            json={
-                "orchestrator_id": "orch-1",
-                "ref": "v1.2.3",
-                "service_image_tag": "v1.2.3",
-                "apply": True,
-                "wake_ttl_seconds": 3600,
-            },
+            headers=ops_headers("/api/orchestrators/ops/upgrade", payload),
+            json=payload,
         )
 
     assert resp.status_code == 200
@@ -130,4 +154,84 @@ def test_admin_orchestrator_upgrade_requires_token():
 
     resp = client.post("/api/orchestrators/ops/upgrade", json={"orchestrator_id": "orch-1"})
     assert resp.status_code == 401
+    tmp.cleanup()
+
+
+def test_admin_orchestrator_upgrade_requires_ops_approval_token():
+    tmp = tempfile.TemporaryDirectory()
+    tmp_path = Path(tmp.name)
+    registry, ledger = build_registry(tmp_path)
+    app_settings = build_settings(tmp_path, api_admin_token="secret")
+
+    with patch.object(Registry, "_resolve_top_set", return_value={"0x" + "a" * 40}):
+        registry.register(
+            orchestrator_id="orch-1",
+            address="0x" + "A" * 40,
+            metadata={"host_public_ip": "203.0.113.5"},
+        )
+
+    app = create_app(registry, ledger, app_settings)
+    client = TestClient(app)
+    resp = client.post(
+        "/api/orchestrators/ops/upgrade",
+        headers={"X-Admin-Token": "secret"},
+        json={"orchestrator_id": "orch-1", "apply": False},
+    )
+    assert resp.status_code == 401
+    assert "approval" in (resp.json().get("detail") or "").lower()
+    tmp.cleanup()
+
+
+def test_admin_orchestrator_upgrade_rejects_replayed_approval_nonce():
+    tmp = tempfile.TemporaryDirectory()
+    tmp_path = Path(tmp.name)
+    registry, ledger = build_registry(tmp_path)
+    app_settings = build_settings(tmp_path, api_admin_token="secret")
+
+    with patch.object(Registry, "_resolve_top_set", return_value={"0x" + "a" * 40}):
+        registry.register(
+            orchestrator_id="orch-1",
+            address="0x" + "A" * 40,
+            metadata={"host_public_ip": "203.0.113.5"},
+        )
+
+    app = create_app(registry, ledger, app_settings)
+
+    class DummyAsyncClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def post(self, url, json=None, **kwargs):
+            if url.endswith("/power"):
+                return httpx.Response(200, json={"state": "sleeping"})
+            if url.endswith("/ops/upgrade"):
+                return httpx.Response(200, json={"ok": True})
+            raise AssertionError(f"unexpected url: {url}")
+
+    payload = {"orchestrator_id": "orch-1", "apply": False}
+    headers = ops_headers(
+        "/api/orchestrators/ops/upgrade",
+        payload,
+        nonce="fixed-nonce",
+    )
+
+    with patch("payments.api.httpx.AsyncClient", DummyAsyncClient):
+        client = TestClient(app)
+        first = client.post(
+            "/api/orchestrators/ops/upgrade",
+            headers=headers,
+            json=payload,
+        )
+        second = client.post(
+            "/api/orchestrators/ops/upgrade",
+            headers=headers,
+            json=payload,
+        )
+
+    assert first.status_code == 200
+    assert second.status_code == 401
+    assert "replay" in (second.json().get("detail") or "").lower()
     tmp.cleanup()

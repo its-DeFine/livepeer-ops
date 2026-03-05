@@ -1,3 +1,4 @@
+import json
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -8,6 +9,7 @@ from fastapi.testclient import TestClient
 
 from payments.api import create_app
 from payments.ledger import Ledger
+from payments.ops_approval import mint_ops_approval_token
 from payments.registry import Registry
 
 
@@ -42,9 +44,29 @@ def build_settings(tmp_path: Path, **overrides):
         workloads_path=tmp_path / "workloads.json",
         jobs_path=tmp_path / "jobs.json",
         workload_archive_base=tmp_path / "recordings",
+        ops_approval_hmac_secret="ops-secret",
+        ops_approval_required=True,
+        ops_approval_max_ttl_seconds=300,
+        ops_approval_nonces_path=tmp_path / "ops_approval_nonces.json",
     )
     defaults.update(overrides)
     return SimpleNamespace(**defaults)
+
+
+def ops_headers(path: str, payload: dict, *, admin_token: str = "secret", secret: str = "ops-secret", nonce: str | None = None) -> dict:
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    token = mint_ops_approval_token(
+        hmac_secret=secret,
+        method="POST",
+        path=path,
+        raw_body=raw,
+        ttl_seconds=300,
+        nonce=nonce,
+    )
+    return {
+        "X-Admin-Token": admin_token,
+        "X-Ops-Approval-Token": token,
+    }
 
 
 def test_admin_orchestrator_rollout_redacts_output():
@@ -85,12 +107,14 @@ def test_admin_orchestrator_rollout_redacts_output():
                 },
             )
 
+    payload = {"orchestrator_id": "orch-1", "image_ref": "enc-v1"}
+
     with patch("payments.api.httpx.AsyncClient", DummyAsyncClient):
         client = TestClient(app)
         resp = client.post(
             "/api/orchestrators/ops/rollout",
-            headers={"X-Admin-Token": "secret"},
-            json={"orchestrator_id": "orch-1", "image_ref": "enc-v1"},
+            headers=ops_headers("/api/orchestrators/ops/rollout", payload),
+            json=payload,
         )
 
     assert resp.status_code == 200
@@ -125,10 +149,11 @@ def test_admin_orchestrator_rollout_requires_manager_allowlist():
     app = create_app(registry, ledger, app_settings)
     client = TestClient(app)
 
+    payload = {"orchestrator_id": "orch-1", "image_ref": "enc-v1"}
     resp = client.post(
         "/api/orchestrators/ops/rollout",
-        headers={"X-Admin-Token": "secret"},
-        json={"orchestrator_id": "orch-1", "image_ref": "enc-v1"},
+        headers=ops_headers("/api/orchestrators/ops/rollout", payload),
+        json=payload,
     )
     assert resp.status_code == 503
     assert "allowlist" in (resp.json().get("detail") or "").lower()
@@ -163,12 +188,14 @@ def test_admin_orchestrator_rollout_reports_connect_errors():
         async def post(self, url, json=None, **kwargs):
             raise httpx.ConnectError("boom", request=httpx.Request("POST", url))
 
+    payload = {"orchestrator_id": "orch-2", "image_ref": "enc-v1"}
+
     with patch("payments.api.httpx.AsyncClient", DummyAsyncClient):
         client = TestClient(app)
         resp = client.post(
             "/api/orchestrators/ops/rollout",
-            headers={"X-Admin-Token": "secret"},
-            json={"orchestrator_id": "orch-2", "image_ref": "enc-v1"},
+            headers=ops_headers("/api/orchestrators/ops/rollout", payload),
+            json=payload,
         )
 
     assert resp.status_code == 200
@@ -177,4 +204,51 @@ def test_admin_orchestrator_rollout_reports_connect_errors():
     assert result["http_status"] is None
     assert "boom" in (result["error"] or "")
 
+    tmp.cleanup()
+
+
+def test_admin_orchestrator_rollout_requires_ops_approval_token():
+    tmp = tempfile.TemporaryDirectory()
+    tmp_path = Path(tmp.name)
+    registry, ledger = build_registry(tmp_path)
+    app_settings = build_settings(tmp_path, api_admin_token="secret")
+    app = create_app(registry, ledger, app_settings)
+    client = TestClient(app)
+
+    resp = client.post(
+        "/api/orchestrators/ops/rollout",
+        headers={"X-Admin-Token": "secret"},
+        json={"orchestrator_id": "orch-1", "image_ref": "enc-v1"},
+    )
+    assert resp.status_code == 401
+    assert "approval" in (resp.json().get("detail") or "").lower()
+    tmp.cleanup()
+
+
+def test_admin_orchestrator_rollout_rejects_body_mismatch():
+    tmp = tempfile.TemporaryDirectory()
+    tmp_path = Path(tmp.name)
+    registry, ledger = build_registry(tmp_path)
+    app_settings = build_settings(tmp_path, api_admin_token="secret")
+
+    with patch.object(Registry, "_resolve_top_set", return_value={"0x" + "a" * 40}):
+        registry.register(
+            orchestrator_id="orch-1",
+            address="0x" + "A" * 40,
+            metadata={"host_public_ip": "203.0.113.5"},
+        )
+
+    app = create_app(registry, ledger, app_settings)
+    client = TestClient(app)
+
+    signed_payload = {"orchestrator_id": "orch-1", "image_ref": "enc-v1"}
+    sent_payload = {"orchestrator_id": "orch-1", "image_ref": "enc-v2"}
+
+    resp = client.post(
+        "/api/orchestrators/ops/rollout",
+        headers=ops_headers("/api/orchestrators/ops/rollout", signed_payload, nonce="body-mismatch"),
+        json=sent_payload,
+    )
+    assert resp.status_code == 401
+    assert "scope" in (resp.json().get("detail") or "").lower()
     tmp.cleanup()
