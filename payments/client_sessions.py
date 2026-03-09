@@ -32,6 +32,16 @@ def _sha256_hex(value: str) -> str:
     return f"sha256:{digest}"
 
 
+def normalize_invite_code(code: str) -> str:
+    return "".join(ch for ch in (code or "").strip().upper() if ch.isalnum())
+
+
+def _generate_invite_code() -> str:
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    raw = "".join(secrets.choice(alphabet) for _ in range(20))
+    return f"{raw[0:4]}-{raw[4:8]}-{raw[8:12]}-{raw[12:16]}-{raw[16:20]}"
+
+
 class ClientSessionStore:
     """Stores client session leases and hashed bearer tokens."""
 
@@ -145,6 +155,19 @@ class ClientSessionStore:
             record = self._records.get(session_id)
             return dict(record) if isinstance(record, dict) else None
 
+    def find_active_by_session_id(self, session_id: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            now = utcnow()
+            changed = self._close_expired_locked(now=now)
+            record = self._records.get(session_id)
+            if not isinstance(record, dict) or not self._is_active_record(record, now=now):
+                if changed:
+                    self._persist()
+                return None
+            if changed:
+                self._persist()
+            return dict(record)
+
     def iter_with_ids(self) -> Iterable[Tuple[str, Dict[str, Any]]]:
         with self._lock:
             return [(session_id, dict(record)) for session_id, record in self._records.items() if isinstance(record, dict)]
@@ -182,7 +205,9 @@ class ClientSessionStore:
                     continue
                 if str(record.get("client_ip") or "") != client_ip:
                     continue
-                if not self._is_unexpired_record(record, now=now):
+                # Ended sessions should not keep a sticky reservation after the user
+                # explicitly releases the avatar.
+                if not self._is_active_record(record, now=now):
                     continue
                 if selected is None:
                     selected = dict(record)
@@ -221,7 +246,7 @@ class ClientSessionStore:
                     continue
                 if str(record.get("orchestrator_id") or "") != orchestrator_id:
                     continue
-                if self._is_unexpired_record(record, now=now):
+                if self._is_active_record(record, now=now):
                     if changed:
                         self._persist()
                     return True
@@ -304,3 +329,178 @@ class ClientSessionStore:
             self._records[session_id] = updated
             self._persist()
             return dict(updated)
+
+
+class ClientSessionInviteStore:
+    """Stores single-use invite codes for initial client session allocation."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._lock = threading.Lock()
+        self._invites: Dict[str, Dict[str, Any]] = {}
+        self._load()
+
+    def _load(self) -> None:
+        if not self.path.exists():
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            return
+        with self.path.open("r", encoding="utf-8") as handle:
+            try:
+                data = json.load(handle)
+            except json.JSONDecodeError:
+                data = {}
+        if isinstance(data, dict):
+            self._invites = data
+        else:
+            self._invites = {}
+
+    def _persist(self) -> None:
+        tmp = self.path.with_suffix(".tmp")
+        with tmp.open("w", encoding="utf-8") as handle:
+            json.dump(self._invites, handle, indent=2, sort_keys=True)
+        tmp.replace(self.path)
+
+    def create(
+        self,
+        *,
+        expires_at: Optional[datetime] = None,
+        requested_duration_seconds: Optional[int] = None,
+        allowed_orchestrators: Optional[Iterable[str]] = None,
+        note: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        now = utcnow()
+        expires = expires_at.astimezone(timezone.utc) if expires_at else None
+        normalized_allowed = sorted(
+            {
+                str(orchestrator_id or "").strip()
+                for orchestrator_id in (allowed_orchestrators or [])
+                if str(orchestrator_id or "").strip()
+            }
+        )
+
+        with self._lock:
+            code = _generate_invite_code()
+            code_hash = _sha256_hex(normalize_invite_code(code))
+            existing_hashes = {rec.get("code_hash") for rec in self._invites.values() if isinstance(rec, dict)}
+            while code_hash in existing_hashes:
+                code = _generate_invite_code()
+                code_hash = _sha256_hex(normalize_invite_code(code))
+
+            invite_id = uuid.uuid4().hex
+            record: Dict[str, Any] = {
+                "invite_id": invite_id,
+                "code_hash": code_hash,
+                "created_at": isoformat(now),
+                "expires_at": isoformat(expires) if expires else None,
+                "requested_duration_seconds": int(requested_duration_seconds)
+                if requested_duration_seconds is not None
+                else None,
+                "allowed_orchestrators": normalized_allowed,
+                "note": note,
+                "revoked_at": None,
+                "redeeming_at": None,
+                "redeemed_at": None,
+                "redeemed_ip": None,
+                "redeemed_session_id": None,
+            }
+            self._invites[invite_id] = record
+            self._persist()
+
+        return {"invite_id": invite_id, "code": code, **record}
+
+    def list(self) -> list[Dict[str, Any]]:
+        items = list(self._invites.values())
+        items.sort(key=lambda entry: entry.get("created_at") or "", reverse=True)
+        return items
+
+    def revoke(self, invite_id: str) -> bool:
+        with self._lock:
+            record = self._invites.get(invite_id)
+            if record is None:
+                return False
+            if record.get("revoked_at"):
+                return True
+            updated = dict(record)
+            updated["revoked_at"] = isoformat(utcnow())
+            self._invites[invite_id] = updated
+            self._persist()
+            return True
+
+    def reserve(self, code: str, *, client_ip: Optional[str] = None, max_pending_seconds: int = 120) -> Dict[str, Any]:
+        now = utcnow()
+        code_hash = _sha256_hex(normalize_invite_code(code))
+
+        with self._lock:
+            found_id: Optional[str] = None
+            record: Optional[Dict[str, Any]] = None
+            for invite_id, payload in self._invites.items():
+                if not isinstance(payload, dict):
+                    continue
+                if payload.get("code_hash") == code_hash:
+                    found_id = invite_id
+                    record = payload
+                    break
+
+            if found_id is None or record is None:
+                raise KeyError("Invite not found")
+
+            if record.get("revoked_at"):
+                raise PermissionError("Invite revoked")
+
+            expires_raw = record.get("expires_at")
+            if isinstance(expires_raw, str) and expires_raw:
+                try:
+                    expires = parse_iso8601(expires_raw)
+                except ValueError:
+                    expires = now
+                if expires <= now:
+                    raise TimeoutError("Invite expired")
+
+            if record.get("redeemed_at"):
+                raise FileExistsError("Invite already redeemed")
+
+            redeeming_at = record.get("redeeming_at")
+            if isinstance(redeeming_at, str) and redeeming_at:
+                try:
+                    pending_since = parse_iso8601(redeeming_at)
+                except ValueError:
+                    pending_since = now
+                if (now - pending_since).total_seconds() <= max_pending_seconds:
+                    raise RuntimeError("Invite redemption in progress")
+
+            updated = dict(record)
+            updated["redeeming_at"] = isoformat(now)
+            updated["redeemed_ip"] = client_ip or updated.get("redeemed_ip")
+            self._invites[found_id] = updated
+            self._persist()
+            return dict(updated)
+
+    def commit(self, *, invite_id: str, session_id: str, client_ip: Optional[str] = None) -> bool:
+        now = utcnow()
+        with self._lock:
+            record = self._invites.get(invite_id)
+            if record is None:
+                return False
+            if record.get("revoked_at"):
+                return False
+            if record.get("redeemed_at"):
+                return True
+
+            updated = dict(record)
+            updated["redeeming_at"] = None
+            updated["redeemed_at"] = isoformat(now)
+            updated["redeemed_ip"] = client_ip or updated.get("redeemed_ip")
+            updated["redeemed_session_id"] = session_id
+            self._invites[invite_id] = updated
+            self._persist()
+            return True
+
+    def release(self, invite_id: str) -> None:
+        with self._lock:
+            record = self._invites.get(invite_id)
+            if record is None or not record.get("redeeming_at"):
+                return
+            updated = dict(record)
+            updated["redeeming_at"] = None
+            self._invites[invite_id] = updated
+            self._persist()
