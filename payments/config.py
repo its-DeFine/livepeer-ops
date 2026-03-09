@@ -320,6 +320,18 @@ class PaymentSettings(BaseSettings):
         default=24 * 60 * 60,
         validation_alias="PAYMENTS_CLIENT_SESSION_SECONDS",
     )
+    client_session_require_invite: bool = Field(
+        default=False,
+        validation_alias="PAYMENTS_CLIENT_SESSION_REQUIRE_INVITE",
+    )
+    client_session_invites_path: Path = Field(
+        default=Path("/app/data/client_session_invites.json"),
+        validation_alias="PAYMENTS_CLIENT_SESSION_INVITES_PATH",
+    )
+    client_session_invite_default_ttl_seconds: int = Field(
+        default=7 * 24 * 60 * 60,
+        validation_alias="PAYMENTS_CLIENT_SESSION_INVITE_DEFAULT_TTL_SECONDS",
+    )
     client_session_allowed_orchestrators: List[str] = Field(
         default_factory=list,
         validation_alias="PAYMENTS_CLIENT_SESSION_ALLOWED_ORCHESTRATORS",

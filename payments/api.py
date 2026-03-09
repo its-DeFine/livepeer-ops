@@ -38,7 +38,11 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from eth_utils import keccak, to_checksum_address
 
 from .activity import ActivityLeaseStore, parse_iso8601 as parse_activity_iso8601
-from .client_sessions import ClientSessionStore, parse_iso8601 as parse_client_session_iso8601
+from .client_sessions import (
+    ClientSessionInviteStore,
+    ClientSessionStore,
+    parse_iso8601 as parse_client_session_iso8601,
+)
 from .config import PaymentSettings, normalize_surface_host
 from .jobs import JobStore
 from .ledger import Ledger
@@ -398,9 +402,12 @@ class EdgeConfigResponse(BaseModel):
     matchmaker_host: str = Field(min_length=1, max_length=255)
     matchmaker_port: int = Field(default=8889, ge=1, le=65535)
     edge_cidrs: List[str] = Field(min_length=1)
+    public_base_url: Optional[str] = Field(default=None, max_length=1024)
     turn_external_ip: Optional[str] = Field(default=None, max_length=64)
     tcp_relay_url: Optional[str] = Field(default=None, max_length=1024)
     tcp_relay_status_url_template: Optional[str] = Field(default=None, max_length=1024)
+    runner_execute_url: Optional[str] = Field(default=None, max_length=1024)
+    runner_status_url_template: Optional[str] = Field(default=None, max_length=1024)
 
     @field_validator("edge_cidrs")
     @classmethod
@@ -429,9 +436,8 @@ class EdgeConfigResponse(BaseModel):
         ip = ipaddress.ip_address(candidate)
         return str(ip)
 
-    @field_validator("tcp_relay_url")
-    @classmethod
-    def validate_tcp_relay_url(cls, value: Optional[str]) -> Optional[str]:
+    @staticmethod
+    def _normalize_absolute_http_url(value: Optional[str], *, field_name: str) -> Optional[str]:
         if value is None:
             return None
         candidate = value.strip()
@@ -439,21 +445,33 @@ class EdgeConfigResponse(BaseModel):
             return None
         parsed = urlparse(candidate)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-            raise ValueError("tcp_relay_url must be an absolute http(s) URL")
-        return candidate
+            raise ValueError(f"{field_name} must be an absolute http(s) URL")
+        return candidate.rstrip("/")
+
+    @field_validator("public_base_url")
+    @classmethod
+    def validate_public_base_url(cls, value: Optional[str]) -> Optional[str]:
+        return cls._normalize_absolute_http_url(value, field_name="public_base_url")
+
+    @field_validator("tcp_relay_url")
+    @classmethod
+    def validate_tcp_relay_url(cls, value: Optional[str]) -> Optional[str]:
+        return cls._normalize_absolute_http_url(value, field_name="tcp_relay_url")
 
     @field_validator("tcp_relay_status_url_template")
     @classmethod
     def validate_tcp_relay_status_url_template(cls, value: Optional[str]) -> Optional[str]:
-        if value is None:
-            return None
-        candidate = value.strip()
-        if not candidate:
-            return None
-        parsed = urlparse(candidate)
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-            raise ValueError("tcp_relay_status_url_template must be an absolute http(s) URL")
-        return candidate
+        return cls._normalize_absolute_http_url(value, field_name="tcp_relay_status_url_template")
+
+    @field_validator("runner_execute_url")
+    @classmethod
+    def validate_runner_execute_url(cls, value: Optional[str]) -> Optional[str]:
+        return cls._normalize_absolute_http_url(value, field_name="runner_execute_url")
+
+    @field_validator("runner_status_url_template")
+    @classmethod
+    def validate_runner_status_url_template(cls, value: Optional[str]) -> Optional[str]:
+        return cls._normalize_absolute_http_url(value, field_name="runner_status_url_template")
 
 
 class EdgeAssignmentUpsertPayload(BaseModel):
@@ -462,18 +480,26 @@ class EdgeAssignmentUpsertPayload(BaseModel):
     matchmaker_host: str = Field(min_length=1, max_length=255)
     matchmaker_port: int = Field(default=8889, ge=1, le=65535)
     edge_cidrs: List[str] = Field(min_length=1)
+    public_base_url: Optional[str] = Field(default=None, max_length=1024)
     turn_external_ip: Optional[str] = Field(default=None, max_length=64)
     tcp_relay_url: Optional[str] = Field(default=None, max_length=1024)
     tcp_relay_status_url_template: Optional[str] = Field(default=None, max_length=1024)
+    runner_execute_url: Optional[str] = Field(default=None, max_length=1024)
+    runner_status_url_template: Optional[str] = Field(default=None, max_length=1024)
 
     @model_validator(mode="after")
     def normalize_fields(self):  # type: ignore[override]
         self.matchmaker_host = self.matchmaker_host.strip()
         self.edge_cidrs = EdgeConfigResponse.validate_edge_cidrs(self.edge_cidrs)
+        self.public_base_url = EdgeConfigResponse.validate_public_base_url(self.public_base_url)
         self.turn_external_ip = EdgeConfigResponse.validate_turn_ip(self.turn_external_ip)
         self.tcp_relay_url = EdgeConfigResponse.validate_tcp_relay_url(self.tcp_relay_url)
         self.tcp_relay_status_url_template = EdgeConfigResponse.validate_tcp_relay_status_url_template(
             self.tcp_relay_status_url_template
+        )
+        self.runner_execute_url = EdgeConfigResponse.validate_runner_execute_url(self.runner_execute_url)
+        self.runner_status_url_template = EdgeConfigResponse.validate_runner_status_url_template(
+            self.runner_status_url_template
         )
         return self
 
@@ -1009,6 +1035,7 @@ class ClientSessionStartPayload(BaseModel):
     """
 
     requested_duration_seconds: Optional[int] = Field(default=None, ge=60, le=24 * 60 * 60)
+    invite_code: Optional[str] = Field(default=None, min_length=4, max_length=128)
 
 
 class ClientSessionRecord(BaseModel):
@@ -1025,7 +1052,7 @@ class ClientSessionRecord(BaseModel):
 
 
 class ClientSessionStartResponse(ClientSessionRecord):
-    token: str
+    token: Optional[str] = None
 
 
 class ClientSessionHeartbeatResponse(ClientSessionRecord):
@@ -1036,7 +1063,58 @@ class ClientSessionEndResponse(ClientSessionRecord):
     end_reason: Optional[str] = None
 
 
+class ClientSessionInviteCreatePayload(BaseModel):
+    ttl_seconds: Optional[int] = Field(default=None, ge=60, le=60 * 60 * 24 * 90)
+    expires_at: Optional[str] = Field(default=None, max_length=64)
+    requested_duration_seconds: Optional[int] = Field(default=None, ge=60, le=24 * 60 * 60)
+    allowed_orchestrators: Optional[List[str]] = Field(default=None)
+    note: Optional[str] = Field(default=None, max_length=256)
+
+    @model_validator(mode="after")
+    def validate_expiration(self):  # type: ignore[override]
+        if self.ttl_seconds is not None and self.expires_at:
+            raise ValueError("Provide ttl_seconds or expires_at, not both")
+        return self
+
+
+class ClientSessionInviteCreateResponse(BaseModel):
+    invite_id: str
+    code: str
+    created_at: str
+    expires_at: Optional[str]
+    requested_duration_seconds: Optional[int] = None
+    allowed_orchestrators: List[str] = Field(default_factory=list)
+    note: Optional[str] = None
+
+
+class ClientSessionInviteRecord(BaseModel):
+    invite_id: str
+    created_at: str
+    expires_at: Optional[str]
+    requested_duration_seconds: Optional[int] = None
+    allowed_orchestrators: List[str] = Field(default_factory=list)
+    note: Optional[str] = None
+    revoked_at: Optional[str] = None
+    redeeming_at: Optional[str] = None
+    redeemed_at: Optional[str] = None
+    redeemed_ip: Optional[str] = None
+    redeemed_session_id: Optional[str] = None
+
+
+class ClientSessionInviteListResponse(BaseModel):
+    invites: List[ClientSessionInviteRecord]
+
+
+class ClientSessionInviteRevokePayload(BaseModel):
+    invite_id: str = Field(min_length=1, max_length=128)
+
+
+class ClientSessionActionPayload(BaseModel):
+    session_id: Optional[str] = Field(default=None, min_length=1, max_length=128)
+
+
 class ClientSessionTcpPayload(BaseModel):
+    session_id: Optional[str] = Field(default=None, min_length=1, max_length=128)
     command: str = Field(min_length=1, max_length=1024)
     timeout_seconds: int = Field(default=20, ge=1, le=120)
 
@@ -1138,11 +1216,18 @@ def create_app(
     client_session_store = ClientSessionStore(
         Path(getattr(settings, "client_sessions_path", data_dir / "client_sessions.json"))
     )
+    client_session_invites = ClientSessionInviteStore(
+        Path(getattr(settings, "client_session_invites_path", data_dir / "client_session_invites.json"))
+    )
     client_session_seconds = int(getattr(settings, "client_session_seconds", 24 * 60 * 60) or (24 * 60 * 60))
     if client_session_seconds < 60:
         client_session_seconds = 60
     if client_session_seconds > 24 * 60 * 60:
         client_session_seconds = 24 * 60 * 60
+    client_session_require_invite = bool(getattr(settings, "client_session_require_invite", False))
+    client_session_invite_default_ttl_seconds = int(
+        getattr(settings, "client_session_invite_default_ttl_seconds", 7 * 24 * 60 * 60) or (7 * 24 * 60 * 60)
+    )
     client_session_tcp_allow_direct_orchestrator = bool(
         getattr(settings, "client_session_tcp_allow_direct_orchestrator", False)
     )
@@ -1821,17 +1906,35 @@ def create_app(
             )
         return info
 
-    async def require_client_session(request: Request) -> Dict[str, Any]:
-        token = _provided_client_session_token(request)
-        if not token:
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Session token required")
-        session = client_session_store.authenticate(token)
-        if not session:
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Session token invalid or expired")
+    async def require_client_session(
+        request: Request,
+        *,
+        session_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
         caller_ip = request_ip(request)
+        if not caller_ip:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Client IP unavailable")
+
+        token = _provided_client_session_token(request)
+        if token:
+            session = client_session_store.authenticate(token)
+            if not session:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Session token invalid or expired",
+                )
+        elif session_id:
+            session = client_session_store.find_active_by_session_id(session_id)
+            if not session:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
+        else:
+            session = client_session_store.find_active_by_client_ip(caller_ip)
+            if not session:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
+
         expected_ip = str(session.get("client_ip") or "")
         if not caller_ip or not expected_ip or caller_ip != expected_ip:
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Session token bound to different IP")
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Session bound to different IP")
         return session
 
     async def require_session_reporter(request: Request) -> None:
@@ -1995,8 +2098,14 @@ def create_app(
         return matched
 
     def _webrtc_url_for_edge(edge: EdgeConfigResponse) -> str:
+        public_base_url = str(edge.public_base_url or "").strip()
+        if public_base_url:
+            return public_base_url
         host = edge.matchmaker_host.strip()
         port = int(edge.matchmaker_port)
+        if port == 8889:
+            # Legacy edge assignments store the matchmaker registration port, not the public player port.
+            return f"https://{host}"
         if port in (80, 443):
             scheme = "https" if port == 443 else "http"
             return f"{scheme}://{host}"
@@ -2266,7 +2375,11 @@ def create_app(
         selected = min(candidates, key=rank)
         return str(selected["orchestrator_id"])
 
-    async def _select_client_session_orchestrator(request: Request) -> str:
+    async def _select_client_session_orchestrator(
+        request: Request,
+        *,
+        allowed_orchestrator_ids: Optional[set[str]] = None,
+    ) -> str:
         now = datetime.now(timezone.utc)
         caller_ip = request_ip(request)
         reserved_matches = _client_reserved_orchestrators(caller_ip)
@@ -2276,6 +2389,8 @@ def create_app(
         candidates: List[Dict[str, Any]] = []
         for orchestrator_id in sorted(all_records.keys()):
             if client_session_allowed_orchestrators and orchestrator_id not in client_session_allowed_orchestrators:
+                continue
+            if allowed_orchestrator_ids is not None and orchestrator_id not in allowed_orchestrator_ids:
                 continue
             record = all_records.get(orchestrator_id)
             if not isinstance(record, dict):
@@ -3087,9 +3202,12 @@ def create_app(
             matchmaker_host=payload.matchmaker_host,
             matchmaker_port=payload.matchmaker_port,
             edge_cidrs=payload.edge_cidrs,
+            public_base_url=payload.public_base_url,
             turn_external_ip=payload.turn_external_ip,
             tcp_relay_url=payload.tcp_relay_url,
             tcp_relay_status_url_template=payload.tcp_relay_status_url_template,
+            runner_execute_url=payload.runner_execute_url,
+            runner_status_url_template=payload.runner_status_url_template,
         ).model_dump()
         _write_edge_assignments(data)
         return {"ok": True, "orchestrator_id": payload.orchestrator_id}
@@ -4774,6 +4892,90 @@ def create_app(
                     raise HTTPException(status_code=status.HTTP_504_GATEWAY_TIMEOUT, detail="Edge relay did not complete in time")
                 return execution_id, final_state
 
+        runner_execute_url = str(edge.runner_execute_url or "").strip()
+        runner_status_template = str(edge.runner_status_url_template or "").strip()
+        if runner_execute_url:
+            runner_payload = {
+                "session_id": execution_id,
+                "commands": [
+                    {
+                        "delay_ms": 0,
+                        "type": "tcp",
+                        "value": command,
+                    }
+                ],
+            }
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                try:
+                    execute_resp = await client.post(runner_execute_url, json=runner_payload)
+                except httpx.RequestError:
+                    raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Runner endpoint unreachable")
+
+                if execute_resp.status_code == 409:
+                    raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Orchestrator command runner busy")
+                if execute_resp.status_code >= 400:
+                    raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Runner rejected command")
+
+                final_state = "pending"
+                try:
+                    execute_body = execute_resp.json()
+                except Exception:
+                    execute_body = {}
+                if isinstance(execute_body, dict):
+                    maybe_session_id = str(execute_body.get("session_id") or "").strip()
+                    if maybe_session_id:
+                        execution_id = maybe_session_id
+                    final_state = str(execute_body.get("state") or "").strip().lower() or "pending"
+
+                if final_state == "failed":
+                    raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Runner failed to execute command")
+                if final_state == "completed":
+                    return execution_id, final_state
+
+                status_url: Optional[str] = None
+                if runner_status_template:
+                    try:
+                        status_url = runner_status_template.format(
+                            execution_id=execution_id,
+                            session_id=execution_id,
+                            orchestrator_id=orchestrator_id,
+                            edge_id=edge.edge_id,
+                        )
+                    except Exception:
+                        status_url = None
+
+                if not status_url:
+                    raise HTTPException(
+                        status_code=status.HTTP_502_BAD_GATEWAY,
+                        detail="Runner status URL not configured for this orchestrator",
+                    )
+
+                deadline = time.monotonic() + max(1, int(timeout_seconds))
+                while time.monotonic() < deadline:
+                    try:
+                        status_resp = await client.get(status_url)
+                    except httpx.RequestError:
+                        await asyncio.sleep(0.25)
+                        continue
+                    if status_resp.status_code != 200:
+                        await asyncio.sleep(0.25)
+                        continue
+                    try:
+                        body = status_resp.json()
+                    except Exception:
+                        await asyncio.sleep(0.25)
+                        continue
+                    final_state = str(body.get("state") or "").strip().lower() or "pending"
+                    if final_state in {"completed", "failed"}:
+                        break
+                    await asyncio.sleep(0.25)
+
+                if final_state == "failed":
+                    raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Runner failed to execute command")
+                if final_state != "completed":
+                    raise HTTPException(status_code=status.HTTP_504_GATEWAY_TIMEOUT, detail="Runner did not complete in time")
+                return execution_id, final_state
+
         if not client_session_tcp_allow_direct_orchestrator:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -4833,7 +5035,11 @@ def create_app(
                 raise HTTPException(status_code=status.HTTP_504_GATEWAY_TIMEOUT, detail="Runner did not complete in time")
         return execution_id, final_state
 
-    @app.post("/api/sessions/start", response_model=ClientSessionStartResponse)
+    @app.post(
+        "/api/sessions/start",
+        response_model=ClientSessionStartResponse,
+        response_model_exclude_none=True,
+    )
     async def start_client_session(
         request: Request,
         payload: Optional[ClientSessionStartPayload] = None,
@@ -4844,44 +5050,42 @@ def create_app(
 
         requested_seconds = payload.requested_duration_seconds if payload is not None else None
         lease_seconds = _resolve_client_session_seconds(requested_seconds)
+        invite_code = (payload.invite_code if payload is not None else None) or None
 
         async with client_session_allocation_lock:
             existing = client_session_store.find_active_by_client_ip(caller_ip)
             if existing:
-                rotated = client_session_store.rotate_token(str(existing.get("session_id") or ""))
-                if rotated:
-                    existing = rotated
-                    session_model = _to_client_session_record(existing, request=request)
-                    try:
-                        remaining_seconds = lease_seconds
-                        expires_at = existing.get("expires_at")
-                        if isinstance(expires_at, str) and expires_at:
-                            remaining_seconds = max(
-                                30,
-                                int(
-                                    max(
-                                        0.0,
-                                        (
-                                            parse_client_session_iso8601(expires_at) - datetime.now(timezone.utc)
-                                        ).total_seconds(),
-                                    )
-                                ),
-                            )
-                        activity_leases.upsert(
-                            lease_id=f"client_session:{session_model.session_id}",
-                            orchestrator_id=session_model.orchestrator_id,
-                            upstream_addr=session_model.edge.matchmaker_host,
-                            kind="client_session",
-                            client_ip=caller_ip,
-                            lease_seconds=remaining_seconds,
-                            metadata={"session_id": session_model.session_id},
+                refreshed = client_session_store.heartbeat(str(existing.get("session_id") or ""), client_ip=caller_ip)
+                if refreshed:
+                    existing = refreshed
+                session_model = _to_client_session_record(existing, request=request)
+                try:
+                    remaining_seconds = lease_seconds
+                    expires_at = existing.get("expires_at")
+                    if isinstance(expires_at, str) and expires_at:
+                        remaining_seconds = max(
+                            30,
+                            int(
+                                max(
+                                    0.0,
+                                    (
+                                        parse_client_session_iso8601(expires_at) - datetime.now(timezone.utc)
+                                    ).total_seconds(),
+                                )
+                            ),
                         )
-                    except Exception:
-                        pass
-                    return ClientSessionStartResponse(
-                        **session_model.model_dump(),
-                        token=str(existing.get("token") or ""),
+                    activity_leases.upsert(
+                        lease_id=f"client_session:{session_model.session_id}",
+                        orchestrator_id=session_model.orchestrator_id,
+                        upstream_addr=session_model.edge.matchmaker_host,
+                        kind="client_session",
+                        client_ip=caller_ip,
+                        lease_seconds=remaining_seconds,
+                        metadata={"session_id": session_model.session_id},
                     )
+                except Exception:
+                    pass
+                return ClientSessionStartResponse(**session_model.model_dump())
 
             pinned = client_session_store.find_unexpired_by_client_ip(caller_ip)
             if pinned:
@@ -4938,62 +5142,177 @@ def create_app(
                     pass
 
                 session_model = _to_client_session_record(issued, request=request)
-                return ClientSessionStartResponse(
-                    **session_model.model_dump(),
-                    token=str(issued.get("token") or ""),
-                )
+                return ClientSessionStartResponse(**session_model.model_dump())
 
-            selected_orchestrator_id = await _select_client_session_orchestrator(request)
-            edge = _edge_assignment_for(selected_orchestrator_id)
-            issued = client_session_store.issue(
-                orchestrator_id=selected_orchestrator_id,
-                client_ip=caller_ip,
-                lease_seconds=lease_seconds,
-                metadata={"source": "api_sessions_start"},
-            )
-            session_id = str(issued.get("session_id") or "")
+            invite_record: Optional[Dict[str, Any]] = None
+            invite_id = ""
+            allowed_orchestrator_ids: Optional[set[str]] = None
+            if invite_code:
+                try:
+                    invite_record = client_session_invites.reserve(invite_code, client_ip=caller_ip)
+                except KeyError:
+                    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Client session invite not found")
+                except TimeoutError:
+                    raise HTTPException(status_code=status.HTTP_410_GONE, detail="Client session invite expired")
+                except PermissionError:
+                    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Client session invite revoked")
+                except FileExistsError:
+                    raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Client session invite already redeemed")
+                except RuntimeError:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail="Client session invite redemption already in progress",
+                    )
+            elif client_session_require_invite:
+                raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Client session invite code required")
+
+            if invite_record:
+                invite_id = str(invite_record.get("invite_id") or "")
+                invite_lease_seconds = invite_record.get("requested_duration_seconds")
+                if invite_lease_seconds is not None:
+                    lease_seconds = min(lease_seconds, _resolve_client_session_seconds(int(invite_lease_seconds)))
+                raw_allowed = invite_record.get("allowed_orchestrators") or []
+                allowed_orchestrator_ids = {
+                    str(orchestrator_id).strip()
+                    for orchestrator_id in raw_allowed
+                    if str(orchestrator_id).strip()
+                } or None
+
             try:
-                activity_leases.upsert(
-                    lease_id=f"client_session:{session_id}",
+                selected_orchestrator_id = await _select_client_session_orchestrator(
+                    request,
+                    allowed_orchestrator_ids=allowed_orchestrator_ids,
+                )
+                edge = _edge_assignment_for(selected_orchestrator_id)
+                issued = client_session_store.issue(
                     orchestrator_id=selected_orchestrator_id,
-                    upstream_addr=edge.matchmaker_host,
-                    kind="client_session",
                     client_ip=caller_ip,
                     lease_seconds=lease_seconds,
-                    metadata={"session_id": session_id},
+                    metadata={
+                        "source": "api_sessions_start",
+                        **({"invite_id": invite_id} if invite_id else {}),
+                    },
                 )
-            except Exception:
-                pass
-            try:
-                registry.record_contact(
-                    selected_orchestrator_id,
-                    source="client_session",
-                    ip=None,
-                )
-            except Exception:
-                pass
+                session_id = str(issued.get("session_id") or "")
+                if invite_id:
+                    client_session_invites.commit(invite_id=invite_id, session_id=session_id, client_ip=caller_ip)
+                try:
+                    activity_leases.upsert(
+                        lease_id=f"client_session:{session_id}",
+                        orchestrator_id=selected_orchestrator_id,
+                        upstream_addr=edge.matchmaker_host,
+                        kind="client_session",
+                        client_ip=caller_ip,
+                        lease_seconds=lease_seconds,
+                        metadata={"session_id": session_id},
+                    )
+                except Exception:
+                    pass
+                try:
+                    registry.record_contact(
+                        selected_orchestrator_id,
+                        source="client_session",
+                        ip=None,
+                    )
+                except Exception:
+                    pass
 
-            session_model = _to_client_session_record(issued, request=request)
-            return ClientSessionStartResponse(
-                **session_model.model_dump(),
-                token=str(issued.get("token") or ""),
+                session_model = _to_client_session_record(issued, request=request)
+                return ClientSessionStartResponse(**session_model.model_dump())
+            except Exception:
+                if invite_id:
+                    client_session_invites.release(invite_id)
+                raise
+
+    @app.post(
+        "/api/client-sessions/invites",
+        response_model=ClientSessionInviteCreateResponse,
+        response_model_exclude_none=True,
+    )
+    async def create_client_session_invite(
+        payload: ClientSessionInviteCreatePayload,
+        _: Any = Depends(require_admin),
+    ) -> ClientSessionInviteCreateResponse:
+        expires_at: Optional[datetime] = None
+        if payload.expires_at:
+            try:
+                expires_at = parse_client_session_iso8601(payload.expires_at)
+            except ValueError:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid expires_at timestamp")
+        else:
+            ttl = payload.ttl_seconds if payload.ttl_seconds is not None else client_session_invite_default_ttl_seconds
+            expires_at = datetime.now(timezone.utc) + timedelta(seconds=ttl)
+
+        created = client_session_invites.create(
+            expires_at=expires_at,
+            requested_duration_seconds=payload.requested_duration_seconds,
+            allowed_orchestrators=payload.allowed_orchestrators,
+            note=payload.note,
+        )
+        return ClientSessionInviteCreateResponse(
+            invite_id=str(created.get("invite_id", "")),
+            code=str(created.get("code", "")),
+            created_at=str(created.get("created_at", "")),
+            expires_at=created.get("expires_at"),
+            requested_duration_seconds=created.get("requested_duration_seconds"),
+            allowed_orchestrators=list(created.get("allowed_orchestrators") or []),
+            note=created.get("note"),
+        )
+
+    @app.get(
+        "/api/client-sessions/invites",
+        response_model=ClientSessionInviteListResponse,
+        response_model_exclude_none=True,
+    )
+    async def list_client_session_invites(_: Any = Depends(require_admin)) -> ClientSessionInviteListResponse:
+        invites: List[ClientSessionInviteRecord] = []
+        for item in client_session_invites.list():
+            if not isinstance(item, dict):
+                continue
+            invites.append(
+                ClientSessionInviteRecord(
+                    invite_id=str(item.get("invite_id", "")),
+                    created_at=str(item.get("created_at", "")),
+                    expires_at=item.get("expires_at"),
+                    requested_duration_seconds=item.get("requested_duration_seconds"),
+                    allowed_orchestrators=list(item.get("allowed_orchestrators") or []),
+                    note=item.get("note"),
+                    revoked_at=item.get("revoked_at"),
+                    redeeming_at=item.get("redeeming_at"),
+                    redeemed_at=item.get("redeemed_at"),
+                    redeemed_ip=item.get("redeemed_ip"),
+                    redeemed_session_id=item.get("redeemed_session_id"),
+                )
             )
+        return ClientSessionInviteListResponse(invites=invites)
+
+    @app.post("/api/client-sessions/invites/revoke", response_model=Dict[str, Any])
+    async def revoke_client_session_invite(
+        payload: ClientSessionInviteRevokePayload,
+        _: Any = Depends(require_admin),
+    ) -> Dict[str, Any]:
+        ok = client_session_invites.revoke(payload.invite_id)
+        if not ok:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Client session invite not found")
+        return {"ok": True}
 
     @app.get("/api/sessions/me", response_model=ClientSessionRecord)
     async def get_client_session(
         request: Request,
-        session: Dict[str, Any] = Depends(require_client_session),
     ) -> ClientSessionRecord:
+        session = await require_client_session(request)
         return _to_client_session_record(session, request=request)
 
     @app.post("/api/sessions/heartbeat", response_model=ClientSessionHeartbeatResponse)
     async def heartbeat_client_session(
         request: Request,
-        session: Dict[str, Any] = Depends(require_client_session),
+        payload: Optional[ClientSessionActionPayload] = None,
     ) -> ClientSessionHeartbeatResponse:
+        session = await require_client_session(
+            request,
+            session_id=payload.session_id if payload is not None else None,
+        )
         caller_ip = request_ip(request)
-        if not caller_ip:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Client IP unavailable")
         session_id = str(session.get("session_id") or "")
         updated = client_session_store.heartbeat(session_id, client_ip=caller_ip)
         if updated is None:
@@ -5032,8 +5351,12 @@ def create_app(
     @app.post("/api/sessions/end", response_model=ClientSessionEndResponse)
     async def end_client_session(
         request: Request,
-        session: Dict[str, Any] = Depends(require_client_session),
+        payload: Optional[ClientSessionActionPayload] = None,
     ) -> ClientSessionEndResponse:
+        session = await require_client_session(
+            request,
+            session_id=payload.session_id if payload is not None else None,
+        )
         session_id = str(session.get("session_id") or "")
         ended = client_session_store.end(session_id, reason="client_end")
         if ended is None:
@@ -5050,9 +5373,10 @@ def create_app(
 
     @app.post("/api/sessions/tcp", response_model=ClientSessionTcpResponse)
     async def send_client_session_tcp(
+        request: Request,
         payload: ClientSessionTcpPayload,
-        session: Dict[str, Any] = Depends(require_client_session),
     ) -> ClientSessionTcpResponse:
+        session = await require_client_session(request, session_id=payload.session_id)
         orchestrator_id = str(session.get("orchestrator_id") or "")
         if not orchestrator_id:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Session missing orchestrator")
