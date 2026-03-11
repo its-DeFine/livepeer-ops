@@ -2,6 +2,19 @@
 
 FastAPI service that tracks orchestrator registrations, balances, and workload credits.
 
+## Harness Entry
+
+For non-trivial repo work, read these in order before touching code or docs:
+
+1. `AGENTS.md`
+2. `README.md`
+3. `docs/overview.md`
+4. `WORKFLOW.md`
+5. `VERIFY.md`
+6. `docs/harness-baseline.md`
+
+Then inspect only the exact surface you plan to change. Harness-only work here is documentation-first; do not widen into backend, ops, or runtime behavior unless the task explicitly requires it.
+
 ## What this enables
 
 This repo is a self-hosted ops backend for Livepeer participants. It can be used to:
