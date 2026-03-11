@@ -123,6 +123,8 @@ class ClientSessionStore:
         orchestrator_id: str,
         client_ip: str,
         lease_seconds: int,
+        installation_id: Optional[str] = None,
+        installation_public_fingerprint: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         now = utcnow()
@@ -134,6 +136,8 @@ class ClientSessionStore:
             "session_id": session_id,
             "orchestrator_id": orchestrator_id,
             "client_ip": client_ip,
+            "installation_id": installation_id,
+            "installation_public_fingerprint": installation_public_fingerprint,
             "issued_at": issued_at,
             "last_seen_at": issued_at,
             "expires_at": expires_at,
@@ -181,6 +185,29 @@ class ClientSessionStore:
                 if not isinstance(record, dict):
                     continue
                 if str(record.get("client_ip") or "") != client_ip:
+                    continue
+                if not self._is_active_record(record, now=now):
+                    continue
+                if selected is None:
+                    selected = dict(record)
+                    continue
+                current = str(selected.get("issued_at") or "")
+                candidate = str(record.get("issued_at") or "")
+                if candidate > current:
+                    selected = dict(record)
+            if changed:
+                self._persist()
+            return selected
+
+    def find_active_by_installation_id(self, installation_id: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            now = utcnow()
+            changed = self._close_expired_locked(now=now)
+            selected: Optional[Dict[str, Any]] = None
+            for _, record in self._records.items():
+                if not isinstance(record, dict):
+                    continue
+                if str(record.get("installation_id") or "") != installation_id:
                     continue
                 if not self._is_active_record(record, now=now):
                     continue
@@ -253,6 +280,23 @@ class ClientSessionStore:
             if changed:
                 self._persist()
             return False
+
+    def count_active_by_mode(self, session_mode: str) -> int:
+        with self._lock:
+            now = utcnow()
+            changed = self._close_expired_locked(now=now)
+            count = 0
+            for _, record in self._records.items():
+                if not isinstance(record, dict):
+                    continue
+                metadata = record.get("metadata") or {}
+                if str(metadata.get("session_mode") or "") != session_mode:
+                    continue
+                if self._is_active_record(record, now=now):
+                    count += 1
+            if changed:
+                self._persist()
+            return count
 
     def rotate_token(self, session_id: str) -> Optional[Dict[str, Any]]:
         with self._lock:

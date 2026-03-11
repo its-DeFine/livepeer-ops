@@ -1896,6 +1896,295 @@ async def test_client_session_invite_can_restrict_orchestrators(temp_paths):
 
 
 @pytest.mark.anyio("asyncio")
+async def test_client_session_guest_bootstrap_requires_installation_id(temp_paths):
+    balances_path, _ = temp_paths
+    edge_assignments_path = balances_path.parent / "edge_assignments.json"
+    edge_assignments_path.write_text(
+        json.dumps(
+            {
+                "orch-guest": {
+                    "edge_id": "edge-guest",
+                    "matchmaker_host": "edge-guest.example.com",
+                    "matchmaker_port": 443,
+                    "edge_cidrs": ["10.24.0.0/24"],
+                }
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    registry, ledger = build_registry(temp_paths)
+    address = "0x" + "2" * 40
+    with patch.object(Registry, "_resolve_top_set", return_value={address.lower()}):
+        registry.register(
+            orchestrator_id="orch-guest",
+            address=address,
+            metadata={"host_public_ip": "8.8.8.8"},
+        )
+
+    settings = build_settings(
+        temp_paths,
+        edge_assignments_path=edge_assignments_path,
+        client_session_allowed_orchestrators=["orch-guest"],
+        client_session_guest_mode_enabled=True,
+        ip_geo_overrides={
+            "198.51.100.80": {"lat": 0.0, "lon": 0.0},
+            "8.8.8.8": {"lat": 0.0, "lon": 0.0},
+        },
+    )
+    app = create_app(registry, ledger, settings)
+    transport = httpx.ASGITransport(app=app, client=("198.51.100.80", 12345))
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        start = await client.post("/api/sessions/start", json={})
+
+    assert start.status_code == 400
+    assert "installation_id" in start.json()["detail"]
+
+
+@pytest.mark.anyio("asyncio")
+async def test_client_session_guest_bootstrap_start_and_reuse_by_installation(temp_paths):
+    balances_path, _ = temp_paths
+    edge_assignments_path = balances_path.parent / "edge_assignments.json"
+    edge_assignments_path.write_text(
+        json.dumps(
+            {
+                "orch-guest": {
+                    "edge_id": "edge-guest",
+                    "matchmaker_host": "edge-guest.example.com",
+                    "matchmaker_port": 443,
+                    "edge_cidrs": ["10.25.0.0/24"],
+                }
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    registry, ledger = build_registry(temp_paths)
+    address = "0x" + "3" * 40
+    with patch.object(Registry, "_resolve_top_set", return_value={address.lower()}):
+        registry.register(
+            orchestrator_id="orch-guest",
+            address=address,
+            metadata={"host_public_ip": "8.8.8.8"},
+        )
+
+    settings = build_settings(
+        temp_paths,
+        edge_assignments_path=edge_assignments_path,
+        client_session_allowed_orchestrators=["orch-guest"],
+        client_session_guest_mode_enabled=True,
+        client_session_guest_ttl_seconds=1200,
+        ip_geo_overrides={
+            "198.51.100.81": {"lat": 0.0, "lon": 0.0},
+            "8.8.8.8": {"lat": 0.0, "lon": 0.0},
+        },
+    )
+    app = create_app(registry, ledger, settings)
+    transport = httpx.ASGITransport(app=app, client=("198.51.100.81", 12345))
+
+    payload = {
+        "installation_id": "install-alpha",
+        "installation_public_fingerprint": "f" * 64,
+        "bootstrap_manifest_version": "1.0.0-alpha",
+    }
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        first = await client.post("/api/sessions/start", json=payload)
+        second = await client.post("/api/sessions/start", json=payload)
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    first_body = first.json()
+    second_body = second.json()
+    assert first_body["mode"] == "guest"
+    assert first_body["installation_id"] == "install-alpha"
+    assert first_body["command_mode"] == "datachannel"
+    assert first_body["command_method"] == "emitCommand"
+    assert first_body["session_id"] == second_body["session_id"]
+
+
+@pytest.mark.anyio("asyncio")
+async def test_client_session_guest_bootstrap_conflicts_for_second_installation_same_ip(temp_paths):
+    balances_path, _ = temp_paths
+    edge_assignments_path = balances_path.parent / "edge_assignments.json"
+    edge_assignments_path.write_text(
+        json.dumps(
+            {
+                "orch-guest": {
+                    "edge_id": "edge-guest",
+                    "matchmaker_host": "edge-guest.example.com",
+                    "matchmaker_port": 443,
+                    "edge_cidrs": ["10.26.0.0/24"],
+                }
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    registry, ledger = build_registry(temp_paths)
+    address = "0x" + "4" * 40
+    with patch.object(Registry, "_resolve_top_set", return_value={address.lower()}):
+        registry.register(
+            orchestrator_id="orch-guest",
+            address=address,
+            metadata={"host_public_ip": "8.8.8.8"},
+        )
+
+    settings = build_settings(
+        temp_paths,
+        edge_assignments_path=edge_assignments_path,
+        client_session_allowed_orchestrators=["orch-guest"],
+        client_session_guest_mode_enabled=True,
+        ip_geo_overrides={
+            "198.51.100.82": {"lat": 0.0, "lon": 0.0},
+            "8.8.8.8": {"lat": 0.0, "lon": 0.0},
+        },
+    )
+    app = create_app(registry, ledger, settings)
+    transport = httpx.ASGITransport(app=app, client=("198.51.100.82", 12345))
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        first = await client.post(
+            "/api/sessions/start",
+            json={"installation_id": "install-a", "installation_public_fingerprint": "a" * 64},
+        )
+        second = await client.post(
+            "/api/sessions/start",
+            json={"installation_id": "install-b", "installation_public_fingerprint": "b" * 64},
+        )
+
+    assert first.status_code == 200
+    assert second.status_code == 409
+    assert "active session on this ip" in second.json()["detail"].lower()
+
+
+@pytest.mark.anyio("asyncio")
+async def test_client_session_guest_bootstrap_capacity_bound(temp_paths):
+    balances_path, _ = temp_paths
+    edge_assignments_path = balances_path.parent / "edge_assignments.json"
+    edge_assignments_path.write_text(
+        json.dumps(
+            {
+                "orch-a": {
+                    "edge_id": "edge-a",
+                    "matchmaker_host": "edge-a.example.com",
+                    "matchmaker_port": 443,
+                    "edge_cidrs": ["10.27.0.0/24"],
+                },
+                "orch-b": {
+                    "edge_id": "edge-b",
+                    "matchmaker_host": "edge-b.example.com",
+                    "matchmaker_port": 443,
+                    "edge_cidrs": ["10.28.0.0/24"],
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    registry, ledger = build_registry(temp_paths)
+    address_a = "0x" + "5" * 40
+    address_b = "0x" + "6" * 40
+    with patch.object(Registry, "_resolve_top_set", return_value={address_a.lower(), address_b.lower()}):
+        registry.register(
+            orchestrator_id="orch-a",
+            address=address_a,
+            metadata={"host_public_ip": "8.8.8.8"},
+        )
+        registry.register(
+            orchestrator_id="orch-b",
+            address=address_b,
+            metadata={"host_public_ip": "1.1.1.1"},
+        )
+
+    settings = build_settings(
+        temp_paths,
+        edge_assignments_path=edge_assignments_path,
+        client_session_allowed_orchestrators=["orch-a", "orch-b"],
+        client_session_guest_mode_enabled=True,
+        client_session_guest_max_concurrent=1,
+        ip_geo_overrides={
+            "198.51.100.83": {"lat": 0.0, "lon": 0.0},
+            "198.51.100.84": {"lat": 0.0, "lon": 0.0},
+            "8.8.8.8": {"lat": 0.0, "lon": 0.0},
+            "1.1.1.1": {"lat": 0.2, "lon": 0.2},
+        },
+    )
+    app = create_app(registry, ledger, settings)
+    first_transport = httpx.ASGITransport(app=app, client=("198.51.100.83", 12345))
+    second_transport = httpx.ASGITransport(app=app, client=("198.51.100.84", 12346))
+
+    async with httpx.AsyncClient(transport=first_transport, base_url="http://test") as client:
+        first = await client.post(
+            "/api/sessions/start",
+            json={"installation_id": "install-a", "installation_public_fingerprint": "a" * 64},
+        )
+    assert first.status_code == 200
+
+    async with httpx.AsyncClient(transport=second_transport, base_url="http://test") as client:
+        second = await client.post(
+            "/api/sessions/start",
+            json={"installation_id": "install-b", "installation_public_fingerprint": "b" * 64},
+        )
+    assert second.status_code == 503
+    assert "available" in second.json()["detail"].lower()
+
+
+@pytest.mark.anyio("asyncio")
+async def test_skillmd_bootstrap_manifest_endpoint(temp_paths):
+    balances_path, _ = temp_paths
+    edge_assignments_path = balances_path.parent / "edge_assignments.json"
+    edge_assignments_path.write_text(
+        json.dumps(
+            {
+                "orch-a": {
+                    "edge_id": "edge-a",
+                    "matchmaker_host": "edge-a.example.com",
+                    "matchmaker_port": 443,
+                    "edge_cidrs": ["10.29.0.0/24"],
+                }
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    registry, ledger = build_registry(temp_paths)
+    address = "0x" + "7" * 40
+    with patch.object(Registry, "_resolve_top_set", return_value={address.lower()}):
+        registry.register(
+            orchestrator_id="orch-a",
+            address=address,
+            metadata={"host_public_ip": "8.8.8.8"},
+        )
+
+    settings = build_settings(
+        temp_paths,
+        edge_assignments_path=edge_assignments_path,
+        client_session_allowed_orchestrators=["orch-a"],
+        client_session_guest_mode_enabled=True,
+    )
+    app = create_app(registry, ledger, settings)
+    transport = httpx.ASGITransport(app=app, client=("198.51.100.85", 12345))
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/api/bootstrap/skillmd")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["mode"] == "guest_bootstrap"
+    assert body["base_url"] == "http://test"
+    assert body["transport"]["primary"] == "pixelstreaming_datachannel_emitcommand"
+    assert body["webrtc"]["command_method"] == "emitCommand"
+    assert body["capacity"]["max_concurrent_sessions"] == 1
+
+
+@pytest.mark.anyio("asyncio")
 async def test_client_session_tcp_command_proxy(temp_paths):
     balances_path, _ = temp_paths
     edge_assignments_path = balances_path.parent / "edge_assignments.json"
