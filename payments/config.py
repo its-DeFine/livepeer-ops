@@ -217,6 +217,26 @@ class PaymentSettings(BaseSettings):
     api_port: int = Field(default=8081, validation_alias="PAYMENTS_API_PORT")
     api_root_path: str = Field(default="", validation_alias="PAYMENTS_API_ROOT_PATH")
     api_admin_token: Optional[str] = Field(default=None, validation_alias="PAYMENTS_API_ADMIN_TOKEN")
+    posthog_project_api_key: Optional[str] = Field(
+        default=None,
+        validation_alias="PAYMENTS_POSTHOG_PROJECT_API_KEY",
+    )
+    posthog_host: str = Field(
+        default="https://us.posthog.com",
+        validation_alias="PAYMENTS_POSTHOG_HOST",
+    )
+    posthog_enabled: Optional[bool] = Field(
+        default=None,
+        validation_alias="PAYMENTS_POSTHOG_ENABLED",
+    )
+    posthog_site_env: str = Field(
+        default="local",
+        validation_alias="PAYMENTS_POSTHOG_SITE_ENV",
+    )
+    posthog_virtual_mode: bool = Field(
+        default=False,
+        validation_alias="PAYMENTS_POSTHOG_VIRTUAL_MODE",
+    )
     ops_approval_hmac_secret: Optional[str] = Field(
         default=None,
         validation_alias="PAYMENTS_OPS_APPROVAL_HMAC_SECRET",
@@ -911,6 +931,15 @@ class PaymentSettings(BaseSettings):
                 candidate = raw_session_token.strip()
                 if candidate:
                     self.session_reporter_token = candidate
+        if self.posthog_project_api_key is not None:
+            candidate = str(self.posthog_project_api_key).strip()
+            self.posthog_project_api_key = candidate or None
+        host_candidate = str(self.posthog_host or "").strip().rstrip("/")
+        self.posthog_host = host_candidate or "https://us.posthog.com"
+        site_env_candidate = str(self.posthog_site_env or "").strip()
+        self.posthog_site_env = site_env_candidate or "local"
+        if self.posthog_enabled is None:
+            self.posthog_enabled = bool(self.posthog_project_api_key)
         if self.credit_unit:
             candidate = self.credit_unit.strip().lower()
             self.credit_unit = candidate or "eth"
