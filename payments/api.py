@@ -1036,6 +1036,11 @@ class ClientSessionStartPayload(BaseModel):
 
     requested_duration_seconds: Optional[int] = Field(default=None, ge=60, le=24 * 60 * 60)
     invite_code: Optional[str] = Field(default=None, min_length=4, max_length=128)
+    installation_id: Optional[str] = Field(default=None, min_length=8, max_length=128)
+    installation_public_fingerprint: Optional[str] = Field(default=None, min_length=16, max_length=256)
+    client_name: Optional[str] = Field(default=None, min_length=1, max_length=128)
+    client_version: Optional[str] = Field(default=None, min_length=1, max_length=64)
+    bootstrap_manifest_version: Optional[str] = Field(default=None, min_length=1, max_length=64)
 
 
 class ClientSessionRecord(BaseModel):
@@ -1049,6 +1054,12 @@ class ClientSessionRecord(BaseModel):
     edge: EdgeConfigResponse
     webrtc_url: str
     control_url: str
+    mode: Optional[str] = None
+    installation_id: Optional[str] = None
+    command_mode: Optional[str] = None
+    command_method: Optional[str] = None
+    capacity_hint: Optional[int] = None
+    policy_version: Optional[str] = None
 
 
 class ClientSessionStartResponse(ClientSessionRecord):
@@ -1225,6 +1236,26 @@ def create_app(
     if client_session_seconds > 24 * 60 * 60:
         client_session_seconds = 24 * 60 * 60
     client_session_require_invite = bool(getattr(settings, "client_session_require_invite", False))
+    client_session_guest_mode_enabled = bool(getattr(settings, "client_session_guest_mode_enabled", False))
+    client_session_guest_ttl_seconds = int(
+        getattr(settings, "client_session_guest_ttl_seconds", 30 * 60) or (30 * 60)
+    )
+    if client_session_guest_ttl_seconds < 60:
+        client_session_guest_ttl_seconds = 60
+    if client_session_guest_ttl_seconds > 24 * 60 * 60:
+        client_session_guest_ttl_seconds = 24 * 60 * 60
+    client_session_guest_max_concurrent = int(getattr(settings, "client_session_guest_max_concurrent", 0) or 0)
+    client_session_guest_max_active_per_installation = int(
+        getattr(settings, "client_session_guest_max_active_per_installation", 1) or 1
+    )
+    client_session_guest_max_active_per_ip = int(getattr(settings, "client_session_guest_max_active_per_ip", 1) or 1)
+    client_session_guest_command_allowlist_version = str(
+        getattr(settings, "client_session_guest_command_allowlist_version", "v1") or "v1"
+    )
+    client_session_bootstrap_manifest_url = str(
+        getattr(settings, "client_session_bootstrap_manifest_url", "https://spec.embody.zone/skillmd/bootstrap/manifest.json")
+        or "https://spec.embody.zone/skillmd/bootstrap/manifest.json"
+    )
     client_session_invite_default_ttl_seconds = int(
         getattr(settings, "client_session_invite_default_ttl_seconds", 7 * 24 * 60 * 60) or (7 * 24 * 60 * 60)
     )
@@ -2155,6 +2186,8 @@ def create_app(
             )
         except Exception:
             lease_seconds = int(client_session_seconds)
+        metadata = session.get("metadata") or {}
+        session_mode = str(metadata.get("session_mode") or "invite")
         return ClientSessionRecord(
             session_id=session_id,
             expires_at=expires_at,
@@ -2166,7 +2199,34 @@ def create_app(
             edge=edge,
             webrtc_url=_webrtc_url_for_edge(edge),
             control_url=control_url,
+            mode=session_mode,
+            installation_id=str(session.get("installation_id") or "") or None,
+            command_mode="datachannel",
+            command_method="emitCommand",
+            capacity_hint=_guest_capacity_limit(),
+            policy_version=client_session_guest_command_allowlist_version if session_mode == "guest" else None,
         )
+
+    def _guest_pool_orchestrator_ids() -> List[str]:
+        now = datetime.now(timezone.utc)
+        all_records = registry.all_records()
+        healthy: List[str] = []
+        for orchestrator_id in sorted(all_records.keys()):
+            if client_session_allowed_orchestrators and orchestrator_id not in client_session_allowed_orchestrators:
+                continue
+            record = all_records.get(orchestrator_id)
+            if not isinstance(record, dict):
+                continue
+            snapshot = _build_orchestrator_record(orchestrator_id, record, now=now)
+            if snapshot.denylisted or snapshot.cooldown_active or not snapshot.eligible_for_payments:
+                continue
+            healthy.append(orchestrator_id)
+        return healthy
+
+    def _guest_capacity_limit() -> int:
+        if client_session_guest_max_concurrent > 0:
+            return client_session_guest_max_concurrent
+        return len(_guest_pool_orchestrator_ids())
 
     geo_lookup_timeout_seconds = float(getattr(settings, "geo_lookup_timeout_seconds", 1.5) or 1.5)
     raw_ip_geo_overrides = getattr(settings, "ip_geo_overrides", None)
@@ -5051,10 +5111,41 @@ def create_app(
         requested_seconds = payload.requested_duration_seconds if payload is not None else None
         lease_seconds = _resolve_client_session_seconds(requested_seconds)
         invite_code = (payload.invite_code if payload is not None else None) or None
+        installation_id = str((payload.installation_id if payload is not None else None) or "").strip()
+        installation_public_fingerprint = str(
+            (payload.installation_public_fingerprint if payload is not None else None) or ""
+        ).strip() or None
+        client_name = str((payload.client_name if payload is not None else None) or "").strip() or None
+        client_version = str((payload.client_version if payload is not None else None) or "").strip() or None
+        bootstrap_manifest_version = str(
+            (payload.bootstrap_manifest_version if payload is not None else None) or ""
+        ).strip() or None
+        guest_mode_requested = not invite_code
+        guest_mode_active = guest_mode_requested and client_session_guest_mode_enabled
+        if guest_mode_active:
+            session_mode = "guest"
+        elif invite_code:
+            session_mode = "invite"
+        else:
+            session_mode = "legacy"
+        if guest_mode_active:
+            if not installation_id:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="installation_id required for guest bootstrap",
+                )
+            lease_seconds = min(lease_seconds, client_session_guest_ttl_seconds)
 
         async with client_session_allocation_lock:
             existing = client_session_store.find_active_by_client_ip(caller_ip)
             if existing:
+                existing_installation_id = str(existing.get("installation_id") or "")
+                if guest_mode_active and client_session_guest_max_active_per_ip <= 1:
+                    if existing_installation_id and installation_id and existing_installation_id != installation_id:
+                        raise HTTPException(
+                            status_code=status.HTTP_409_CONFLICT,
+                            detail="Another installation already has an active session on this IP",
+                        )
                 refreshed = client_session_store.heartbeat(str(existing.get("session_id") or ""), client_ip=caller_ip)
                 if refreshed:
                     existing = refreshed
@@ -5087,6 +5178,19 @@ def create_app(
                     pass
                 return ClientSessionStartResponse(**session_model.model_dump())
 
+            if guest_mode_active:
+                if client_session_guest_max_active_per_installation <= 1:
+                    existing_installation = client_session_store.find_active_by_installation_id(installation_id)
+                    if existing_installation:
+                        existing_installation_ip = str(existing_installation.get("client_ip") or "")
+                        if existing_installation_ip and existing_installation_ip != caller_ip:
+                            raise HTTPException(
+                                status_code=status.HTTP_409_CONFLICT,
+                                detail="Installation already has an active session on another IP",
+                            )
+                        session_model = _to_client_session_record(existing_installation, request=request)
+                        return ClientSessionStartResponse(**session_model.model_dump())
+
             pinned = client_session_store.find_unexpired_by_client_ip(caller_ip)
             if pinned:
                 pinned_orchestrator_id = str(pinned.get("orchestrator_id") or "").strip()
@@ -5114,8 +5218,14 @@ def create_app(
                     orchestrator_id=pinned_orchestrator_id,
                     client_ip=caller_ip,
                     lease_seconds=remaining_seconds,
+                    installation_id=installation_id or None,
+                    installation_public_fingerprint=installation_public_fingerprint,
                     metadata={
                         "source": "api_sessions_start_pinned",
+                        "session_mode": session_mode,
+                        "client_name": client_name,
+                        "client_version": client_version,
+                        "bootstrap_manifest_version": bootstrap_manifest_version,
                         "pinned_from_session_id": str(pinned.get("session_id") or ""),
                     },
                 )
@@ -5179,6 +5289,19 @@ def create_app(
                 } or None
 
             try:
+                if guest_mode_active:
+                    capacity = _guest_capacity_limit()
+                    if capacity <= 0:
+                        raise HTTPException(
+                            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                            detail="No orchestrator currently available",
+                        )
+                    active_guest_sessions = client_session_store.count_active_by_mode("guest")
+                    if active_guest_sessions >= capacity:
+                        raise HTTPException(
+                            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                            detail="No orchestrator currently available",
+                        )
                 selected_orchestrator_id = await _select_client_session_orchestrator(
                     request,
                     allowed_orchestrator_ids=allowed_orchestrator_ids,
@@ -5188,8 +5311,14 @@ def create_app(
                     orchestrator_id=selected_orchestrator_id,
                     client_ip=caller_ip,
                     lease_seconds=lease_seconds,
+                    installation_id=installation_id or None,
+                    installation_public_fingerprint=installation_public_fingerprint,
                     metadata={
                         "source": "api_sessions_start",
+                        "session_mode": session_mode,
+                        "client_name": client_name,
+                        "client_version": client_version,
+                        "bootstrap_manifest_version": bootstrap_manifest_version,
                         **({"invite_id": invite_id} if invite_id else {}),
                     },
                 )
@@ -5295,6 +5424,52 @@ def create_app(
         if not ok:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Client session invite not found")
         return {"ok": True}
+
+    @app.get("/api/bootstrap/skillmd", response_model=Dict[str, Any])
+    async def get_skillmd_bootstrap_manifest(request: Request) -> Dict[str, Any]:
+        base = _external_base_url(request)
+        capacity = _guest_capacity_limit()
+        return {
+            "version": "1.0.0-alpha",
+            "updated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "mode": "guest_bootstrap" if client_session_guest_mode_enabled else "invite_bootstrap",
+            "base_url": base,
+            "session_start_path": "/api/sessions/start",
+            "session_end_path": "/api/sessions/end",
+            "transport": {
+                "primary": "pixelstreaming_datachannel_emitcommand",
+                "fallback": "http_sessions_tcp_admin_only",
+            },
+            "webrtc": {
+                "command_mode": "datachannel",
+                "command_method": "emitCommand",
+                "command_payload_shape": {"command": "CAMSHOT.ExtremeClose"},
+            },
+            "capacity": {
+                "max_concurrent_sessions": capacity,
+                "current_expected_sessions": capacity,
+                "one_orchestrator_per_avatar": True,
+            },
+            "limits": {
+                "default_ttl_seconds": client_session_guest_ttl_seconds,
+                "max_ttl_seconds": client_session_guest_ttl_seconds,
+                "one_active_session_per_installation": client_session_guest_max_active_per_installation == 1,
+                "guest_rate_limited": True,
+            },
+            "features": {
+                "guest_bootstrap": client_session_guest_mode_enabled,
+                "invite_code_required": client_session_require_invite,
+                "login_required": False,
+                "wallet_required": False,
+                "kokoro_supported": True,
+            },
+            "deferred": {
+                "oidc_auth": True,
+                "wallet_linking": True,
+                "managed_agent_identities": True,
+            },
+            "canonical_manifest_url": client_session_bootstrap_manifest_url,
+        }
 
     @app.get("/api/sessions/me", response_model=ClientSessionRecord)
     async def get_client_session(

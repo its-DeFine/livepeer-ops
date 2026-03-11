@@ -324,6 +324,34 @@ class PaymentSettings(BaseSettings):
         default=False,
         validation_alias="PAYMENTS_CLIENT_SESSION_REQUIRE_INVITE",
     )
+    client_session_guest_mode_enabled: bool = Field(
+        default=False,
+        validation_alias="PAYMENTS_CLIENT_SESSION_GUEST_MODE_ENABLED",
+    )
+    client_session_guest_ttl_seconds: int = Field(
+        default=30 * 60,
+        validation_alias="PAYMENTS_CLIENT_SESSION_GUEST_TTL_SECONDS",
+    )
+    client_session_guest_max_concurrent: int = Field(
+        default=0,
+        validation_alias="PAYMENTS_CLIENT_SESSION_GUEST_MAX_CONCURRENT",
+    )
+    client_session_guest_max_active_per_installation: int = Field(
+        default=1,
+        validation_alias="PAYMENTS_CLIENT_SESSION_GUEST_MAX_ACTIVE_PER_INSTALLATION",
+    )
+    client_session_guest_max_active_per_ip: int = Field(
+        default=1,
+        validation_alias="PAYMENTS_CLIENT_SESSION_GUEST_MAX_ACTIVE_PER_IP",
+    )
+    client_session_guest_command_allowlist_version: str = Field(
+        default="v1",
+        validation_alias="PAYMENTS_CLIENT_SESSION_GUEST_COMMAND_ALLOWLIST_VERSION",
+    )
+    client_session_bootstrap_manifest_url: str = Field(
+        default="https://spec.embody.zone/skillmd/bootstrap/manifest.json",
+        validation_alias="PAYMENTS_CLIENT_SESSION_BOOTSTRAP_MANIFEST_URL",
+    )
     client_session_invites_path: Path = Field(
         default=Path("/app/data/client_session_invites.json"),
         validation_alias="PAYMENTS_CLIENT_SESSION_INVITES_PATH",
