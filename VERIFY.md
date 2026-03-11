@@ -33,6 +33,11 @@ Recommended layout:
 
 - Docs-only change:
   - proof is the doc diff plus the command matrix staying grounded in real repo commands
+  - use deterministic doc checks first:
+    - `rg -n 'Harness Entry|WORKFLOW.md|VERIFY.md|docs/harness-baseline.md' README.md`
+    - `rg -n 'Docs-only change|git diff -- README.md VERIFY.md|rg -n' VERIFY.md`
+    - `git diff -- README.md VERIFY.md`
+  - when the diff itself makes the change obvious, `logs/harness/...` is optional rather than required
 - `local-safe` change:
   - proof is the relevant command output captured under `local/` when needed
 - `runtime-required` change:
