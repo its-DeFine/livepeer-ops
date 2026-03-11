@@ -5122,7 +5122,12 @@ def create_app(
         ).strip() or None
         guest_mode_requested = not invite_code
         guest_mode_active = guest_mode_requested and client_session_guest_mode_enabled
-        session_mode = "guest" if guest_mode_active else "invite"
+        if guest_mode_active:
+            session_mode = "guest"
+        elif invite_code:
+            session_mode = "invite"
+        else:
+            session_mode = "legacy"
         if guest_mode_active:
             if not installation_id:
                 raise HTTPException(
@@ -5284,11 +5289,6 @@ def create_app(
                 } or None
 
             try:
-                if guest_mode_requested and not client_session_guest_mode_enabled and not invite_code:
-                    raise HTTPException(
-                        status_code=status.HTTP_401_UNAUTHORIZED,
-                        detail="Client session invite code required",
-                    )
                 if guest_mode_active:
                     capacity = _guest_capacity_limit()
                     if capacity <= 0:
