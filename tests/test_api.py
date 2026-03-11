@@ -73,6 +73,55 @@ def build_settings(temp_paths, **overrides):
     return SimpleNamespace(**defaults)
 
 
+def build_skillmd_posthog_app(
+    temp_paths,
+    *,
+    client_ip: str = "198.51.100.190",
+    upstream_ip: str = "8.8.8.8",
+    tcp_relay_url: str | None = None,
+):
+    balances_path, _ = temp_paths
+    edge_assignments_path = balances_path.parent / "edge_assignments.json"
+    edge_assignment = {
+        "edge_id": "edge-skillmd",
+        "matchmaker_host": "edge-skillmd.example.com",
+        "matchmaker_port": 443,
+        "edge_cidrs": ["10.30.0.0/24"],
+    }
+    if tcp_relay_url:
+        edge_assignment["tcp_relay_url"] = tcp_relay_url
+    edge_assignments_path.write_text(
+        json.dumps({"orch-skillmd": edge_assignment}) + "\n",
+        encoding="utf-8",
+    )
+
+    registry, ledger = build_registry(temp_paths)
+    address = "0x" + "8" * 40
+    with patch.object(Registry, "_resolve_top_set", return_value={address.lower()}):
+        registry.register(
+            orchestrator_id="orch-skillmd",
+            address=address,
+            metadata={"host_public_ip": upstream_ip},
+        )
+
+    settings = build_settings(
+        temp_paths,
+        edge_assignments_path=edge_assignments_path,
+        client_session_allowed_orchestrators=["orch-skillmd"],
+        client_session_guest_mode_enabled=True,
+        posthog_enabled=True,
+        posthog_project_api_key="phc_local_test",
+        posthog_site_env="test",
+        ip_geo_overrides={
+            client_ip: {"lat": 0.0, "lon": 0.0},
+            upstream_ip: {"lat": 0.0, "lon": 0.0},
+        },
+    )
+    app = create_app(registry, ledger, settings)
+    transport = httpx.ASGITransport(app=app, client=(client_ip, 12345))
+    return app, transport, upstream_ip
+
+
 @pytest.mark.anyio("asyncio")
 async def test_register_endpoint_success(temp_paths):
     registry, ledger = build_registry(temp_paths)
@@ -2182,6 +2231,241 @@ async def test_skillmd_bootstrap_manifest_endpoint(temp_paths):
     assert body["transport"]["primary"] == "pixelstreaming_datachannel_emitcommand"
     assert body["webrtc"]["command_method"] == "emitCommand"
     assert body["capacity"]["max_concurrent_sessions"] == 1
+
+
+@pytest.mark.anyio("asyncio")
+async def test_skillmd_bootstrap_manifest_emits_posthog_event(temp_paths, monkeypatch):
+    captured = []
+
+    async def fake_capture_event(*, settings, event, distinct_id, properties, logger=None):  # noqa: ANN001
+        captured.append((event, distinct_id, properties))
+
+    monkeypatch.setattr("payments.api.posthog.capture_event", fake_capture_event)
+    app, transport, _ = build_skillmd_posthog_app(temp_paths)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get(
+            "/api/bootstrap/skillmd?installation_id=install-bootstrap",
+            headers={
+                "X-Client-Name": "skillmd-browser",
+                "X-Client-Version": "1.2.3",
+                "X-Bootstrap-Manifest-Version": "1.0.0-alpha",
+            },
+        )
+
+    assert response.status_code == 200
+    assert len(captured) == 1
+    event, distinct_id, properties = captured[0]
+    assert event == "skillmd_bootstrap_served"
+    assert distinct_id == "install-bootstrap"
+    assert properties["installation_id"] == "install-bootstrap"
+    assert properties["session_mode"] == "guest_bootstrap"
+    assert properties["client_name"] == "skillmd-browser"
+    assert properties["client_version"] == "1.2.3"
+    assert properties["bootstrap_manifest_version"] == "1.0.0-alpha"
+    assert properties["manifest_version"] == "1.0.0-alpha"
+    assert properties["capacity_hint"] == 1
+    assert properties["guest_mode_enabled"] is True
+    assert properties["site_env"] == "test"
+    assert properties["contract_version"] == "skillmd-posthog-v1"
+
+
+@pytest.mark.anyio("asyncio")
+async def test_client_session_start_emits_posthog_event(temp_paths, monkeypatch):
+    captured = []
+
+    async def fake_capture_event(*, settings, event, distinct_id, properties, logger=None):  # noqa: ANN001
+        captured.append((event, distinct_id, properties))
+
+    monkeypatch.setattr("payments.api.posthog.capture_event", fake_capture_event)
+    app, transport, _ = build_skillmd_posthog_app(temp_paths)
+    payload = {
+        "installation_id": "install-start",
+        "installation_public_fingerprint": "a" * 64,
+        "client_name": "skillmd-browser",
+        "client_version": "2.0.0",
+        "bootstrap_manifest_version": "1.0.0-alpha",
+    }
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post("/api/sessions/start", json=payload)
+
+    assert response.status_code == 200
+    assert len(captured) == 1
+    body = response.json()
+    event, distinct_id, properties = captured[0]
+    assert event == "skillmd_session_started"
+    assert distinct_id == "install-start"
+    assert properties["installation_id"] == "install-start"
+    assert properties["session_mode"] == "guest"
+    assert properties["client_name"] == "skillmd-browser"
+    assert properties["client_version"] == "2.0.0"
+    assert properties["bootstrap_manifest_version"] == "1.0.0-alpha"
+    assert properties["session_id"] == body["session_id"]
+    assert properties["orchestrator_id"] == "orch-skillmd"
+    assert properties["edge_id"] == "edge-skillmd"
+    assert properties["edge_host"] == "edge-skillmd.example.com"
+    assert properties["lease_seconds"] == body["lease_seconds"]
+    assert properties["command_mode"] == "datachannel"
+    assert properties["command_method"] == "emitCommand"
+    assert properties["capacity_hint"] == 1
+
+
+@pytest.mark.anyio("asyncio")
+async def test_session_event_start_emits_attached_posthog_event(temp_paths, monkeypatch):
+    captured = []
+
+    async def fake_capture_event(*, settings, event, distinct_id, properties, logger=None):  # noqa: ANN001
+        captured.append((event, distinct_id, properties))
+
+    monkeypatch.setattr("payments.api.posthog.capture_event", fake_capture_event)
+    app, transport, upstream_ip = build_skillmd_posthog_app(temp_paths)
+    start_payload = {
+        "installation_id": "install-attach",
+        "installation_public_fingerprint": "b" * 64,
+        "bootstrap_manifest_version": "1.0.0-alpha",
+    }
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        start = await client.post("/api/sessions/start", json=start_payload)
+        assert start.status_code == 200
+        session_id = start.json()["session_id"]
+        captured.clear()
+        attach = await client.post(
+            "/api/sessions/events",
+            json={
+                "session_id": session_id,
+                "upstream_addr": upstream_ip,
+                "upstream_port": 8080,
+                "edge_id": "edge-skillmd",
+                "streamer_id": "avatar-1",
+                "event": "start",
+            },
+        )
+
+    assert attach.status_code == 200
+    assert len(captured) == 1
+    event, distinct_id, properties = captured[0]
+    assert event == "skillmd_session_attached"
+    assert distinct_id == "install-attach"
+    assert properties["installation_id"] == "install-attach"
+    assert properties["session_id"] == session_id
+    assert properties["orchestrator_id"] == "orch-skillmd"
+    assert properties["edge_id"] == "edge-skillmd"
+    assert properties["edge_host"] == "edge-skillmd.example.com"
+    assert properties["streamer_id"] == "avatar-1"
+    assert properties["session_mode"] == "guest"
+    assert isinstance(properties["attach_latency_ms"], int)
+    assert properties["attach_latency_ms"] >= 0
+
+
+@pytest.mark.anyio("asyncio")
+async def test_client_session_end_emits_posthog_event(temp_paths, monkeypatch):
+    captured = []
+
+    async def fake_capture_event(*, settings, event, distinct_id, properties, logger=None):  # noqa: ANN001
+        captured.append((event, distinct_id, properties))
+
+    monkeypatch.setattr("payments.api.posthog.capture_event", fake_capture_event)
+    app, transport, upstream_ip = build_skillmd_posthog_app(temp_paths)
+    start_payload = {
+        "installation_id": "install-end",
+        "installation_public_fingerprint": "c" * 64,
+        "bootstrap_manifest_version": "1.0.0-alpha",
+    }
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        start = await client.post("/api/sessions/start", json=start_payload)
+        assert start.status_code == 200
+        session_id = start.json()["session_id"]
+        attach = await client.post(
+            "/api/sessions/events",
+            json={
+                "session_id": session_id,
+                "upstream_addr": upstream_ip,
+                "upstream_port": 8080,
+                "edge_id": "edge-skillmd",
+                "streamer_id": "avatar-1",
+                "event": "start",
+            },
+        )
+        assert attach.status_code == 200
+        captured.clear()
+        ended = await client.post("/api/sessions/end", json={"session_id": session_id})
+
+    assert ended.status_code == 200
+    assert len(captured) == 1
+    event, distinct_id, properties = captured[0]
+    assert event == "skillmd_session_ended"
+    assert distinct_id == "install-end"
+    assert properties["installation_id"] == "install-end"
+    assert properties["session_id"] == session_id
+    assert properties["end_reason"] == "client_end"
+    assert properties["attached"] is True
+    assert isinstance(properties["session_duration_seconds"], int)
+    assert properties["session_duration_seconds"] >= 0
+
+
+@pytest.mark.anyio("asyncio")
+async def test_client_session_tcp_emits_posthog_fallback_event(temp_paths, monkeypatch):
+    captured = []
+
+    async def fake_capture_event(*, settings, event, distinct_id, properties, logger=None):  # noqa: ANN001
+        captured.append((event, distinct_id, properties))
+
+    monkeypatch.setattr("payments.api.posthog.capture_event", fake_capture_event)
+    app, transport, _ = build_skillmd_posthog_app(
+        temp_paths,
+        tcp_relay_url="https://edge-skillmd.example.com/api/tcp/relay",
+    )
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        start = await client.post(
+            "/api/sessions/start",
+            json={
+                "installation_id": "install-tcp",
+                "installation_public_fingerprint": "d" * 64,
+                "bootstrap_manifest_version": "1.0.0-alpha",
+            },
+        )
+        assert start.status_code == 200
+        session_id = start.json()["session_id"]
+        captured.clear()
+
+        class FakeAsyncClient:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def post(self, url, json=None):
+                assert url == "https://edge-skillmd.example.com/api/tcp/relay"
+                return httpx.Response(200, json={"execution_id": "exec-1", "state": "completed"})
+
+            async def get(self, url):
+                return httpx.Response(200, json={"state": "completed"})
+
+        with patch("payments.api.httpx.AsyncClient", FakeAsyncClient):
+            tcp_resp = await client.post(
+                "/api/sessions/tcp",
+                json={"session_id": session_id, "command": "CAMSHOT.ExtremeClose"},
+            )
+
+    assert tcp_resp.status_code == 200
+    assert len(captured) == 1
+    event, distinct_id, properties = captured[0]
+    assert event == "skillmd_session_tcp_fallback_used"
+    assert distinct_id == "install-tcp"
+    assert properties["installation_id"] == "install-tcp"
+    assert properties["session_id"] == session_id
+    assert properties["orchestrator_id"] == "orch-skillmd"
+    assert properties["edge_id"] == "edge-skillmd"
+    assert properties["command_family"] == "camera"
+    assert properties["reason"] == "fallback_http_control"
 
 
 @pytest.mark.anyio("asyncio")

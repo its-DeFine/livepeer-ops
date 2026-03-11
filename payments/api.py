@@ -37,6 +37,7 @@ from eth_account.messages import encode_defunct
 from pydantic import BaseModel, Field, field_validator, model_validator
 from eth_utils import keccak, to_checksum_address
 
+from . import posthog
 from .activity import ActivityLeaseStore, parse_iso8601 as parse_activity_iso8601
 from .client_sessions import (
     ClientSessionInviteStore,
@@ -1262,6 +1263,13 @@ def create_app(
     client_session_tcp_allow_direct_orchestrator = bool(
         getattr(settings, "client_session_tcp_allow_direct_orchestrator", False)
     )
+    posthog_project_api_key = str(getattr(settings, "posthog_project_api_key", "") or "").strip()
+    raw_posthog_enabled = getattr(settings, "posthog_enabled", None)
+    posthog_enabled = (
+        bool(raw_posthog_enabled) if raw_posthog_enabled is not None else bool(posthog_project_api_key)
+    )
+    posthog_site_env = str(getattr(settings, "posthog_site_env", "local") or "local").strip() or "local"
+    posthog_contract_version = "skillmd-posthog-v1"
 
     raw_allowed_orchestrators = getattr(settings, "client_session_allowed_orchestrators", []) or []
     if isinstance(raw_allowed_orchestrators, str):
@@ -2205,6 +2213,235 @@ def create_app(
             command_method="emitCommand",
             capacity_hint=_guest_capacity_limit(),
             policy_version=client_session_guest_command_allowlist_version if session_mode == "guest" else None,
+        )
+
+    def _skillmd_iso_now() -> str:
+        return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    def _skillmd_header_text(request: Request, name: str) -> Optional[str]:
+        candidate = str(request.headers.get(name) or "").strip()
+        return candidate or None
+
+    def _skillmd_bootstrap_installation_id(request: Request) -> Optional[str]:
+        query_value = str(request.query_params.get("installation_id") or "").strip()
+        if query_value:
+            return query_value
+        return _skillmd_header_text(request, "X-Installation-Id")
+
+    def _skillmd_base_properties(
+        *,
+        installation_id: Optional[str],
+        session_mode: Optional[str],
+        client_name: Optional[str],
+        client_version: Optional[str],
+        bootstrap_manifest_version: Optional[str],
+    ) -> Dict[str, Any]:
+        return {
+            "installation_id": installation_id,
+            "session_mode": session_mode,
+            "client_name": client_name,
+            "client_version": client_version,
+            "bootstrap_manifest_version": bootstrap_manifest_version,
+        }
+
+    def _skillmd_edge_host(orchestrator_id: Optional[str], *, fallback: Optional[str] = None) -> Optional[str]:
+        candidate = str(orchestrator_id or "").strip()
+        if candidate:
+            try:
+                return _edge_assignment_for(candidate).matchmaker_host
+            except Exception:
+                pass
+        fallback_value = str(fallback or "").strip()
+        return fallback_value or None
+
+    def _skillmd_client_session_properties(session: Dict[str, Any]) -> Dict[str, Any]:
+        metadata = session.get("metadata") or {}
+        installation_id = str(session.get("installation_id") or "").strip() or None
+        session_mode = str(metadata.get("session_mode") or "invite")
+        client_name = str(metadata.get("client_name") or "").strip() or None
+        client_version = str(metadata.get("client_version") or "").strip() or None
+        bootstrap_manifest_version = str(metadata.get("bootstrap_manifest_version") or "").strip() or None
+        orchestrator_id = str(session.get("orchestrator_id") or "").strip() or None
+        edge_id: Optional[str] = None
+        edge_host: Optional[str] = None
+        if orchestrator_id:
+            try:
+                edge = _edge_assignment_for(orchestrator_id)
+                edge_id = edge.edge_id
+                edge_host = edge.matchmaker_host
+            except Exception:
+                pass
+        return {
+            **_skillmd_base_properties(
+                installation_id=installation_id,
+                session_mode=session_mode,
+                client_name=client_name,
+                client_version=client_version,
+                bootstrap_manifest_version=bootstrap_manifest_version,
+            ),
+            "session_id": str(session.get("session_id") or "").strip() or None,
+            "orchestrator_id": orchestrator_id,
+            "edge_id": edge_id,
+            "edge_host": edge_host,
+        }
+
+    def _skillmd_command_family(command: str) -> str:
+        candidate = str(command or "").strip().upper()
+        if candidate.startswith("CAMSHOT."):
+            return "camera"
+        if candidate.startswith(("EMOTE_", "CONVO_")):
+            return "emotion"
+        if candidate.startswith(("PRS.", "SKC.", "EYE", "MT.", "MKUP", "HS", "HCR", "HAIR", "OF")):
+            return "customization"
+        if candidate.startswith(("EXPO", "BLOOM", "VIG", "CHROME", "GRAIN", "CG", "CGG")):
+            return "postfx"
+        if candidate.startswith(("SPWN", "LIGHT.")):
+            return "scene"
+        if candidate.startswith("TTS_KOKORO_"):
+            return "kokoro"
+        return "other"
+
+    async def _capture_skillmd_event(
+        event_name: str,
+        distinct_id: Optional[str],
+        properties: Dict[str, Any],
+    ) -> None:
+        normalized_distinct_id = str(distinct_id or "").strip()
+        if not posthog_enabled or not normalized_distinct_id:
+            return
+        payload = dict(properties)
+        payload.setdefault("distinct_id", normalized_distinct_id)
+        payload.setdefault("site_env", posthog_site_env)
+        payload.setdefault("contract_version", posthog_contract_version)
+        payload.setdefault("ts", _skillmd_iso_now())
+        await posthog.capture_event(
+            settings=settings,
+            event=event_name,
+            distinct_id=normalized_distinct_id,
+            properties=payload,
+            logger=logger,
+        )
+
+    async def _emit_skillmd_session_started(
+        session: Dict[str, Any],
+        session_model: ClientSessionRecord,
+    ) -> None:
+        properties = _skillmd_client_session_properties(session)
+        properties.update(
+            {
+                "lease_seconds": session_model.lease_seconds,
+                "command_mode": session_model.command_mode,
+                "command_method": session_model.command_method,
+                "capacity_hint": session_model.capacity_hint,
+            }
+        )
+        await _capture_skillmd_event(
+            "skillmd_session_started",
+            properties.get("installation_id"),
+            properties,
+        )
+
+    async def _emit_skillmd_session_attached(
+        client_session: Dict[str, Any],
+        stream_session: Dict[str, Any],
+    ) -> None:
+        properties = _skillmd_client_session_properties(client_session)
+        orchestrator_id = str(stream_session.get("orchestrator_id") or properties.get("orchestrator_id") or "").strip()
+        started_at = str(stream_session.get("started_at") or "").strip()
+        issued_at = str(client_session.get("issued_at") or "").strip()
+        attach_latency_ms: Optional[int] = None
+        try:
+            attach_latency_ms = int(
+                max(
+                    0.0,
+                    (
+                        parse_client_session_iso8601(started_at) - parse_client_session_iso8601(issued_at)
+                    ).total_seconds()
+                    * 1000.0,
+                )
+            )
+        except Exception:
+            attach_latency_ms = None
+        properties.update(
+            {
+                "orchestrator_id": orchestrator_id or None,
+                "edge_id": str(stream_session.get("edge_id") or properties.get("edge_id") or "").strip() or None,
+                "edge_host": _skillmd_edge_host(
+                    orchestrator_id,
+                    fallback=str(stream_session.get("upstream_addr") or properties.get("edge_host") or ""),
+                ),
+                "streamer_id": str(stream_session.get("streamer_id") or "").strip() or None,
+                "attach_latency_ms": attach_latency_ms,
+            }
+        )
+        await _capture_skillmd_event(
+            "skillmd_session_attached",
+            properties.get("installation_id"),
+            properties,
+        )
+
+    async def _emit_skillmd_session_ended(
+        client_session: Dict[str, Any],
+        *,
+        end_reason: Optional[str],
+        stream_session: Optional[Dict[str, Any]],
+    ) -> None:
+        properties = _skillmd_client_session_properties(client_session)
+        orchestrator_id = str(
+            (stream_session or {}).get("orchestrator_id") or properties.get("orchestrator_id") or ""
+        ).strip()
+        issued_at = str(client_session.get("issued_at") or "").strip()
+        ended_at = str(client_session.get("ended_at") or "").strip()
+        session_duration_seconds: Optional[int] = None
+        try:
+            session_duration_seconds = int(
+                max(
+                    0.0,
+                    (
+                        parse_client_session_iso8601(ended_at) - parse_client_session_iso8601(issued_at)
+                    ).total_seconds(),
+                )
+            )
+        except Exception:
+            session_duration_seconds = None
+        properties.update(
+            {
+                "orchestrator_id": orchestrator_id or None,
+                "edge_id": str(
+                    (stream_session or {}).get("edge_id") or properties.get("edge_id") or ""
+                ).strip()
+                or None,
+                "edge_host": _skillmd_edge_host(
+                    orchestrator_id,
+                    fallback=str((stream_session or {}).get("upstream_addr") or properties.get("edge_host") or ""),
+                ),
+                "end_reason": str(end_reason or "").strip() or None,
+                "session_duration_seconds": session_duration_seconds,
+                "attached": bool(stream_session),
+            }
+        )
+        await _capture_skillmd_event(
+            "skillmd_session_ended",
+            properties.get("installation_id"),
+            properties,
+        )
+
+    async def _emit_skillmd_session_tcp_fallback(
+        client_session: Dict[str, Any],
+        *,
+        command: str,
+    ) -> None:
+        properties = _skillmd_client_session_properties(client_session)
+        properties.update(
+            {
+                "command_family": _skillmd_command_family(command),
+                "reason": "fallback_http_control",
+            }
+        )
+        await _capture_skillmd_event(
+            "skillmd_session_tcp_fallback_used",
+            properties.get("installation_id"),
+            properties,
         )
 
     def _guest_pool_orchestrator_ids() -> List[str]:
@@ -5252,6 +5489,7 @@ def create_app(
                     pass
 
                 session_model = _to_client_session_record(issued, request=request)
+                await _emit_skillmd_session_started(issued, session_model)
                 return ClientSessionStartResponse(**session_model.model_dump())
 
             invite_record: Optional[Dict[str, Any]] = None
@@ -5347,6 +5585,7 @@ def create_app(
                     pass
 
                 session_model = _to_client_session_record(issued, request=request)
+                await _emit_skillmd_session_started(issued, session_model)
                 return ClientSessionStartResponse(**session_model.model_dump())
             except Exception:
                 if invite_id:
@@ -5429,7 +5668,7 @@ def create_app(
     async def get_skillmd_bootstrap_manifest(request: Request) -> Dict[str, Any]:
         base = _external_base_url(request)
         capacity = _guest_capacity_limit()
-        return {
+        manifest = {
             "version": "1.0.0-alpha",
             "updated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             "mode": "guest_bootstrap" if client_session_guest_mode_enabled else "invite_bootstrap",
@@ -5470,6 +5709,26 @@ def create_app(
             },
             "canonical_manifest_url": client_session_bootstrap_manifest_url,
         }
+        installation_id = _skillmd_bootstrap_installation_id(request)
+        await _capture_skillmd_event(
+            "skillmd_bootstrap_served",
+            installation_id or "anonymous-bootstrap",
+            {
+                **_skillmd_base_properties(
+                    installation_id=installation_id,
+                    session_mode=str(manifest.get("mode") or ""),
+                    client_name=_skillmd_header_text(request, "X-Client-Name"),
+                    client_version=_skillmd_header_text(request, "X-Client-Version"),
+                    bootstrap_manifest_version=_skillmd_header_text(
+                        request, "X-Bootstrap-Manifest-Version"
+                    ),
+                ),
+                "manifest_version": str(manifest.get("version") or ""),
+                "capacity_hint": capacity,
+                "guest_mode_enabled": client_session_guest_mode_enabled,
+            },
+        )
+        return manifest
 
     @app.get("/api/sessions/me", response_model=ClientSessionRecord)
     async def get_client_session(
@@ -5533,6 +5792,7 @@ def create_app(
             session_id=payload.session_id if payload is not None else None,
         )
         session_id = str(session.get("session_id") or "")
+        stream_session = session_store.get(session_id)
         ended = client_session_store.end(session_id, reason="client_end")
         if ended is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
@@ -5540,6 +5800,11 @@ def create_app(
             activity_leases.revoke(f"client_session:{session_id}")
         except Exception:
             pass
+        await _emit_skillmd_session_ended(
+            ended,
+            end_reason=str(ended.get("end_reason") or ""),
+            stream_session=stream_session,
+        )
         session_model = _to_client_session_record(ended, request=request)
         return ClientSessionEndResponse(
             **session_model.model_dump(),
@@ -5560,6 +5825,7 @@ def create_app(
             command=payload.command,
             timeout_seconds=payload.timeout_seconds,
         )
+        await _emit_skillmd_session_tcp_fallback(session, command=payload.command)
         return ClientSessionTcpResponse(
             session_id=str(session.get("session_id") or ""),
             execution_id=execution_id,
@@ -5576,6 +5842,7 @@ def create_app(
         request: Request,
         __: Any = Depends(require_session_reporter),
     ) -> SessionRecord:
+        existing_stream_session = session_store.get(payload.session_id)
         now = datetime.now(timezone.utc)
         upstream_addr = payload.upstream_addr
 
@@ -5728,6 +5995,13 @@ def create_app(
                     )
             except Exception:
                 pass
+        first_attach_event = payload.event == "start" and (
+            existing_stream_session is None or bool(existing_stream_session.get("ended_at"))
+        )
+        if first_attach_event:
+            client_session = client_session_store.get(payload.session_id)
+            if client_session is not None:
+                await _emit_skillmd_session_attached(client_session, stored)
         return SessionRecord(**stored)
 
     @app.get("/api/sessions", response_model=SessionListResponse)
