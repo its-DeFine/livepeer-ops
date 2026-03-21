@@ -1,5 +1,7 @@
-## Linked issue
+## Linked tracker item
 
+<!-- Use whichever applies -->
+Linear: EMB-
 Closes #
 
 ## Summary
@@ -8,7 +10,7 @@ Closes #
 
 ## Acceptance criteria
 
-- [ ] Met all acceptance criteria from the issue
+- [ ] Met all acceptance criteria from the task
 - [ ] Did not touch forbidden paths
 
 ## How to test
@@ -18,4 +20,3 @@ Closes #
 ## Risk / rollout
 
 -
-
