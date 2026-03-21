@@ -1,6 +1,6 @@
 # Agent Notes
 
-This repo uses GitHub Issues as the unit of work and PRs as the execution artifact.
+This repo uses Linear tasks as the internal unit of work and PRs as the execution artifact. GitHub issues are optional external/public intake, not a prerequisite for internal repo work.
 
 ## Harness Entry
 
@@ -25,20 +25,20 @@ Then inspect only the code and docs for the surface you will touch.
 
 - Use `VERIFY.md` to classify checks as `local-safe`, `runtime-required`, or `operator-only`.
 - When command output matters, store it under `logs/harness/<YYYY-MM-DD>/<change-id>/`.
-- If no issue number is supplied, stop before opening a new implementation wedge or PR artifact.
+- If no Linear task key is supplied, stop before opening a new implementation wedge or PR artifact.
 
 ## Non-negotiables
 
-- Only do what the Issue asks. If `outcome`, `scope`, `acceptance criteria`, or `allowed/forbidden areas` are missing or unclear, stop and ask for clarification (do not guess).
-- Stop before implementation if no real GitHub issue number is supplied, or if a placeholder such as `issue-0` is being used.
-- Never commit directly to the default branch (`main`/`master`). Work on a branch named `codex/issue-<number>-<slug>` and open a **draft PR**.
-- The draft PR body must link the real issue with `Closes #<number>` or `Refs #<number>`.
+- Only do what the task asks. If `outcome`, `scope`, `acceptance criteria`, or `allowed/forbidden areas` are missing or unclear, stop and ask for clarification (do not guess).
+- If no real Linear task key is supplied, stop before opening an implementation branch or PR. Never use placeholder keys such as `<linear-key>`.
+- Never commit directly to the default branch (`main`/`master`). Work on a branch named `codex/<linear_key>-<slug>` and open a **draft PR**.
+- The PR body must include `Linear: <linear_key>`.
 - Keep changes small and surgical; avoid drive-by refactors.
-- Do not add or modify secrets/keys/tokens. If an Issue requires secret changes, stop and ask a human.
+- Do not add or modify secrets/keys/tokens. If a task requires secret changes, stop and ask a human.
 
 ## Safety / forbidden by default
 
-Unless an Issue explicitly allows it, do not modify:
+Unless a task explicitly allows it, do not modify:
 
 - `.github/**`
 - `*.env*`
@@ -47,4 +47,4 @@ Unless an Issue explicitly allows it, do not modify:
 - `*secret*`
 - `*credentials*`
 
-If the Issue provides its own allowed/forbidden paths, those take precedence.
+If the task provides its own allowed/forbidden paths, those take precedence.
