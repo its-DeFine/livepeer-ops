@@ -47,6 +47,7 @@ def build_settings(temp_dir, **overrides):
         enforce_split_surfaces=False,
         public_edge_host=None,
         public_ops_host=None,
+        enable_docs=False,
     )
     defaults.update(overrides)
     return SimpleNamespace(**defaults)

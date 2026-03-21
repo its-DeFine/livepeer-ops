@@ -254,6 +254,11 @@ class PaymentSettings(BaseSettings):
         validation_alias="PAYMENTS_OPS_APPROVAL_NONCES_PATH",
     )
 
+    enable_docs: bool = Field(
+        default=False,
+        validation_alias="PAYMENTS_ENABLE_DOCS",
+    )
+
     enforce_split_surfaces: bool = Field(
         default=False,
         validation_alias="PAYMENTS_ENFORCE_SPLIT_SURFACES",

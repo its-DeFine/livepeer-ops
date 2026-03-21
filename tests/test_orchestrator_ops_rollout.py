@@ -48,6 +48,7 @@ def build_settings(tmp_path: Path, **overrides):
         ops_approval_required=True,
         ops_approval_max_ttl_seconds=300,
         ops_approval_nonces_path=tmp_path / "ops_approval_nonces.json",
+        enable_docs=False,
     )
     defaults.update(overrides)
     return SimpleNamespace(**defaults)
