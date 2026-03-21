@@ -82,4 +82,4 @@ Stop and ask for a narrower packet if any of these become necessary:
 - changing payout, billing, credits, registration, or other backend feature behavior when the issue is harness-only
 - relying on a runtime-only check when no disposable local env or operator context is available
 - widening from one bounded repo task into Unreal_Vtuber work or cross-repo orchestration
-- opening implementation PR flow without a GitHub issue number
+- opening implementation PR flow without a real tracker key (Linear task key or GitHub issue number)
