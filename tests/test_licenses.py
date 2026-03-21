@@ -61,6 +61,7 @@ def build_settings(temp_paths, **overrides):
         jobs_path=base_dir / "jobs.json",
         workload_archive_base=base_dir / "recordings",
         license_lease_seconds=60,
+        enable_docs=False,
     )
     defaults.update(overrides)
     return SimpleNamespace(**defaults)

@@ -64,6 +64,7 @@ def build_settings(temp_paths, **overrides):
         activity_leases_path=base_dir / "activity_leases.json",
         activity_lease_seconds=30,
         activity_lease_max_seconds=60,
+        enable_docs=False,
     )
     defaults.update(overrides)
     return SimpleNamespace(**defaults)
