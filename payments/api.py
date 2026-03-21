@@ -969,11 +969,20 @@ SESSION_EVENTS = {"start", "heartbeat", "end"}
 
 class SessionEventPayload(BaseModel):
     session_id: str = Field(min_length=1, max_length=128)
-    upstream_addr: str = Field(min_length=1, max_length=255)
-    upstream_port: int = Field(ge=1, le=65535)
+    orchestrator_id: Optional[str] = Field(default=None, min_length=1, max_length=128)
+    upstream_addr: Optional[str] = Field(default=None, max_length=255)
+    upstream_port: Optional[int] = Field(default=None, ge=1, le=65535)
     edge_id: Optional[str] = Field(default=None, max_length=64)
     streamer_id: Optional[str] = Field(default=None, max_length=128)
     event: str = Field(default="heartbeat", max_length=32)
+
+    @field_validator("orchestrator_id")
+    @classmethod
+    def validate_orchestrator_id(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        candidate = value.strip()
+        return candidate if candidate else None
 
     @field_validator("streamer_id")
     @classmethod
@@ -993,10 +1002,12 @@ class SessionEventPayload(BaseModel):
 
     @field_validator("upstream_addr")
     @classmethod
-    def validate_upstream_addr(cls, value: str) -> str:
-        candidate = (value or "").strip()
+    def validate_upstream_addr(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        candidate = value.strip()
         if not candidate:
-            raise ValueError("upstream_addr required")
+            return None
         # Accept IP literals (recommended). Hostnames are rejected to keep attribution unambiguous.
         try:
             ipaddress.ip_address(candidate)
@@ -1982,10 +1993,30 @@ def create_app(
     async def require_session_reporter(request: Request) -> None:
         expected = getattr(settings, "session_reporter_token", None) or None
         if not expected:
-            return
+            provided = _provided_session_token(request)
+            if provided:
+                session = client_session_store.authenticate(provided)
+                if session:
+                    caller_ip = request_ip(request)
+                    expected_ip = str(session.get("client_ip") or "")
+                    if not caller_ip or not expected_ip or caller_ip != expected_ip:
+                        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Session bound to different IP")
+                    return {"mode": "client_session", "session": session}
+            return {"mode": "open", "session": None}
         provided = _provided_session_token(request)
+        if provided == expected:
+            return {"mode": "shared_token", "session": None}
+        if provided:
+            session = client_session_store.authenticate(provided)
+            if session:
+                caller_ip = request_ip(request)
+                expected_ip = str(session.get("client_ip") or "")
+                if not caller_ip or not expected_ip or caller_ip != expected_ip:
+                    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Session bound to different IP")
+                return {"mode": "client_session", "session": session}
         if provided != expected:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Session reporter token required")
+        return {"mode": "shared_token", "session": None}
 
     async def require_ops_approval(request: Request) -> None:
         await ops_approval_verifier.verify(request)
@@ -2256,6 +2287,39 @@ def create_app(
                 pass
         fallback_value = str(fallback or "").strip()
         return fallback_value or None
+
+    def _orchestrator_upstream_addr(orchestrator_id: Optional[str]) -> Optional[str]:
+        from urllib.parse import urlparse
+
+        candidate = str(orchestrator_id or "").strip()
+        if not candidate:
+            return None
+        record = registry.all_records().get(candidate)
+        if not isinstance(record, dict):
+            return None
+        for key in ("host_public_ip", "last_seen_ip", "last_session_upstream_addr"):
+            value = str(record.get(key) or "").strip()
+            if not value:
+                continue
+            try:
+                ipaddress.ip_address(value)
+                return value
+            except ValueError:
+                continue
+        raw_health_url = record.get("health_url")
+        host = None
+        if isinstance(raw_health_url, str) and raw_health_url:
+            try:
+                host = urlparse(raw_health_url).hostname
+            except Exception:
+                host = None
+        if host:
+            try:
+                ipaddress.ip_address(host)
+                return host
+            except ValueError:
+                return None
+        return None
 
     def _skillmd_client_session_properties(session: Dict[str, Any]) -> Dict[str, Any]:
         metadata = session.get("metadata") or {}
@@ -5416,7 +5480,11 @@ def create_app(
                     )
                 except Exception:
                     pass
-                return ClientSessionStartResponse(**session_model.model_dump())
+                refreshed = client_session_store.rotate_token(session_model.session_id) or existing
+                return ClientSessionStartResponse(
+                    **session_model.model_dump(),
+                    token=str(refreshed.get("token") or "") or None,
+                )
 
             if guest_mode_active:
                 if client_session_guest_max_active_per_installation <= 1:
@@ -5429,7 +5497,11 @@ def create_app(
                                 detail="Installation already has an active session on another IP",
                             )
                         session_model = _to_client_session_record(existing_installation, request=request)
-                        return ClientSessionStartResponse(**session_model.model_dump())
+                        refreshed = client_session_store.rotate_token(session_model.session_id) or existing_installation
+                        return ClientSessionStartResponse(
+                            **session_model.model_dump(),
+                            token=str(refreshed.get("token") or "") or None,
+                        )
 
             pinned = client_session_store.find_unexpired_by_client_ip(caller_ip)
             if pinned:
@@ -5493,7 +5565,10 @@ def create_app(
 
                 session_model = _to_client_session_record(issued, request=request)
                 await _emit_skillmd_session_started(issued, session_model)
-                return ClientSessionStartResponse(**session_model.model_dump())
+                return ClientSessionStartResponse(
+                    **session_model.model_dump(),
+                    token=str(issued.get("token") or "") or None,
+                )
 
             invite_record: Optional[Dict[str, Any]] = None
             invite_id = ""
@@ -5589,7 +5664,10 @@ def create_app(
 
                 session_model = _to_client_session_record(issued, request=request)
                 await _emit_skillmd_session_started(issued, session_model)
-                return ClientSessionStartResponse(**session_model.model_dump())
+                return ClientSessionStartResponse(
+                    **session_model.model_dump(),
+                    token=str(issued.get("token") or "") or None,
+                )
             except Exception:
                 if invite_id:
                     client_session_invites.release(invite_id)
@@ -5678,9 +5756,15 @@ def create_app(
             "base_url": base,
             "session_start_path": "/api/sessions/start",
             "session_end_path": "/api/sessions/end",
+            "session_events_path": "/api/sessions/events",
             "transport": {
                 "primary": "pixelstreaming_datachannel_emitcommand",
                 "fallback": "http_sessions_tcp_admin_only",
+            },
+            "session_reporting": {
+                "mode": "client_session_token",
+                "auth_header": "X-Session-Token",
+                "heartbeat_seconds": 15,
             },
             "webrtc": {
                 "command_mode": "datachannel",
@@ -5843,11 +5927,29 @@ def create_app(
     async def record_session_event(
         payload: SessionEventPayload,
         request: Request,
-        __: Any = Depends(require_session_reporter),
+        reporter: Any = Depends(require_session_reporter),
     ) -> SessionRecord:
+        reporter_session = reporter.get("session") if isinstance(reporter, dict) else None
+        if isinstance(reporter_session, dict):
+            expected_session_id = str(reporter_session.get("session_id") or "")
+            if expected_session_id and payload.session_id != expected_session_id:
+                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Session token bound to different session")
+
         existing_stream_session = session_store.get(payload.session_id)
         now = datetime.now(timezone.utc)
-        upstream_addr = payload.upstream_addr
+        records = registry.all_records()
+        orch_id: Optional[str] = None
+        if isinstance(reporter_session, dict):
+            orch_id = str(reporter_session.get("orchestrator_id") or "").strip() or None
+        if not orch_id:
+            orch_id = str(payload.orchestrator_id or "").strip() or None
+        if orch_id and orch_id not in records:
+            orch_id = None
+
+        upstream_addr = payload.upstream_addr or _orchestrator_upstream_addr(orch_id)
+        if not upstream_addr:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Session event missing upstream address")
+        upstream_port = int(payload.upstream_port or 8080)
 
         def parse_host(candidate: Any) -> Optional[str]:
             if not isinstance(candidate, str) or not candidate:
@@ -5870,29 +5972,28 @@ def create_app(
             except Exception:
                 return None
 
-        records = registry.all_records()
-        orch_id: Optional[str] = None
-        for candidate_id, record in records.items():
-            if not isinstance(record, dict):
-                continue
-            for key in ("host_public_ip", "last_seen_ip", "last_session_upstream_addr"):
-                ip = record.get(key)
-                if isinstance(ip, str) and ip == upstream_addr:
+        if orch_id is None:
+            for candidate_id, record in records.items():
+                if not isinstance(record, dict):
+                    continue
+                for key in ("host_public_ip", "last_seen_ip", "last_session_upstream_addr"):
+                    ip = record.get(key)
+                    if isinstance(ip, str) and ip == upstream_addr:
+                        orch_id = candidate_id
+                        break
+                if orch_id:
+                    break
+                host = parse_host(record.get("health_url"))
+                if host and host == upstream_addr:
                     orch_id = candidate_id
                     break
-            if orch_id:
-                break
-            host = parse_host(record.get("health_url"))
-            if host and host == upstream_addr:
-                orch_id = candidate_id
-                break
-            forwarder_health = record.get("forwarder_health")
-            if isinstance(forwarder_health, dict):
-                data = forwarder_health.get("data")
-                ip = data.get("ip") if isinstance(data, dict) else None
-                if isinstance(ip, str) and ip == upstream_addr:
-                    orch_id = candidate_id
-                    break
+                forwarder_health = record.get("forwarder_health")
+                if isinstance(forwarder_health, dict):
+                    data = forwarder_health.get("data")
+                    ip = data.get("ip") if isinstance(data, dict) else None
+                    if isinstance(ip, str) and ip == upstream_addr:
+                        orch_id = candidate_id
+                        break
 
         if orch_id is None:
             best: Optional[str] = None
@@ -5926,7 +6027,8 @@ def create_app(
             eligible = registry.is_eligible(orch_id)
             awake = False
             if eligible:
-                state = await _session_power_state(orch_id, upstream_addr)
+                power_host = _orchestrator_upstream_addr(orch_id) or upstream_addr
+                state = await _session_power_state(orch_id, power_host)
                 awake = state == "awake"
 
             if eligible and awake:
@@ -5963,8 +6065,8 @@ def create_app(
             event=payload.event,
             now=now,
             orchestrator_id=orch_id,
-            upstream_addr=payload.upstream_addr,
-            upstream_port=payload.upstream_port,
+            upstream_addr=upstream_addr,
+            upstream_port=upstream_port,
             edge_id=payload.edge_id,
             streamer_id=payload.streamer_id,
             segment_seconds=segment_seconds,
@@ -5984,7 +6086,7 @@ def create_app(
                     activity_leases.upsert(
                         lease_id=lease_id,
                         orchestrator_id=orch_id,
-                        upstream_addr=payload.upstream_addr,
+                        upstream_addr=upstream_addr,
                         kind="session",
                         client_ip=request_ip(request),
                         lease_seconds=seconds,
@@ -5992,8 +6094,8 @@ def create_app(
                             "session_id": payload.session_id,
                             "edge_id": payload.edge_id,
                             "streamer_id": payload.streamer_id,
-                            "upstream_addr": payload.upstream_addr,
-                            "upstream_port": payload.upstream_port,
+                            "upstream_addr": upstream_addr,
+                            "upstream_port": upstream_port,
                         },
                     )
             except Exception:
