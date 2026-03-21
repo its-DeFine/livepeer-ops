@@ -1530,7 +1530,7 @@ async def test_client_session_start_picks_nearest_allowed_orchestrator(temp_path
         assert start.status_code == 200
         body = start.json()
         assert body["orchestrator_id"] == "orch-near"
-        assert "token" not in body
+        assert body.get("token")  # rotated token returned on start
         assert body["webrtc_url"] == "https://edge-near.example.com"
         assert body["control_url"].endswith("/api/sessions/tcp")
 
@@ -1865,7 +1865,7 @@ async def test_client_session_start_accepts_invite_and_rejects_reuse(temp_paths)
         start = await client.post("/api/sessions/start", json={"invite_code": code})
         assert start.status_code == 200
         assert start.json()["orchestrator_id"] == "orch-gated"
-        assert "token" not in start.json()
+        assert start.json().get("token")  # rotated token returned on start
 
     second_transport = httpx.ASGITransport(app=app, client=("198.51.100.72", 12346))
     async with httpx.AsyncClient(transport=second_transport, base_url="http://test") as client:
