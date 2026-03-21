@@ -1211,7 +1211,10 @@ def create_app(
     signer: Optional[Signer] = None,
     tee_core: Optional[TeeCoreClient] = None,
 ) -> FastAPI:
-    app = FastAPI(title="Livepeer Ops Backend", version="1.0.0")
+    docs_kwargs = {}
+    if not settings.enable_docs:
+        docs_kwargs.update(docs_url=None, redoc_url=None, openapi_url=None)
+    app = FastAPI(title="Livepeer Ops Backend", version="1.0.0", **docs_kwargs)
     logger = logging.getLogger(__name__)
 
     data_dir = Path(getattr(settings, "workloads_path", Path("/app/data/workloads.json"))).parent
