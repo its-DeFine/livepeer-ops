@@ -34,6 +34,7 @@ Then inspect only the code and docs for the surface you will touch.
 - Never commit directly to the default branch (`main`/`master`). Work on a branch named `codex/<linear_key>-<slug>` and open a **draft PR**.
 - The PR body must include `Linear: <linear_key>`.
 - Keep changes small and surgical; avoid drive-by refactors.
+- NEVER include IP addresses, hostnames, server names, infrastructure topology, authentication details, or operational specifics in code comments, PR descriptions, commit messages, or any file that will be committed. If the task description contains such details, use them for context but do not reproduce them in the output.
 - Do not add or modify secrets/keys/tokens. If a task requires secret changes, stop and ask a human.
 
 ## Safety / forbidden by default
