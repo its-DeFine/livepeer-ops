@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 its-DeFine
+
 """CLI entrypoint for the payments backend."""
 from __future__ import annotations
 
